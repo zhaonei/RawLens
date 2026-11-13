@@ -172,7 +172,13 @@ jobs:
           # AGP only enables v1 when minSdk < 24 (this app is 29), so re-sign with the
           # SAME key to add the JAR signature: same signer, extra scheme, nothing else
           # changes. Alignment first, because a signature covers the aligned bytes.
-          "$BT/zipalign" -f -P 16 4 "$APK" out/aligned.apk
+          #
+          # The aligned file goes to RUNNER_TEMP, NOT out/: an aligned-but-unsigned APK is
+          # a half-finished file that cannot be installed, and out/ is what gets uploaded
+          # and published. Keeping it outside out/ makes "the artifact is not the signed
+          # package" impossible rather than merely unlikely.
+          ALIGNED="$RUNNER_TEMP/aligned-${GITHUB_RUN_NUMBER}.apk"
+          "$BT/zipalign" -f -P 16 4 "$APK" "$ALIGNED"
           "$BT/apksigner" sign \
             --ks "$KS" \
             --ks-key-alias "$SIGNING_KEY_ALIAS" \
@@ -182,7 +188,10 @@ jobs:
             --v1-signing-enabled true \
             --v2-signing-enabled true \
             --v3-signing-enabled true \
-            --out "out/$NAME" out/aligned.apk
+            --out "out/$NAME" "$ALIGNED"
+
+          rm -f "$ALIGNED"
+          test -s "out/$NAME" || { echo "::error::signing produced no APK"; exit 1; }
 
           "$BT/zipalign" -c -v -P 16 4 "out/$NAME"
           "$BT/apksigner" verify --verbose --print-certs \
@@ -206,6 +215,8 @@ jobs:
           } > out/BUILD_INFO.txt
           sha256sum "out/$NAME" > out/SHA256SUMS.txt
           cat out/SHA256SUMS.txt
+          echo "--- files that will be uploaded and published ---"
+          ls -l out
           {
             echo "SIGNED_APK=out/$NAME"
             echo "VERSION_NAME=$VERSION_NAME"
@@ -223,14 +234,32 @@ jobs:
             exit 1
           fi
 
+      - name: Verify the signed APK is the only package in out/
+        run: |
+          set -euo pipefail
+          : "${SIGNED_APK:?SIGNED_APK was not exported by the signing step}"
+          test -s "$SIGNED_APK" || { echo "::error::signed APK is missing: $SIGNED_APK"; exit 1; }
+          count="$(find out -maxdepth 1 -type f -name '*.apk' | wc -l)"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::out/ must hold exactly one APK (the signed one), found $count:"
+            find out -maxdepth 1 -type f -name '*.apk' -printf '  %10s  %p\n'
+            exit 1
+          fi
+          test "$(find out -maxdepth 1 -type f -name '*.apk')" = "$SIGNED_APK"
+          ls out/RawLens-fork-*.apk > /dev/null || {
+            echo "::error::the release pattern out/RawLens-fork-*.apk matches nothing"; exit 1; }
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --min-sdk-version 18 "$SIGNED_APK"
+          echo "shipping: $SIGNED_APK"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: rawlens-fork-${{ github.run_number }}
+          name: rawlens-fork-${{ github.run_number }}-signed
           path: |
-            out/*.apk
+            ${{ env.SIGNED_APK }}
             out/SHA256SUMS.txt
             out/BUILD_INFO.txt
             out/verify.txt
+          if-no-files-found: error
           retention-days: 30
 
       - name: Publish to Release
@@ -249,3 +278,14 @@ jobs:
             Verify the download before installing:
 
             ```
+            ${{ env.APK_SHA256 }}
+            ```
+          # Matched by name rather than by '${{ env.SIGNED_APK }}' alone: that expression
+          # was empty in one run, the step still "succeeded", and the release was published
+          # with no assets at all. out/ holds exactly one APK (the guard step above proves
+          # it) and aligned.apk is never in it, so this glob can only match the package
+          # that came out of apksigner.
+          files: |
+            out/RawLens-fork-*.apk
+            out/SHA256SUMS.txt
+          fail_on_unmatched_files: true
