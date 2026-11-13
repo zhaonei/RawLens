@@ -386,6 +386,9 @@ class RawCameraController(
     }
     private var previewSize: Size? = null
     private var selectedCameraId: String? = null
+    /** Viewfinder zoom, 1x..ZoomStops.MAX_MULTIPLIER. Never sent to the sensor. */
+    private var uiZoom = 1f
+    private var uiZoomListener: ((Float) -> Unit)? = null
     private var rawCameraIds: List<String> = emptyList()
     private var activePhysicalCameraId: String? = null
     private var selectedIso: Int? = null
@@ -4768,6 +4771,72 @@ class RawCameraController(
         restartCameraForConfigurationChange()
     }
 
+    /** Multiplier the viewfinder is framed at. */
+    fun activeZoomMultiplier(): Float = uiZoom
+
+    fun setUiZoomListener(listener: ((Float) -> Unit)?) {
+        uiZoomListener = listener
+        listener?.invoke(uiZoom)
+    }
+
+    /** Detent multipliers for the slider: one per physical rear lens. */
+    fun zoomDetents(): List<Float> =
+        ZoomStops.detents(rawCameraIds.filter { !isFrontCamera(it) }.map(::opticalMetric))
+
+    private fun rearMetrics(): List<Float> =
+        rawCameraIds.filter { !isFrontCamera(it) }.map(::opticalMetric)
+
+    /** How much this lens already magnifies relative to the 1x baseline lens. */
+    private fun lensMultiplier(cameraId: String?): Float {
+        val rear = rearMetrics()
+        val baseline = LensZoom.baseline(rear)
+        val metric = cameraId?.let { opticalMetric(it) } ?: return 1f
+        return if (LensZoom.isKnown(metric) && LensZoom.isKnown(baseline) && baseline > 0f) {
+            metric / baseline
+        } else 1f
+    }
+
+    /**
+     * Move the viewfinder zoom.
+     *
+     * Landing on a physical lens switches to it, so the frame is optically magnified and
+     * nothing is resampled. Every other multiplier magnifies the PREVIEW only; the sensor
+     * readout (crop region, zoom ratio) is deliberately untouched, and the capture trims
+     * the frame afterwards through [ZoomCrop]. That ordering is what keeps a burst aligned:
+     * each frame in it still sees the whole sensor and the same field of view, and the
+     * discarded border is discarded after fusion.
+     */
+    fun setUiZoom(multiplier: Float) {
+        val target = ZoomStops.clamp(multiplier)
+        if (kotlin.math.abs(target - uiZoom) < 1e-4f) return
+        uiZoom = target
+        val snapped = ZoomStops.snap(target, zoomDetents())
+        if (snapped != null) {
+            val lens = rawCameraIds.filter { !isFrontCamera(it) }
+                .firstOrNull { kotlin.math.abs(lensMultiplier(it) - snapped) < 0.05f }
+            if (lens != null && lens != selectedCameraId) {
+                selectedCameraId = lens
+                afRegion = null
+                aeRegion = null
+                updateDevelopFocus(null)
+                ladder.reset()
+                restartCameraForConfigurationChange()
+            }
+        }
+        applyPreviewZoom()
+        uiZoomListener?.invoke(uiZoom)
+    }
+
+    private fun applyPreviewZoom() {
+        val scale = ZoomStops.previewScale(uiZoom, lensMultiplier(selectedCameraId))
+        if (viewfinder.width > 0 && viewfinder.height > 0) {
+            viewfinder.pivotX = viewfinder.width / 2f
+            viewfinder.pivotY = viewfinder.height / 2f
+        }
+        viewfinder.scaleX = scale
+        viewfinder.scaleY = scale
+    }
+
     fun lensOptions(): List<LensOption> {
         val extended = LapisRootProfile.enabled(context) && "0" in rawCameraIds
         val mode = LapisRootProfile.mode(context)
@@ -6578,7 +6647,10 @@ class RawCameraController(
                 c,
                 result,
                 orientation,
-                levelOverrides = captureDngOverrides
+                levelOverrides = captureDngOverrides,
+                // Frozen here, like every other capture setting: the save job runs on a
+                // writer thread after this, and must crop the frame exactly as framed.
+                zoomMultiplier = uiZoom
             )
         } catch (failure: Exception) {
             ownership.close()

@@ -750,11 +750,15 @@ class RawDevelopmentCoordinator(context: Context) {
      * exposure analyzed on the given CFA.
      */
     fun developCfaJpeg(
-        cfa: UnpackedRawCfa,
+        sourceCfa: UnpackedRawCfa,
         metadata: RawFrameMetadata,
         settings: RawDevelopmentSettings = RawDevelopmentSettings(),
         outputSettings: JpegOutputSettings = JpegOutputSettings()
     ): DevelopedJpeg {
+        // Same crop the DNG writer applies to this capture's CFA: the JPEG and the DNG
+        // must agree on framing, or the two files of one shutter press show different
+        // pictures.
+        val cfa = ZoomCrop.applyIfNeeded(sourceCfa, metadata.zoomMultiplier)
         amaze.chromaCleanup = outputSettings.chromaCleanup
         MemoryLeakDiagnostics.stillCapture()
         metadata.rawDevelopmentUnsupportedReason?.let { throw UnsupportedOperationException(it) }
@@ -831,11 +835,15 @@ class RawDevelopmentCoordinator(context: Context) {
     /** Develops an unclamped, normalized CFA produced by RAW HDR merging. */
     // Future SR hook: route SR merges through this develop path.
     fun developMergedJpeg(
-        cfa: UnpackedRawCfa,
+        sourceCfa: UnpackedRawCfa,
         metadata: RawFrameMetadata,
         settings: RawDevelopmentSettings = RawDevelopmentSettings(),
         outputSettings: JpegOutputSettings = JpegOutputSettings()
     ): DevelopedJpeg {
+        // Same crop the DNG writer applies to this capture's CFA: the JPEG and the DNG
+        // must agree on framing, or the two files of one shutter press show different
+        // pictures.
+        val cfa = ZoomCrop.applyIfNeeded(sourceCfa, metadata.zoomMultiplier)
         amaze.chromaCleanup = outputSettings.chromaCleanup
         MemoryLeakDiagnostics.stillCapture()
         metadata.rawDevelopmentUnsupportedReason?.let { throw UnsupportedOperationException(it) }

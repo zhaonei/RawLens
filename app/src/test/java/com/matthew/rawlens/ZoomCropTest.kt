@@ -199,4 +199,33 @@ class ZoomCropTest {
         assertTrue(state.bitsAt(3, 3) != 0)
         assertEquals(0, state.bitsAt(15, 11))
     }
+
+    // --- what the capture path calls ------------------------------------------------
+
+    @Test
+    fun applyIfNeededIsANoOpAtUnity() {
+        val source = cfa(64, 48)
+        assertSame(source, ZoomCrop.applyIfNeeded(source, 1f))
+        assertSame(source, ZoomCrop.applyIfNeeded(source, 0.9f))
+        assertSame(source, ZoomCrop.applyIfNeeded(source, Float.NaN))
+    }
+
+    @Test
+    fun applyIfNeededCropsForAMultiplier() {
+        val cropped = ZoomCrop.applyIfNeeded(cfa(400, 300), 2f)
+        assertEquals(200, cropped.width)
+        assertEquals(150, cropped.height)
+        assertEquals(100, cropped.sensorCropLeft)
+        assertEquals(75, cropped.sensorCropTop)
+    }
+
+    @Test
+    fun applyIfNeededStopsAtTheMinimumMosaicInsteadOfGoingIllegal() {
+        // A frame already near the minimum cannot be cropped by the requested factor: the
+        // rectangle is clamped up to MIN_CFA_EDGE rather than producing a 1x1 mosaic that
+        // AMaZE would reject.
+        val cropped = ZoomCrop.applyIfNeeded(cfa(16, 16), 10f)
+        assertEquals(ZoomCrop.MIN_CFA_EDGE, cropped.width)
+        assertEquals(ZoomCrop.MIN_CFA_EDGE, cropped.height)
+    }
 }

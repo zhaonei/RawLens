@@ -142,6 +142,19 @@ internal object ZoomCrop {
         )
     }
 
+    /**
+     * [cfa] cropped for a capture that framed at [zoomMultiplier], or unchanged when the
+     * multiplier is at unity or the crop would not fit (a merge that already produced a
+     * smaller mosaic than the request assumed). Callers pass the multiplier frozen at the
+     * shutter press, so every output of one capture crops the same way.
+     */
+    fun applyIfNeeded(cfa: UnpackedRawCfa, zoomMultiplier: Float): UnpackedRawCfa {
+        if (isIdentity(zoomMultiplier)) return cfa
+        val crop = rectFor(cfa.width, cfa.height, zoomMultiplier) ?: return cfa
+        if (crop.left + crop.width > cfa.width || crop.top + crop.height > cfa.height) return cfa
+        return applyTo(cfa, crop)
+    }
+
     private fun cropClippingMask(mask: CfaHighlightClipping, crop: RawCrop): CfaHighlightClipping {
         require(cfaMaskContains(mask, crop)) {
             "highlight-clipping mask ${mask.width}x${mask.height} does not cover the crop"

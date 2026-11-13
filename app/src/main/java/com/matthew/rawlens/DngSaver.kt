@@ -31,13 +31,16 @@ class DngSaver(private val context: Context) {
      * level, preserved CFA pattern); the CFA must already be denoised.
      */
     fun saveAiDenoised(
-        cfa: UnpackedRawCfa,
+        sourceCfa: UnpackedRawCfa,
         metadata: RawFrameMetadata,
         captureId: Long = System.currentTimeMillis(),
         fileNameSuffix: String? = null,
         gps: GpsLocation? = null,
         subfolder: String? = null
     ): String {
+        // One crop, applied to the CFA both the DNG and the JPEG are made from, so a
+        // capture framed at 3x produces a 3x DNG and a 3x JPEG, never one of each.
+        val cfa = ZoomCrop.applyIfNeeded(sourceCfa, metadata.zoomMultiplier)
         if (subfolder != null) BurstSidecar.requireSubfolder(subfolder)
         val displayName = CaptureFileNames.aiDng(captureId, fileNameSuffix)
         val resolver = context.contentResolver
@@ -75,7 +78,7 @@ class DngSaver(private val context: Context) {
      * @param description ImageDescription for the 32-bit path; null omits
      *   it. Ignored by the 16-bit path (provenance owns that block).
      */
-    fun saveMerged(cfa: UnpackedRawCfa, metadata: RawFrameMetadata,
+    fun saveMerged(sourceCfa: UnpackedRawCfa, metadata: RawFrameMetadata,
                    captureId: Long = System.currentTimeMillis(),
                    gps: GpsLocation? = null,
                    displayName: String? = null,
@@ -84,6 +87,7 @@ class DngSaver(private val context: Context) {
                    baselineExposureEv: Double? = null,
                    description: String? = null,
                    dngCompression: DngCompression = DngCompression.UNCOMPRESSED): String {
+        val cfa = ZoomCrop.applyIfNeeded(sourceCfa, metadata.zoomMultiplier)
         val resolvedName = displayName ?: CaptureFileNames.hdrDng(captureId)
         val resolver = context.contentResolver
         val values = ContentValues().apply {
@@ -217,7 +221,19 @@ class DngSaver(private val context: Context) {
             DngWriterBackend.TINY_DNG
         } else effectiveBackend
         try {
-            val actualBackend = if (packedFormat != null) {
+            // A zoomed single frame cannot go through the platform writer: DngCreator has
+            // no crop API, so it would write the whole sensor while the JPEG beside it is
+            // cropped. Unpack the plane, trim it, and write it with the project's own CFA
+            // writer (the same backend the other fallbacks above already use).
+            val wantCrop = packedFormat == null &&
+                !ZoomCrop.isIdentity(metadata.zoomMultiplier)
+            if (wantCrop) {
+                Log.i(LOG_TAG, "zoom ${metadata.zoomMultiplier}x: $displayName written from a cropped CFA")
+            }
+            val actualBackend = if (wantCrop) {
+                saveUnpackedCfaWithCrop(uri, image, metadata, gps)
+                DngWriterBackend.TINY_DNG
+            } else if (packedFormat != null) {
                 savePackedCfa(uri, image, metadata, gps, overrides, displayName)
                 DngWriterBackend.TINY_DNG
             } else when (compressionBackend) {
@@ -282,6 +298,36 @@ class DngSaver(private val context: Context) {
      * 16-bit HDR+ writer (GPS-capable). User calibration overrides patch the
      * file afterwards; a patch failure warns but never fails the save.
      */
+    /**
+     * Single-frame save with a viewfinder crop: unpack the RAW_SENSOR plane straight into
+     * the cropped window, then write it with the 16-bit CFA writer. The crop reaches the
+     * unpacker, so the full mosaic is never materialised a second time.
+     */
+    private fun saveUnpackedCfaWithCrop(
+        uri: android.net.Uri,
+        image: Image,
+        metadata: RawFrameMetadata,
+        gps: GpsLocation?
+    ) {
+        val normalization = metadata.normalizationOrNull()
+            ?: throw IOException("Zoomed DNG needs normalization metadata")
+        val plane = image.planes.single()
+        val crop = ZoomCrop.rectFor(image.width, image.height, metadata.zoomMultiplier)
+            ?: throw IOException("Zoomed DNG has no crop to apply")
+        val layout = RawPlaneLayout(
+            width = image.width,
+            height = image.height,
+            rowStride = plane.rowStride,
+            pixelStride = plane.pixelStride,
+        )
+        val cfa = RawSensorUnpacker.unpackNormalized(
+            plane.buffer, layout, normalization, crop, ByteOrder.LITTLE_ENDIAN
+        )
+        context.contentResolver.openOutputStream(uri, "w")?.use { output ->
+            HdrPlusDngWriter.write(output, cfa, metadata, gps)
+        } ?: throw IOException("Could not open DNG output stream")
+    }
+
     private fun savePackedCfa(
         uri: android.net.Uri,
         image: Image,
@@ -293,11 +339,12 @@ class DngSaver(private val context: Context) {
         val normalization = metadata.normalizationOrNull()
             ?: throw IOException("Packed DNG normalization metadata is missing")
         val plane = image.planes.single()
-        val cfa = RawPackedUnpacker.unpackFrameNormalized(
+        val unpacked = RawPackedUnpacker.unpackFrameNormalized(
             plane.buffer, image.width, image.height,
             plane.rowStride, plane.pixelStride, image.format, normalization,
             byteOrder = ByteOrder.LITTLE_ENDIAN
         )
+        val cfa = ZoomCrop.applyIfNeeded(unpacked, metadata.zoomMultiplier)
         context.contentResolver.openOutputStream(uri, "w")?.use { output ->
             HdrPlusDngWriter.write(output, cfa, metadata, gps)
         } ?: throw IOException("Could not open DNG output stream")

@@ -241,6 +241,7 @@ class MainActivity : Activity() {
         val shutter = findViewById<View>(R.id.shutter)
         bindViewsAndOverlays()
         createController(dngInfo, sensorInfo, viewfinder, shutter)
+        wireZoomSlider()
         applyControllerSettings(shutter)
         wireModeAndQuickControls(shutter)
         wireTouchAndManualControls(viewfinder)
@@ -475,6 +476,23 @@ class MainActivity : Activity() {
     }
 
     /** onCreate stage: The camera controller and its UI callbacks (status, scopes, focus, route). */
+    /**
+     * Zoom track wiring. The slider owns no camera state: it reports multipliers and is fed
+     * the controller's current one, so lens switching, snapping and the crop all stay in
+     * RawCameraController. Detents are re-read whenever the slider is touched into a lens,
+     * because rawCameraIds is only known once the camera has opened.
+     */
+    private fun wireZoomSlider() {
+        val slider = findViewById<ZoomSliderView>(R.id.zoomSlider) ?: return
+        if (!::controller.isInitialized) return
+        slider.setDetents(controller.zoomDetents())
+        slider.onZoom = { multiplier -> controller.setUiZoom(multiplier) }
+        controller.setUiZoomListener { multiplier ->
+            slider.setDetents(controller.zoomDetents())
+            slider.setZoom(multiplier)
+        }
+    }
+
     private fun createController(dngInfo: TextView, sensorInfo: TextView, viewfinder: AutoFitSurfaceView, shutter: View) {
         controller = RawCameraController(this, viewfinder,
             { message -> runOnUiThread { setStatus(message) } },
