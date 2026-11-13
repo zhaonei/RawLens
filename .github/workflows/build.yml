@@ -84,61 +84,77 @@ jobs:
             --tests "com.matthew.rawlens.ZoomCropTest" \
             --stacktrace
 
-      - name: Assemble unsigned release
-        run: |
-          set -euo pipefail
-          chmod +x ./gradlew
-          # assembleGithubRelease also bumps versionCode/versionName in
-          # version.properties (see app/build.gradle.kts), so consecutive CI builds
-          # install as upgrades instead of colliding.
-          ./gradlew :app:assembleGithubRelease --stacktrace
-          echo "--- what was produced ---"
-          find app/build/outputs/apk -type f -name '*.apk' -printf '%10s  %p\n' | sort -k2
-          # AGP does not necessarily name an unsigned APK "*-unsigned.apk" (this project's
-          # version-named output does not), so pick whatever single non-test APK the
-          # github/release directory holds and prove it is unsigned below.
-          APK="$(find app/build/outputs/apk/github/release -maxdepth 1 -type f -name '*.apk' | head -1)"
-          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
-            echo "::error::assembleGithubRelease produced no APK to sign"
-            exit 1
-          fi
-          if "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$APK" >/dev/null 2>&1; then
-            echo "::error::The Gradle build unexpectedly produced a signed APK"
-            exit 1
-          fi
-          echo "unsigned APK: $(du -h "$APK" | cut -f1)"
-          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" \
-            | grep -E "^package:|^sdkVersion|^targetSdkVersion|^application-label:"
-
-      - name: Align, sign v1+v2+v3, verify
+      # This project signs its own release output: with RAWLENS_KEYSTORE set,
+      # app/build.gradle.kts uses the `releaseEnv` signing config, otherwise it falls back
+      # to the debug key so a fresh clone stays installable. So the APK here is signed by
+      # design -- the first attempt of this workflow assumed "*-unsigned.apk" and failed
+      # twice on that assumption, once on the name and once on a guard that asserted the
+      # build produced nothing signed. Sign with our key *in* Gradle, then add v1 below.
+      - name: Assemble release with this fork's key
         env:
           SIGNING_KEYSTORE: ${{ secrets.SIGNING_KEYSTORE }}
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           SIGNING_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          RAWLENS_KEYSTORE: ${{ runner.temp }}/fork-signing-${{ github.run_id }}.jks
+          RAWLENS_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          RAWLENS_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          RAWLENS_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${SIGNING_KEYSTORE:?secret SIGNING_KEYSTORE is empty or missing}"
+          chmod +x ./gradlew
+          ( umask 077; printf '%s' "$SIGNING_KEYSTORE" | base64 -d > "$RAWLENS_KEYSTORE" )
+          test -s "$RAWLENS_KEYSTORE"
+          ./gradlew :app:assembleGithubRelease --stacktrace
+
+          echo "--- what was produced ---"
+          find app/build/outputs/apk -type f -name '*.apk' -printf '%10s  %p\n' | sort -k2
+          # The release directory holds per-ABI splits (-arm64-v8a, -armeabi-v7a) as well
+          # as the plain version-named universal APK, which is the one that installs
+          # anywhere.
+          APK="$(find app/build/outputs/apk/github/release -maxdepth 1 -type f \
+            -name 'RawLens-*-release.apk' | head -1)"
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "::error::assembleGithubRelease produced no universal APK"
+            exit 1
+          fi
+          echo "universal APK: $APK ($(du -h "$APK" | cut -f1))"
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          EXPECTED="$(keytool -list -v -keystore "$RAWLENS_KEYSTORE" \
+            -storepass "$RAWLENS_KEYSTORE_PASSWORD" -alias "$RAWLENS_KEY_ALIAS" \
+            | sed -n 's/.*SHA256: //p' | tr -d ':' | tr 'A-F' 'a-f')"
+          ACTUAL="$("$BT/apksigner" verify --print-certs "$APK" \
+            | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr -d ':' | tr 'A-F' 'a-f')"
+          echo "expected signer: $EXPECTED"
+          echo "actual signer:   $ACTUAL"
+          test -n "$EXPECTED" && test "$ACTUAL" = "$EXPECTED"
+          "$BT/aapt" dump badging "$APK" \
+            | grep -E "^package:|^sdkVersion|^targetSdkVersion|^application-label:"
+
+      - name: Force the v1 (JAR) signature and verify all three schemes
+        env:
+          SIGNING_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KS: ${{ runner.temp }}/fork-signing-${{ github.run_id }}.jks
         run: |
           set -euo pipefail
           BT="$ANDROID_HOME/build-tools/36.0.0"
-          APK="$(find app/build/outputs/apk/github/release -maxdepth 1 -type f -name '*.apk' | head -1)"
-          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
-            echo "::error::no APK from the assemble step"
-            exit 1
-          fi
-          : "${SIGNING_KEYSTORE:?secret SIGNING_KEYSTORE is empty or missing}"
-          : "${SIGNING_KEY_ALIAS:?secret SIGNING_KEY_ALIAS is empty or missing}"
-          : "${SIGNING_KEYSTORE_PASSWORD:?secret SIGNING_KEYSTORE_PASSWORD is empty or missing}"
-          : "${SIGNING_KEY_PASSWORD:?secret SIGNING_KEY_PASSWORD is empty or missing}"
-
-          KS="$RUNNER_TEMP/fork-signing-${GITHUB_RUN_ID}.jks"
-          ( umask 077; printf '%s' "$SIGNING_KEYSTORE" | base64 -d > "$KS" )
+          APK="$APK_PATH"
+          test -f "$APK"
           test -s "$KS"
-
           VERSION_NAME="$("$BT/aapt" dump badging "$APK" \
             | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" | head -1)"
           test -n "$VERSION_NAME"
           NAME="RawLens-fork-${VERSION_NAME}-${GITHUB_RUN_NUMBER}.apk"
           mkdir -p out
 
+          # AGP only enables v1 when minSdk < 24 (this app is 29), so re-sign with the
+          # SAME key to add the JAR signature: same signer, extra scheme, nothing else
+          # changes. Alignment first, because a signature covers the aligned bytes.
           "$BT/zipalign" -f -P 16 4 "$APK" out/aligned.apk
           "$BT/apksigner" sign \
             --ks "$KS" \
@@ -150,7 +166,6 @@ jobs:
             --v2-signing-enabled true \
             --v3-signing-enabled true \
             --out "out/$NAME" out/aligned.apk
-          rm -f "$KS"
 
           "$BT/zipalign" -c -v -P 16 4 "out/$NAME"
           "$BT/apksigner" verify --verbose --print-certs \
