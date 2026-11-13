@@ -1238,12 +1238,15 @@ class RawDevelopmentCoordinator(context: Context) {
      * half-float JXL output stage instead of the 8-bit JPEG one.
      */
     fun developMergedJxl(
-        cfa: UnpackedRawCfa,
+        sourceCfa: UnpackedRawCfa,
         metadata: RawFrameMetadata,
         settings: RawDevelopmentSettings = RawDevelopmentSettings(),
         look: JpegOutputSettings = JpegOutputSettings(),
         jxl: JxlOutputSettings = JxlOutputSettings()
     ): DevelopedJxl {
+        // Same crop the merged DNG and the merged JPEG take, so all three outputs of one
+        // shutter press agree on framing.
+        val cfa = ZoomCrop.applyIfNeeded(sourceCfa, metadata.zoomMultiplier)
         MemoryLeakDiagnostics.stillCapture()
         metadata.rawDevelopmentUnsupportedReason?.let { throw UnsupportedOperationException(it) }
         cfa.requireAmazeCompatible()
