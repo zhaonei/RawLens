@@ -306,8 +306,10 @@ internal class HdrPlusZslSaveJob(private val context: Context, private val host:
         // dng + develop; the wait column is what the overlap saved.
         Log.i(
             LOG_TAG,
-            "HDR+ save: frames=${keptInputs.size} merge=${mergeMs}ms dng=${dngMs.get()}ms " +
-                "develop+encode=${saveMs}ms wait=${totalMs - saveMs}ms total=${totalMs}ms",
+            "HDR+ save: frames=${keptInputs.size} merge=${mergeMs}ms " +
+                "(pack=${timings.packMs} gpu=${timings.gpuMs.toLong()} unpack=${timings.unpackMs}) " +
+                "dng=${dngMs.get()}ms develop+encode=${saveMs}ms " +
+                "wait=${totalMs - saveMs}ms total=${totalMs}ms",
         )
     }
 
