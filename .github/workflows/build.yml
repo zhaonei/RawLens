@@ -80,10 +80,25 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./gradlew
+          # Compiler diagnostics are re-emitted as workflow annotations: the job log is
+          # a multi-megabyte blob, the annotations endpoint is not, so a failure here can
+          # be read back through the API instead of by scrolling.
+          set +e
           ./gradlew :app:testGithubDebugUnitTest \
             --tests "com.matthew.rawlens.ZoomCropTest" \
             --tests "com.matthew.rawlens.ZoomStopsTest" \
-            --stacktrace
+            --stacktrace > /tmp/gradle-tests.log 2>&1
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            grep -E "^e: |^w: .*Zoom|error:|FAILED|What went wrong|Caused by" /tmp/gradle-tests.log \
+              | head -40 | while IFS= read -r line; do
+                printf '::error::%s\n' "${line//'%'/'%25'}"
+              done
+            echo "--- last 40 lines ---"
+            tail -40 /tmp/gradle-tests.log
+            exit "$status"
+          fi
 
       # This project signs its own release output: with RAWLENS_KEYSTORE set,
       # app/build.gradle.kts uses the `releaseEnv` signing config, otherwise it falls back
