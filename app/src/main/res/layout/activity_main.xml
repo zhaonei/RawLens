@@ -177,16 +177,6 @@
 
 
 
-    <!-- Zoom track: 1x on the left, 10x on the right, one detent per physical rear lens.
-         A detent is a lens switch; between them the preview is magnified and the capture
-         is cropped afterwards (see ZoomCrop), so the sensor readout never changes. -->
-    <com.matthew.rawlens.ZoomSliderView
-        android:id="@+id/zoomSlider"
-        android:layout_width="wrap_content"
-        android:layout_height="46dp"
-        android:layout_gravity="bottom|center_horizontal"
-        android:layout_marginBottom="196dp" />
-
     <!-- Top bar: opaque black island, edge-to-edge with rounded bottom corners
          mirroring the bottom panel. Single controls row in photo mode; the
          capture info line lives in the bottom panel in both modes so the
@@ -683,4 +673,15 @@
             </LinearLayout>
         </LinearLayout>
     </LinearLayout>
+
+    <!-- Zoom track. LAST child on purpose: it has to draw ABOVE the bottom panel, and in a
+         FrameLayout the draw order is declaration order. 252dp keeps it clear of the panel
+         top (the app's own panels sit at 248dp); MainActivity re-seats it against the real
+         panel once it has been measured. -->
+    <com.matthew.rawlens.ZoomSliderView
+        android:id="@+id/zoomSlider"
+        android:layout_width="wrap_content"
+        android:layout_height="46dp"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="252dp" />
 </FrameLayout>

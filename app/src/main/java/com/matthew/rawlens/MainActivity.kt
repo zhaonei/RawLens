@@ -483,13 +483,39 @@ class MainActivity : Activity() {
      * because rawCameraIds is only known once the camera has opened.
      */
     private fun wireZoomSlider() {
-        val slider = findViewById<ZoomSliderView>(R.id.zoomSlider) ?: return
+        val slider = findViewById<ZoomSliderView>(R.id.zoomSlider)
+        if (slider == null) {
+            android.util.Log.w("Spektra", "zoom slider is not in this layout; zoom stays off")
+            return
+        }
         if (!::controller.isInitialized) return
         slider.setDetents(controller.zoomDetents())
         slider.onZoom = { multiplier -> controller.setUiZoom(multiplier) }
         controller.setUiZoomListener { multiplier ->
             slider.setDetents(controller.zoomDetents())
             slider.setZoom(multiplier)
+        }
+        // The bottom panel's height depends on the mode and on how many lenses the row
+        // holds, so the 252dp in the layout is only a fallback: once both views are
+        // measured, sit the track directly above the panel with a small gap.
+        slider.post {
+            val panel = findViewById<View>(R.id.controlPanel)
+            val root = slider.parent as? View
+            if (panel != null && root != null && panel.height > 0) {
+                val gap = (8 * resources.displayMetrics.density).toInt()
+                val params = slider.layoutParams as FrameLayout.LayoutParams
+                val margin = (root.height - panel.top + gap).coerceAtLeast(gap)
+                if (params.bottomMargin != margin) {
+                    params.bottomMargin = margin
+                    slider.layoutParams = params
+                }
+            }
+            android.util.Log.i(
+                "Spektra",
+                "zoom slider wired: detents=" + controller.zoomDetents() +
+                    " visible=" + (slider.visibility == View.VISIBLE) +
+                    " size=" + slider.width + "x" + slider.height,
+            )
         }
     }
 
