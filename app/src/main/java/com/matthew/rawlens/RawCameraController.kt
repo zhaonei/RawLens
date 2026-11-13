@@ -389,6 +389,7 @@ class RawCameraController(
     /** Viewfinder zoom, 1x..ZoomStops.MAX_MULTIPLIER. Never sent to the sensor. */
     private var uiZoom = 1f
     private var uiZoomListener: ((Float) -> Unit)? = null
+    private var previewZoomApplier: ((Float) -> Unit)? = null
     private var rawCameraIds: List<String> = emptyList()
     private var activePhysicalCameraId: String? = null
     private var selectedIso: Int? = null
@@ -4779,6 +4780,17 @@ class RawCameraController(
         listener?.invoke(uiZoom)
     }
 
+    /**
+     * Applies the preview magnification to the views that actually show the preview. The
+     * controller owns the multiplier but not the view ids: the visible surface depends on the
+     * route (the ISP SurfaceView, the RAW/BGU GPU viewfinder), and the overlays must NOT be
+     * magnified, so the app decides which views are "the preview".
+     */
+    fun setPreviewZoomApplier(applier: ((Float) -> Unit)?) {
+        previewZoomApplier = applier
+        applyPreviewZoom()
+    }
+
     /** Detent multipliers for the slider: one per physical rear lens. */
     fun zoomDetents(): List<Float> =
         ZoomStops.detents(rawCameraIds.filter { !isFrontCamera(it) }.map(::opticalMetric))
@@ -4797,7 +4809,8 @@ class RawCameraController(
     }
 
     /**
-     * Move the viewfinder zoom.
+     * Move the viewfinder zoom. Called from the touch handler, so it must not touch camera
+     * state: every mutation of the session belongs to the camera thread.
      *
      * Landing on a physical lens switches to it, so the frame is optically magnified and
      * nothing is resampled. Every other multiplier magnifies the PREVIEW only; the sensor
@@ -4815,20 +4828,35 @@ class RawCameraController(
             val lens = rawCameraIds.filter { !isFrontCamera(it) }
                 .firstOrNull { kotlin.math.abs(lensMultiplier(it) - snapped) < 0.05f }
             if (lens != null && lens != selectedCameraId) {
-                selectedCameraId = lens
-                afRegion = null
-                aeRegion = null
-                updateDevelopFocus(null)
-                ladder.reset()
-                restartCameraForConfigurationChange()
+                // selectLens() is the app's own lens switch: it posts to the camera thread
+                // and refuses while a capture is in flight. Reaching into selectedCameraId
+                // and calling restartCameraForConfigurationChange() from here is what threw
+                // IllegalStateException("Check failed") -- that function opens with
+                // check(isOnCameraThread()), and a touch handler runs on the main thread.
+                selectLens(lens)
             }
         }
         applyPreviewZoom()
         uiZoomListener?.invoke(uiZoom)
     }
 
+    /**
+     * Magnification the preview surface needs, derived from the REQUESTED multiplier rather
+     * than from whichever lens happens to be live: on a detent the physical lens provides the
+     * magnification, so the preview needs none; between detents the live lens is the base. That
+     * also means the correct scale is known the moment the slider moves, without waiting for a
+     * lens switch to finish on the camera thread.
+     */
     private fun applyPreviewZoom() {
-        val scale = ZoomStops.previewScale(uiZoom, lensMultiplier(selectedCameraId))
+        val detents = zoomDetents()
+        val lensStop = ZoomStops.snap(uiZoom, detents)
+        val base = lensStop ?: lensMultiplier(selectedCameraId)
+        val scale = ZoomStops.previewScale(uiZoom, base)
+        val applier = previewZoomApplier
+        if (applier != null) {
+            applier(scale)
+            return
+        }
         if (viewfinder.width > 0 && viewfinder.height > 0) {
             viewfinder.pivotX = viewfinder.width / 2f
             viewfinder.pivotY = viewfinder.height / 2f

@@ -491,6 +491,21 @@ class MainActivity : Activity() {
         if (!::controller.isInitialized) return
         slider.setDetents(controller.zoomDetents())
         slider.onZoom = { multiplier -> controller.setUiZoom(multiplier) }
+        // The visible preview is whichever surface the active route draws into: the ISP
+        // SurfaceView, the RAW GPU viewfinder, or the BGU one. All of them get the same
+        // transform; the overlays (focus, level, guides, scopes) deliberately do not, or the
+        // framing guides would zoom with the picture.
+        controller.setPreviewZoomApplier { scale ->
+            for (id in PREVIEW_SURFACE_IDS) {
+                val view = findViewById<View>(id) ?: continue
+                if (view.width > 0 && view.height > 0) {
+                    view.pivotX = view.width / 2f
+                    view.pivotY = view.height / 2f
+                }
+                view.scaleX = scale
+                view.scaleY = scale
+            }
+        }
         controller.setUiZoomListener { multiplier ->
             slider.setDetents(controller.zoomDetents())
             slider.setZoom(multiplier)
@@ -4576,4 +4591,12 @@ class MainActivity : Activity() {
         const val MAX_RAW_ZSL_FRAMES = 59
         const val DEFAULT_RAW_ZSL_FRAME_COUNT = 16
     }
+
 }
+
+/** Views that show the live preview, in the order the routes use them. */
+private val PREVIEW_SURFACE_IDS = intArrayOf(
+    R.id.viewfinder,
+    R.id.rawViewfinder,
+    R.id.bguViewfinder,
+)
