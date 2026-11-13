@@ -64,6 +64,9 @@ internal object OfflineBurstMetadata {
             rawPlaneRowStride = width * 2,
             rawPlanePixelStride = 2,
             exifOrientation = exifOrientation,
+            // Offline merges of a staged burst rebuild metadata from the container, which
+            // carries no viewfinder state: take the multiplier the capture was framed at.
+            zoomMultiplier = UiZoomState.captureMultiplier,
             sensorOrientationDegrees = container.optInt("sensorOrientation", 0),
             sensitivityIso = frame.optInt("iso", 0).takeIf { it > 0 },
             exposureTimeNanos = frame.optLong("exposureTime", 0L).takeIf { it > 0 },

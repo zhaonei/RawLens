@@ -4838,6 +4838,10 @@ class RawCameraController(
         }
         applyPreviewZoom()
         uiZoomListener?.invoke(uiZoom)
+        // Freeze point for the save jobs (see UiZoomState). A drag while a merge is being
+        // written must not change what that merge crops to, so this only moves between
+        // captures; the shutter sets it unconditionally.
+        if (!captureInProgress.get()) UiZoomState.captureMultiplier = uiZoom
     }
 
     /**
@@ -6680,6 +6684,9 @@ class RawCameraController(
                 // writer thread after this, and must crop the frame exactly as framed.
                 zoomMultiplier = uiZoom
             )
+            // The burst/bracket pipelines rebuild their per-frame metadata in the save job,
+            // so the value has to be visible outside this object too.
+            UiZoomState.captureMultiplier = uiZoom
         } catch (failure: Exception) {
             ownership.close()
             Log.e(LOG_TAG, "Could not snapshot RAW save metadata", failure)

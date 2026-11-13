@@ -166,7 +166,10 @@ object RawFrameMetadataFactory {
         result: TotalCaptureResult,
         exifOrientation: Int,
         levelOverrides: DngMetadataOverrides = DngMetadataOverrides(),
-        zoomMultiplier: Float = 1f
+        // Default to the multiplier frozen at the shutter: burst and bracket frames rebuild
+        // their metadata here at save time, and without this they would all look like 1x and
+        // export the whole sensor while the single frame of the same capture is cropped.
+        zoomMultiplier: Float = UiZoomState.captureMultiplier
     ): RawFrameMetadata {
         val cfaValue = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
         val cfaResult = runCatching { cfaValue?.let(BayerPattern::fromCamera2) }

@@ -105,3 +105,22 @@ internal object ZoomStops {
         return (clamp(multiplier) / lensMultiplier).coerceIn(1f, MAX_MULTIPLIER)
     }
 }
+
+/**
+ * The viewfinder multiplier a capture is being cropped with, readable from the save jobs.
+ *
+ * The burst and bracket pipelines do not carry the shutter-time metadata object through:
+ * every frame's metadata is rebuilt from its frozen CaptureResult at save time
+ * (RawFrameMetadataFactory.capture), which is deliberate for exactness but means anything not
+ * derivable from the Camera2 result has to live somewhere the factory can see. Single-frame
+ * captures already pass the multiplier explicitly; this is what makes HDR+/ZFS/MFSR crops match
+ * them instead of defaulting to 1.
+ *
+ * [captureMultiplier] is only moved while no capture is in flight, so dragging the slider
+ * during a merge cannot retroactively change what that merge crops to; the shutter sets it
+ * unconditionally.
+ */
+internal object UiZoomState {
+    @Volatile
+    var captureMultiplier: Float = 1f
+}

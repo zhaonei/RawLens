@@ -937,7 +937,11 @@ class RawDevelopmentCoordinator(context: Context) {
         height: Int,
         metadata: RawFrameMetadata,
         settings: RawDevelopmentSettings = RawDevelopmentSettings(),
-        outputSettings: JpegOutputSettings = JpegOutputSettings()
+        outputSettings: JpegOutputSettings = JpegOutputSettings(),
+        /** Window of [rgb] to develop; see [Gles31AmazeProcessor.processMfsrRgb]. */
+        sourceRowStride: Int = width,
+        sourceColumnOffset: Int = 0,
+        sourceRowOffset: Int = 0
     ): DevelopedJpeg {
         amaze.chromaCleanup = outputSettings.chromaCleanup
         MemoryLeakDiagnostics.stillCapture()
@@ -949,7 +953,10 @@ class RawDevelopmentCoordinator(context: Context) {
             rgb, width, height,
             transform.glslColumnMajorMatrix(),
             transform.glslCameraWhiteNormalized(),
-            cameraLinear = settings.denoise.captureSharpening.enabled
+            cameraLinear = settings.denoise.captureSharpening.enabled,
+            sourceRowStride = sourceRowStride,
+            sourceColumnOffset = sourceColumnOffset,
+            sourceRowOffset = sourceRowOffset
         ) { output ->
             consumeCaptureSharpened(output, transform,
                 capturePattern(metadata),

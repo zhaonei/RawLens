@@ -463,6 +463,13 @@ class Gles31AmazeProcessor(
      * [process]. Any failure throws: the coordinator falls back to the
      * DNG-only save.
      */
+    /**
+     * [sourceRowStride], [sourceColumnOffset] and [sourceRowOffset] describe where the frame
+     * to develop sits inside [rgb]: the buffer may hold the full merged frame while only a
+     * window of it is wanted (the post-capture zoom crop). GLES 3.0 unpacks the window
+     * directly through GL_UNPACK_ROW_LENGTH / SKIP_PIXELS / SKIP_ROWS, so the crop costs no
+     * copy of a buffer that can be hundreds of megabytes. Defaults read the whole buffer.
+     */
     fun <T> processMfsrRgb(
         rgb: java.nio.ByteBuffer,
         width: Int,
@@ -470,6 +477,9 @@ class Gles31AmazeProcessor(
         cameraToAcescgColumnMajor: FloatArray,
         cameraWhiteNormalized: FloatArray,
         cameraLinear: Boolean = false,
+        sourceRowStride: Int = width,
+        sourceColumnOffset: Int = 0,
+        sourceRowOffset: Int = 0,
         consume: (AmazeGpuOutput) -> T
     ): T {
         require(width >= 2 && height >= 2) { "Sharp RGB needs positive dimensions" }
@@ -485,8 +495,14 @@ class Gles31AmazeProcessor(
         require(rgb.isDirect && rgb.order() == java.nio.ByteOrder.nativeOrder()) {
             "Sharp RGB must be a native-order direct buffer"
         }
-        require(rgb.capacity() >= width * height * 3 * 4) {
-            "Sharp RGB buffer too small for ${width}x$height triplets"
+        require(sourceRowStride >= sourceColumnOffset + width) { "Sharp RGB source window exceeds its row stride" }
+        require(sourceRowOffset >= 0 && sourceRowStride > 0 && sourceColumnOffset >= 0) {
+            "Sharp RGB source window must be non-negative"
+        }
+        require(rgb.capacity() >=
+            (sourceRowOffset + height - 1) * sourceRowStride * 3 * 4 + (sourceColumnOffset + width) * 3 * 4) {
+            "Sharp RGB buffer too small for a ${width}x$height window at " +
+                "row $sourceRowOffset, column $sourceColumnOffset of a $sourceRowStride-wide frame"
         }
         val session = processingSession()
         return session.egl.run {
@@ -498,10 +514,16 @@ class Gles31AmazeProcessor(
                 GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
                 GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
                 rgb.rewind()
+                GLES31.glPixelStorei(GLES31.GL_UNPACK_ROW_LENGTH, sourceRowStride)
+                GLES31.glPixelStorei(GLES31.GL_UNPACK_SKIP_PIXELS, sourceColumnOffset)
+                GLES31.glPixelStorei(GLES31.GL_UNPACK_SKIP_ROWS, sourceRowOffset)
                 GLES31.glTexImage2D(
                     GLES31.GL_TEXTURE_2D, 0, GLES30.GL_RGB32F, width, height, 0,
                     GLES31.GL_RGB, GLES31.GL_FLOAT, rgb
                 )
+                GLES31.glPixelStorei(GLES31.GL_UNPACK_ROW_LENGTH, 0)
+                GLES31.glPixelStorei(GLES31.GL_UNPACK_SKIP_PIXELS, 0)
+                GLES31.glPixelStorei(GLES31.GL_UNPACK_SKIP_ROWS, 0)
                 checkGl("Sharp RGB upload")
                 val program = session.programs.get("rcd/rcd_final.glsl")
                 val output = session.textures.acquire(width, height, GLES30.GL_RGBA16F)
