@@ -1315,7 +1315,11 @@ class RawDevelopmentCoordinator(context: Context) {
         metadata: RawFrameMetadata,
         settings: RawDevelopmentSettings = RawDevelopmentSettings(),
         look: JpegOutputSettings = JpegOutputSettings(),
-        jxl: JxlOutputSettings = JxlOutputSettings()
+        jxl: JxlOutputSettings = JxlOutputSettings(),
+        /** Window of [rgb] to develop; see [Gles31AmazeProcessor.processMfsrRgb]. */
+        sourceRowStride: Int = width,
+        sourceColumnOffset: Int = 0,
+        sourceRowOffset: Int = 0
     ): DevelopedJxl {
         MemoryLeakDiagnostics.stillCapture()
         metadata.rawDevelopmentUnsupportedReason?.let { throw UnsupportedOperationException(it) }
@@ -1326,7 +1330,10 @@ class RawDevelopmentCoordinator(context: Context) {
             rgb, width, height,
             transform.glslColumnMajorMatrix(),
             transform.glslCameraWhiteNormalized(),
-            cameraLinear = settings.denoise.captureSharpening.enabled
+            cameraLinear = settings.denoise.captureSharpening.enabled,
+            sourceRowStride = sourceRowStride,
+            sourceColumnOffset = sourceColumnOffset,
+            sourceRowOffset = sourceRowOffset
         ) { output ->
             consumeCaptureSharpened(output, transform,
                 capturePattern(metadata),
