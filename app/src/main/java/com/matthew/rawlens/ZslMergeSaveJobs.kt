@@ -390,7 +390,10 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
                     LkrMerge.Settings(dctPrior = settings.lkrDctPrior, tuning = LkrTuning.overrides(context),
                         zoom = settings.lkrZoom, fullRes = settings.lkrFullRes),
                     releaseInputs = host::releaseInputs) }
-            else MfsrMerge.merge(context, ordered, settings)
+            // Same quiet-window the LK-R route already used: the viewfinder's RAW upload and
+            // tonemap otherwise keep the GPU busy through a 5-40 s merge (measured: 27-29 fps,
+            // single draws 260-280 ms) while the merge is saturating the same GPU.
+            else MergeGpuQuiet.during { MfsrMerge.merge(context, ordered, settings) }
         } finally {
             host.releaseInputs()
         } ?: run {
