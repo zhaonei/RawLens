@@ -514,16 +514,16 @@ class Gles31AmazeProcessor(
                 GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
                 GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
                 rgb.rewind()
-                GLES31.glPixelStorei(GLES31.GL_UNPACK_ROW_LENGTH, sourceRowStride)
-                GLES31.glPixelStorei(GLES31.GL_UNPACK_SKIP_PIXELS, sourceColumnOffset)
-                GLES31.glPixelStorei(GLES31.GL_UNPACK_SKIP_ROWS, sourceRowOffset)
+                GLES31.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, sourceRowStride)
+                GLES31.glPixelStorei(GLES30.GL_UNPACK_SKIP_PIXELS, sourceColumnOffset)
+                GLES31.glPixelStorei(GLES30.GL_UNPACK_SKIP_ROWS, sourceRowOffset)
                 GLES31.glTexImage2D(
                     GLES31.GL_TEXTURE_2D, 0, GLES30.GL_RGB32F, width, height, 0,
                     GLES31.GL_RGB, GLES31.GL_FLOAT, rgb
                 )
-                GLES31.glPixelStorei(GLES31.GL_UNPACK_ROW_LENGTH, 0)
-                GLES31.glPixelStorei(GLES31.GL_UNPACK_SKIP_PIXELS, 0)
-                GLES31.glPixelStorei(GLES31.GL_UNPACK_SKIP_ROWS, 0)
+                GLES31.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, 0)
+                GLES31.glPixelStorei(GLES30.GL_UNPACK_SKIP_PIXELS, 0)
+                GLES31.glPixelStorei(GLES30.GL_UNPACK_SKIP_ROWS, 0)
                 checkGl("Sharp RGB upload")
                 val program = session.programs.get("rcd/rcd_final.glsl")
                 val output = session.textures.acquire(width, height, GLES30.GL_RGBA16F)
