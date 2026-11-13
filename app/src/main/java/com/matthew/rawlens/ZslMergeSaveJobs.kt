@@ -11,6 +11,18 @@ import android.os.SystemClock
  * Save settings a ZSL merge job reads, frozen at shutter time like every
  * other save (W4): the job runs later on the writer thread.
  */
+/**
+ * Waits for a [java.util.concurrent.FutureTask] and rethrows the task's own failure, so a DNG
+ * that failed on its worker thread surfaces to the caller as the same exception type it threw
+ * instead of an ExecutionException wrapper (the save jobs' callers classify those).
+ */
+private fun <T> java.util.concurrent.FutureTask<T>.awaitResult(): T =
+    try {
+        get()
+    } catch (failure: java.util.concurrent.ExecutionException) {
+        throw failure.cause ?: failure
+    }
+
 internal data class ZslMergeSaveSettings(
     val dngBackend: DngWriterBackend,
     val dngOverrides: DngMetadataOverrides,
@@ -216,14 +228,28 @@ internal class HdrPlusZslSaveJob(private val context: Context, private val host:
                 )
             }
         )
-        if (outputFormat.includesDng) {
-            referenceDng = DngSaver(context).saveMerged(
-                effectiveMerged, refMetadata, captureTimeMillis, gps = captureGps,
-                displayName = CaptureFileNames.hdrPlusDng(captureTimeMillis),
-                sixteenBit = true, hdrPlusProvenance = provenance,
-                dngCompression = saveSettings.dngCompression
-            )
-        }
+        // The DNG write is CPU quantisation plus 75 MB of IO; the develop is a GPU pass. They
+        // read the same merged CFA and neither depends on the other, so they run at the same
+        // time -- this used to be serial, paying both in full. The DNG's result is joined at
+        // the end of the job, and a DNG failure still surfaces as the job's failure.
+        val saveStarted = SystemClock.elapsedRealtime()
+        val dngMs = java.util.concurrent.atomic.AtomicLong(0)
+        val dngTask = if (outputFormat.includesDng) {
+            java.util.concurrent.FutureTask {
+                val t0 = SystemClock.elapsedRealtime()
+                val name = DngSaver(context).saveMerged(
+                    effectiveMerged, refMetadata, captureTimeMillis, gps = captureGps,
+                    displayName = CaptureFileNames.hdrPlusDng(captureTimeMillis),
+                    sixteenBit = true, hdrPlusProvenance = provenance,
+                    dngCompression = saveSettings.dngCompression
+                )
+                dngMs.set(SystemClock.elapsedRealtime() - t0)
+                name
+            }.also { Thread(it, "rawlens-hdrplus-dng").start() }
+        } else null
+        val dngRequested = outputFormat.includesDng
+        var developMs = 0L
+        var encodeMs = 0L
         if (outputFormat.includesJpeg) {
             // The HDR+ average lives in the single-frame normalized domain, so the
             // merged develop meters through the LDR adaptive path on the merged CFA
@@ -245,7 +271,7 @@ internal class HdrPlusZslSaveJob(private val context: Context, private val host:
                     captureTimeMillis = captureTimeMillis,
                     typeSuffix = CaptureFileNames.TYPE_HDRPLUS, gps = captureGps)
                 host.publishDevelopedJxlScope(developed)
-                host.reportSaveState(if (referenceDng != null) "HDR+ MERGED+DNG • JXL" else "HDR+ MERGED • JXL")
+                host.reportSaveState(if (dngRequested) "HDR+ MERGED+DNG • JXL" else "HDR+ MERGED • JXL")
             } else {
                 val developed = developer.developMergedJpeg(effectiveMerged, refMetadata,
                     RawDevelopmentSettings(
@@ -264,7 +290,7 @@ internal class HdrPlusZslSaveJob(private val context: Context, private val host:
                         typeSuffix = CaptureFileNames.TYPE_HDRPLUS, gps = captureGps,
                         description = HdrPlusDngWriter.provenanceBlock(provenance))
                     host.publishDevelopedScope(developed.bitmap)
-                    host.reportSaveState(if (referenceDng != null) "HDR+ MERGED+DNG" else "HDR+ MERGED")
+                    host.reportSaveState(if (dngRequested) "HDR+ MERGED+DNG" else "HDR+ MERGED")
                 } finally {
                     recycleUltraHdrGainmapContents(developed)
                     developed.bitmap.recycle()
@@ -273,6 +299,16 @@ internal class HdrPlusZslSaveJob(private val context: Context, private val host:
         } else {
             host.reportSaveState("HDR+ DNG SAVED")
         }
+        val saveMs = SystemClock.elapsedRealtime() - saveStarted
+        referenceDng = dngTask?.awaitResult()
+        val totalMs = SystemClock.elapsedRealtime() - saveStarted
+        // One line per capture with the stages that actually cost time. Serial used to be
+        // dng + develop; the wait column is what the overlap saved.
+        Log.i(
+            LOG_TAG,
+            "HDR+ save: frames=${keptInputs.size} merge=${mergeMs}ms dng=${dngMs.get()}ms " +
+                "develop+encode=${saveMs}ms wait=${totalMs - saveMs}ms total=${totalMs}ms",
+        )
     }
 
     private companion object {
@@ -387,12 +423,25 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
                     "${merged.width}x${merged.height} -> ${outWidth}x${outHeight} " +
                     "at $windowColumn,$windowRow")
             }
+            // Same overlap as HDR+: the striped DNG write (CPU + IO) and the develop (GPU) read
+            // the same merge buffer and are independent. The join has to happen before
+            // merged.release() in the finally block -- the DNG thread reads merged.rgb.
+            val saveStarted = SystemClock.elapsedRealtime()
+            val dngMs = java.util.concurrent.atomic.AtomicLong(0)
             var referenceDng: String? = null
+            val dngTask = if (outputFormat.includesDng) {
+                java.util.concurrent.FutureTask {
+                    val t0 = SystemClock.elapsedRealtime()
+                    val name = saveMfsrDng(
+                        merged, captureTimeMillis, captureGps, provenance,
+                        outWidth, outHeight, windowColumn, windowRow,
+                    )
+                    dngMs.set(SystemClock.elapsedRealtime() - t0)
+                    name
+                }.also { Thread(it, "rawlens-mfsr-dng").start() }
+            } else null
+            val dngRequested = outputFormat.includesDng
             if (outputFormat.includesDng) {
-                referenceDng = saveMfsrDng(
-                    merged, captureTimeMillis, captureGps, provenance,
-                    outWidth, outHeight, windowColumn, windowRow,
-                )
                 host.reportSaveState("${settings.label} DNG SAVED")
             }
             if (outputFormat.includesJpeg) {
@@ -418,7 +467,7 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
                         captureTimeMillis = captureTimeMillis,
                         typeSuffix = settings.mergeFileSuffix(), gps = captureGps)
                     host.publishDevelopedJxlScope(developed)
-                    host.reportSaveState(if (referenceDng != null) "${settings.label} MERGED+DNG • JXL" else "${settings.label} MERGED • JXL")
+                    host.reportSaveState(if (dngRequested) "${settings.label} MERGED+DNG • JXL" else "${settings.label} MERGED • JXL")
                 } else {
                     val developed = developer.developMfsrJpeg(
                         merged.rgb, outWidth, outHeight,
@@ -433,7 +482,7 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
                             typeSuffix = settings.mergeFileSuffix(), gps = captureGps,
                             description = LinearRgbDngWriter.provenanceBlock(provenance))
                         host.publishDevelopedScope(developed.bitmap)
-                        host.reportSaveState(if (referenceDng != null) "${settings.label} MERGED+DNG" else "${settings.label} MERGED")
+                        host.reportSaveState(if (dngRequested) "${settings.label} MERGED+DNG" else "${settings.label} MERGED")
                     } finally {
                         recycleUltraHdrGainmapContents(developed)
                         developed.bitmap.recycle()
@@ -442,6 +491,17 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
             } else {
                 host.reportSaveState("${settings.label} DNG SAVED")
             }
+            val saveMs = SystemClock.elapsedRealtime() - saveStarted
+            // Joined inside the try, before merged.release(): the DNG thread is still reading
+            // merged.rgb until it returns.
+            referenceDng = dngTask?.awaitResult()
+            val totalMs = SystemClock.elapsedRealtime() - saveStarted
+            Log.i(
+                LOG_TAG,
+                "MFSR save: frames=${merged.keptCount} merge=${merged.mergeMs}ms " +
+                    "dng=${dngMs.get()}ms develop+encode=${saveMs}ms " +
+                    "wait=${totalMs - saveMs}ms total=${totalMs}ms crop=${outWidth}x$outHeight",
+            )
         } finally {
             // Native output (MfsrMerge): free once the DNG/JPEG tail is done.
             merged.release()
