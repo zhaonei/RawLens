@@ -92,8 +92,16 @@ jobs:
           # version.properties (see app/build.gradle.kts), so consecutive CI builds
           # install as upgrades instead of colliding.
           ./gradlew :app:assembleGithubRelease --stacktrace
-          APK="$(find app/build/outputs/apk/github/release -name '*unsigned*.apk' | head -1)"
-          test -n "$APK" && test -f "$APK"
+          echo "--- what was produced ---"
+          find app/build/outputs/apk -type f -name '*.apk' -printf '%10s  %p\n' | sort -k2
+          # AGP does not necessarily name an unsigned APK "*-unsigned.apk" (this project's
+          # version-named output does not), so pick whatever single non-test APK the
+          # github/release directory holds and prove it is unsigned below.
+          APK="$(find app/build/outputs/apk/github/release -maxdepth 1 -type f -name '*.apk' | head -1)"
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "::error::assembleGithubRelease produced no APK to sign"
+            exit 1
+          fi
           if "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$APK" >/dev/null 2>&1; then
             echo "::error::The Gradle build unexpectedly produced a signed APK"
             exit 1
@@ -111,8 +119,11 @@ jobs:
         run: |
           set -euo pipefail
           BT="$ANDROID_HOME/build-tools/36.0.0"
-          APK="$(find app/build/outputs/apk/github/release -name '*unsigned*.apk' | head -1)"
-          test -n "$APK" && test -f "$APK"
+          APK="$(find app/build/outputs/apk/github/release -maxdepth 1 -type f -name '*.apk' | head -1)"
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "::error::no APK from the assemble step"
+            exit 1
+          fi
           : "${SIGNING_KEYSTORE:?secret SIGNING_KEYSTORE is empty or missing}"
           : "${SIGNING_KEY_ALIAS:?secret SIGNING_KEY_ALIAS is empty or missing}"
           : "${SIGNING_KEYSTORE_PASSWORD:?secret SIGNING_KEYSTORE_PASSWORD is empty or missing}"
