@@ -1707,6 +1707,10 @@ class RawCameraController(
                 }
             }
             Log.i(LOG_TAG, "Session ready (zsl=$rawZslStreaming vf=$rawViewfinderStreaming)")
+            // A restarted session replaces the preview surface, which drops the transform the
+            // slider put on it: without this the frame snaps back to full-frame right after a
+            // capture or a lens switch, losing the framing the user just set.
+            applyPreviewZoom()
             logAfCapabilities()
             onState(if (rawZslStreaming) "READY • ZSL WARMING" else "READY")
         }
@@ -4822,29 +4826,39 @@ class RawCameraController(
      * each frame in it still sees the whole sensor and the same field of view, and the
      * discarded border is discarded after fusion.
      */
+    /**
+     * Frames the preview at [multiplier]. Preview only, on purpose: switching lenses restarts the
+     * camera session (black frame + a fresh AF hunt), so doing it on every move made a drag across
+     * a detent stutter. The switch happens on [commitUiZoom], i.e. when the finger lifts.
+     */
     fun setUiZoom(multiplier: Float) {
         val target = ZoomStops.clamp(multiplier)
         if (kotlin.math.abs(target - uiZoom) < 1e-4f) return
         uiZoom = target
-        val snapped = ZoomStops.snap(target, zoomDetents())
-        if (snapped != null) {
-            val lens = rawCameraIds.filter { !isFrontCamera(it) }
-                .firstOrNull { kotlin.math.abs(lensMultiplier(it) - snapped) < 0.05f }
-            if (lens != null && lens != selectedCameraId) {
-                // selectLens() is the app's own lens switch: it posts to the camera thread
-                // and refuses while a capture is in flight. Reaching into selectedCameraId
-                // and calling restartCameraForConfigurationChange() from here is what threw
-                // IllegalStateException("Check failed") -- that function opens with
-                // check(isOnCameraThread()), and a touch handler runs on the main thread.
-                selectLens(lens)
-            }
-        }
         applyPreviewZoom()
         uiZoomListener?.invoke(uiZoom)
         // Freeze point for the save jobs (see UiZoomState). A drag while a merge is being
         // written must not change what that merge crops to, so this only moves between
         // captures; the shutter sets it unconditionally.
         if (!captureInProgress.get()) UiZoomState.captureMultiplier = uiZoom
+    }
+
+    /**
+     * Ends a zoom gesture: only here may the physical lens change. Idempotent, so a settled
+     * value that is not on a detent (or already on the active lens) costs nothing.
+     */
+    fun commitUiZoom(multiplier: Float) {
+        val target = ZoomStops.clamp(multiplier)
+        val snapped = ZoomStops.snap(target, zoomDetents()) ?: return
+        val lens = rawCameraIds.filter { !isFrontCamera(it) }
+            .firstOrNull { kotlin.math.abs(lensMultiplier(it) - snapped) < 0.05f } ?: return
+        if (lens == selectedCameraId) return
+        // selectLens() is the app's own lens switch: it posts to the camera thread and refuses
+        // while a capture is in flight. Touching selectedCameraId and calling
+        // restartCameraForConfigurationChange() from the touch thread is what threw
+        // IllegalStateException("Check failed") -- that function opens with
+        // check(isOnCameraThread()).
+        selectLens(lens)
     }
 
     /**
