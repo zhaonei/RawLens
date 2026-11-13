@@ -6672,22 +6672,22 @@ class RawCameraController(
         val captureDngOverrides = dngMetadataOverrides(selectedCameraId)
         // Freeze the exact paired result before crossing to the writer thread. Future JPEG
         // development consumes this snapshot, never a later preview result or mutable HAL array.
-        val frameMetadata = try {
-            RawFrameMetadataFactory.capture(
-                selectedCameraId ?: "unknown",
-                image,
-                c,
-                result,
-                orientation,
-                levelOverrides = captureDngOverrides,
-                // Frozen here, like every other capture setting: the save job runs on a
-                // writer thread after this, and must crop the frame exactly as framed.
-                zoomMultiplier = uiZoom
-            )
-            // The burst/bracket pipelines rebuild their per-frame metadata in the save job,
-            // so the value has to be visible outside this object too.
-            UiZoomState.captureMultiplier = uiZoom
-        } catch (failure: Exception) {
+        // The burst/bracket pipelines rebuild their per-frame metadata in the save job,
+// so the value has to be visible outside this object too.
+UiZoomState.captureMultiplier = uiZoom
+val frameMetadata = try {
+    RawFrameMetadataFactory.capture(
+        selectedCameraId ?: "unknown",
+        image,
+        c,
+        result,
+        orientation,
+        levelOverrides = captureDngOverrides,
+        // Frozen here, like every other capture setting: the save job runs on a
+        // writer thread after this, and must crop the frame exactly as framed.
+        zoomMultiplier = uiZoom
+    )
+} catch (failure: Exception) {
             ownership.close()
             Log.e(LOG_TAG, "Could not snapshot RAW save metadata", failure)
             finishCapture("SAVE ERROR")
