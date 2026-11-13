@@ -216,7 +216,10 @@ class ZoomCropTest {
         assertEquals(200, cropped.width)
         assertEquals(150, cropped.height)
         assertEquals(100, cropped.sensorCropLeft)
-        assertEquals(75, cropped.sensorCropTop)
+        // (300 - 150) / 2 = 75, which is ODD: the origin is aligned DOWN to 74 so the crop
+        // keeps the 2x2 Bayer phase. That one-pixel asymmetry at the bottom edge is the
+        // price of an even origin, and it is why the assertion is 74 and not 75.
+        assertEquals(74, cropped.sensorCropTop)
     }
 
     @Test
