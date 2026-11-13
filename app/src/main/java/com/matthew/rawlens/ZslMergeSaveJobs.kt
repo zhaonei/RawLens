@@ -356,9 +356,28 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
                 if (settings.engine == MfsrEngine.LKR && settings.lkrMiddleReference)
                     "auto (sharpest of the middle three, blur rejection)"
                 else "auto (sharpness and blur rejection)")
+            // Super-resolved output is a linear RGB plane, not a CFA, so the viewfinder crop
+            // cannot go through ZoomCrop: the frame is cut where it is written and where it is
+            // developed. Both read a WINDOW of the merge buffer, so the crop costs no copy.
+            val window = ZoomCrop.rectFor(
+                merged.width, merged.height, merged.refMetadata.zoomMultiplier,
+                minEdge = 2, evenAligned = false,
+            )
+            val outWidth = window?.width ?: merged.width
+            val outHeight = window?.height ?: merged.height
+            val windowColumn = window?.left ?: 0
+            val windowRow = window?.top ?: 0
+            if (window != null) {
+                Log.i(LOG_TAG, "MFSR crop ${merged.refMetadata.zoomMultiplier}x: " +
+                    "${merged.width}x${merged.height} -> ${outWidth}x${outHeight} " +
+                    "at $windowColumn,$windowRow")
+            }
             var referenceDng: String? = null
             if (outputFormat.includesDng) {
-                referenceDng = saveMfsrDng(merged, captureTimeMillis, captureGps, provenance)
+                referenceDng = saveMfsrDng(
+                    merged, captureTimeMillis, captureGps, provenance,
+                    outWidth, outHeight, windowColumn, windowRow,
+                )
                 host.reportSaveState("${settings.label} DNG SAVED")
             }
             if (outputFormat.includesJpeg) {
@@ -372,17 +391,27 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
                 )
                 val developer = host.developer()
                 if (developedFormat == DevelopedFormat.JXL) {
-                    val developed = developer.developMfsrJxl(merged.rgb, merged.width, merged.height,
+                    val developed = developer.developMfsrJxl(
+                        merged.rgb, outWidth, outHeight,
                         merged.refMetadata, development,
-                        look = outputSettings, jxl = jxlSettings)
+                        look = outputSettings, jxl = jxlSettings,
+                        sourceRowStride = merged.width,
+                        sourceColumnOffset = windowColumn,
+                        sourceRowOffset = windowRow,
+                    )
                     JxlSaver(context).save(developed, merged.refMetadata, merged.refResult,
                         captureTimeMillis = captureTimeMillis,
                         typeSuffix = settings.mergeFileSuffix(), gps = captureGps)
                     host.publishDevelopedJxlScope(developed)
                     host.reportSaveState(if (referenceDng != null) "${settings.label} MERGED+DNG • JXL" else "${settings.label} MERGED • JXL")
                 } else {
-                    val developed = developer.developMfsrJpeg(merged.rgb, merged.width, merged.height,
-                        merged.refMetadata, development, outputSettings)
+                    val developed = developer.developMfsrJpeg(
+                        merged.rgb, outWidth, outHeight,
+                        merged.refMetadata, development, outputSettings,
+                        sourceRowStride = merged.width,
+                        sourceColumnOffset = windowColumn,
+                        sourceRowOffset = windowRow,
+                    )
                     try {
                         JpegSaver(context).save(developed, merged.refMetadata,
                             merged.refResult, captureTimeMillis = captureTimeMillis,
@@ -409,13 +438,22 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
         merged: MfsrMerge.MfsrResult,
         captureTimeMillis: Long,
         captureGps: GpsLocation?,
-        provenance: MergeProvenance
+        provenance: MergeProvenance,
+        outWidth: Int,
+        outHeight: Int,
+        windowColumn: Int,
+        windowRow: Int,
     ): String {
         merged.rgb.rewind()
-        // C11: striped from the native merge buffer (no 150 MB heap copy)
+        // C11: striped from the native merge buffer (no 150 MB heap copy). With a zoom crop
+        // the writer reads only the window's rows and columns, so the saved DNG is the framed
+        // region rather than the whole sensor.
         return LinearRgbDngSaver(context).saveLinearRgbStriped(
-            merged.width, merged.height, merged.rgb.asFloatBuffer(),
-            merged.refMetadata, provenance, captureId = captureTimeMillis, gps = captureGps
+            outWidth, outHeight, merged.rgb.asFloatBuffer(),
+            merged.refMetadata, provenance, captureId = captureTimeMillis, gps = captureGps,
+            sourceRowStride = merged.width,
+            sourceColumnOffset = windowColumn,
+            sourceRowOffset = windowRow,
         )
     }
 
