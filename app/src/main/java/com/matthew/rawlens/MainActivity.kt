@@ -491,6 +491,9 @@ class MainActivity : Activity() {
         if (!::controller.isInitialized) return
         slider.setDetents(controller.zoomDetents())
         slider.onZoom = { multiplier -> controller.setUiZoom(multiplier) }
+        // Lens switches restart the session (black frame + AF re-hunt), so they only happen
+        // once the finger lifts instead of on every pixel of the drag.
+        slider.onZoomSettled = { multiplier -> controller.commitUiZoom(multiplier) }
         // The visible preview is whichever surface the active route draws into: the ISP
         // SurfaceView, the RAW GPU viewfinder, or the BGU one. All of them get the same
         // transform; the overlays (focus, level, guides, scopes) deliberately do not, or the
