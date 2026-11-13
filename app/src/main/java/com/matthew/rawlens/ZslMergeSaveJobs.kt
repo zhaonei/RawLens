@@ -19,6 +19,13 @@ internal data class ZslMergeSaveSettings(
     val jxl: JxlOutputSettings,
     val exposureMode: CaptureExposureMode,
     val focusView: Pair<Float, Float>?,
+    /**
+     * Viewfinder zoom frozen at the shutter, carried on the settings like every other capture
+     * choice. Reading the process-wide [UiZoomState] here instead would make the crop follow the
+     * slider: a merge takes seconds, and any drag after the shutter would silently re-frame a
+     * burst that is already captured.
+     */
+    val zoomMultiplier: Float = 1f,
 )
 
 /**
@@ -74,7 +81,9 @@ internal class HdrPlusZslSaveJob(private val context: Context, private val host:
             val overrides = saveSettings.dngOverrides
             selected.forEachIndexed { index, frame ->
                 val metadata = RawFrameMetadataFactory.capture(
-                    cameraId, frame.image, c, frame.result, orientation, levelOverrides = saveSettings.dngOverrides
+                    cameraId, frame.image, c, frame.result, orientation,
+                    levelOverrides = saveSettings.dngOverrides,
+                    zoomMultiplier = saveSettings.zoomMultiplier,
                 )
                 val buffer = frame.image.planes.single().buffer
                 val position = buffer.position()
@@ -94,7 +103,11 @@ internal class HdrPlusZslSaveJob(private val context: Context, private val host:
             }
         }
         val inputs = selected.map { frame ->
-            val metadata = RawFrameMetadataFactory.capture(cameraId, frame.image, c, frame.result, orientation, levelOverrides = saveSettings.dngOverrides)
+            val metadata = RawFrameMetadataFactory.capture(
+                cameraId, frame.image, c, frame.result, orientation,
+                levelOverrides = saveSettings.dngOverrides,
+                zoomMultiplier = saveSettings.zoomMultiplier,
+            )
             val geometry = metadata.bufferGeometry as? RawBufferGeometry.Supported
                 ?: throw UnsupportedOperationException("HDR+ RAW geometry is not supported")
             val normalization = metadata.normalizationOrNull()
@@ -295,7 +308,9 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
             val overrides = saveSettings.dngOverrides
             selected.forEachIndexed { index, frame ->
                 val metadata = RawFrameMetadataFactory.capture(
-                    cameraId, frame.image, c, frame.result, orientation, levelOverrides = saveSettings.dngOverrides
+                    cameraId, frame.image, c, frame.result, orientation,
+                    levelOverrides = saveSettings.dngOverrides,
+                    zoomMultiplier = saveSettings.zoomMultiplier,
                 )
                 val buffer = frame.image.planes.single().buffer
                 val position = buffer.position()
@@ -360,7 +375,7 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
             // cannot go through ZoomCrop: the frame is cut where it is written and where it is
             // developed. Both read a WINDOW of the merge buffer, so the crop costs no copy.
             val window = ZoomCrop.rectFor(
-                merged.width, merged.height, merged.refMetadata.zoomMultiplier,
+                merged.width, merged.height, saveSettings.zoomMultiplier,
                 minEdge = 2, evenAligned = false,
             )
             val outWidth = window?.width ?: merged.width
@@ -368,7 +383,7 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
             val windowColumn = window?.left ?: 0
             val windowRow = window?.top ?: 0
             if (window != null) {
-                Log.i(LOG_TAG, "MFSR crop ${merged.refMetadata.zoomMultiplier}x: " +
+                Log.i(LOG_TAG, "MFSR crop ${saveSettings.zoomMultiplier}x: " +
                     "${merged.width}x${merged.height} -> ${outWidth}x${outHeight} " +
                     "at $windowColumn,$windowRow")
             }
