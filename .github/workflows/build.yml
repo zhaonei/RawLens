@@ -74,11 +74,13 @@ jobs:
           sed -i 's/^toolchainVersion=.*/toolchainVersion=21/' gradle/gradle-daemon-jvm.properties
           echo "after:  $(cat gradle/gradle-daemon-jvm.properties)"
 
+      # Two distribution flavors, so every task name carries one: the fork ships the
+      # `github` flavor (update check on, F-Droid build would pin and strip it).
       - name: Zoom-crop unit tests
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew :app:testDebugUnitTest \
+          ./gradlew :app:testGithubDebugUnitTest \
             --tests "com.matthew.rawlens.ZoomCropTest" \
             --stacktrace
 
@@ -86,9 +88,12 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew :app:assembleRelease --stacktrace
-          APK=app/build/outputs/apk/release/app-release-unsigned.apk
-          test -f "$APK"
+          # assembleGithubRelease also bumps versionCode/versionName in
+          # version.properties (see app/build.gradle.kts), so consecutive CI builds
+          # install as upgrades instead of colliding.
+          ./gradlew :app:assembleGithubRelease --stacktrace
+          APK="$(find app/build/outputs/apk/github/release -name '*unsigned*.apk' | head -1)"
+          test -n "$APK" && test -f "$APK"
           if "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$APK" >/dev/null 2>&1; then
             echo "::error::The Gradle build unexpectedly produced a signed APK"
             exit 1
@@ -106,7 +111,8 @@ jobs:
         run: |
           set -euo pipefail
           BT="$ANDROID_HOME/build-tools/36.0.0"
-          APK=app/build/outputs/apk/release/app-release-unsigned.apk
+          APK="$(find app/build/outputs/apk/github/release -name '*unsigned*.apk' | head -1)"
+          test -n "$APK" && test -f "$APK"
           : "${SIGNING_KEYSTORE:?secret SIGNING_KEYSTORE is empty or missing}"
           : "${SIGNING_KEY_ALIAS:?secret SIGNING_KEY_ALIAS is empty or missing}"
           : "${SIGNING_KEYSTORE_PASSWORD:?secret SIGNING_KEYSTORE_PASSWORD is empty or missing}"
