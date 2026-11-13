@@ -3235,6 +3235,9 @@ class RawCameraController(
         jxl = activeJxlOutputSettings,
         exposureMode = activeCaptureExposureMode,
         focusView = developFocusView,
+        // Frozen at the shutter with everything else: a merge runs for seconds, and the crop
+        // must describe how the picture was framed, not where the slider is when it finishes.
+        zoomMultiplier = uiZoom,
     )
 
     private fun saveMfsrMerge(selected: List<BufferedRawFrame>) {
@@ -6672,22 +6675,24 @@ class RawCameraController(
         val captureDngOverrides = dngMetadataOverrides(selectedCameraId)
         // Freeze the exact paired result before crossing to the writer thread. Future JPEG
         // development consumes this snapshot, never a later preview result or mutable HAL array.
-        // The burst/bracket pipelines rebuild their per-frame metadata in the save job,
-// so the value has to be visible outside this object too.
-UiZoomState.captureMultiplier = uiZoom
-val frameMetadata = try {
-    RawFrameMetadataFactory.capture(
-        selectedCameraId ?: "unknown",
-        image,
-        c,
-        result,
-        orientation,
-        levelOverrides = captureDngOverrides,
-        // Frozen here, like every other capture setting: the save job runs on a
-        // writer thread after this, and must crop the frame exactly as framed.
-        zoomMultiplier = uiZoom
-    )
-} catch (failure: Exception) {
+        // The burst/bracket pipelines rebuild their per-frame metadata in the save job, so the
+        // multiplier has to be visible outside this object too. Set it OUTSIDE the try: inside,
+        // the assignment would become the try-expression's value and 'frameMetadata' would be a
+        // Unit, which is exactly how this failed to compile the first time.
+        UiZoomState.captureMultiplier = uiZoom
+        val frameMetadata = try {
+            RawFrameMetadataFactory.capture(
+                selectedCameraId ?: "unknown",
+                image,
+                c,
+                result,
+                orientation,
+                levelOverrides = captureDngOverrides,
+                // Frozen here, like every other capture setting: the save job runs on a
+                // writer thread after this, and must crop the frame exactly as framed.
+                zoomMultiplier = uiZoom
+            )
+        } catch (failure: Exception) {
             ownership.close()
             Log.e(LOG_TAG, "Could not snapshot RAW save metadata", failure)
             finishCapture("SAVE ERROR")
