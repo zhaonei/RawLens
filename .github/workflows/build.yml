@@ -4,10 +4,11 @@
 # this workflow only builds, signs and publishes it.
 #
 # What it does:
-#   1. runs the zoom-crop unit tests (the one piece of new logic this fork adds);
-#   2. :app:assembleRelease -> UNSIGNED, minified APK;
-#   3. zipalign -P 16 (16 KB page alignment for the bundled .so) then apksigner with
-#      v1 (JAR) AND v2 AND v3 all forced on;
+#   1. runs the zoom unit tests (the one piece of new logic this fork adds);
+#   2. :app:assembleGithubRelease, signed by AGP with this fork's key through the
+#      project's own RAWLENS_KEYSTORE hook (it otherwise falls back to the debug key);
+#   3. zipalign -P 16 (16 KB page alignment) then re-sign with the SAME key to add the
+#      v1 JAR scheme AGP skips at minSdk 29, so v1 + v2 + v3 are all present;
 #   4. verifies all three schemes at --min-sdk-version 18 (below 24 is what makes
 #      apksigner actually check the v1 JAR signature) and prints the signer;
 #   5. uploads the APK as a workflow artifact and attaches it to a Release.
@@ -248,9 +249,3 @@ jobs:
             Verify the download before installing:
 
             ```
-            ${{ env.APK_SHA256 }}
-            ```
-          files: |
-            ${{ env.SIGNED_APK }}
-            out/SHA256SUMS.txt
-          fail_on_unmatched_files: true
