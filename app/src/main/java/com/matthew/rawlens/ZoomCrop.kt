@@ -149,9 +149,25 @@ internal object ZoomCrop {
      * shutter press, so every output of one capture crops the same way.
      */
     fun applyIfNeeded(cfa: UnpackedRawCfa, zoomMultiplier: Float): UnpackedRawCfa {
-        if (isIdentity(zoomMultiplier)) return cfa
+        // One line per output path: the only way to tell 'the crop did not fire' from 'the
+        // multiplier never reached the writer' without guessing from a finished file.
+        if (isIdentity(zoomMultiplier)) {
+            android.util.Log.i(
+                "ZoomCrop",
+                "no crop: multiplier=$zoomMultiplier frame=${cfa.width}x${cfa.height}",
+            )
+            return cfa
+        }
         val crop = rectFor(cfa.width, cfa.height, zoomMultiplier) ?: return cfa
-        if (crop.left + crop.width > cfa.width || crop.top + crop.height > cfa.height) return cfa
+        if (crop.left + crop.width > cfa.width || crop.top + crop.height > cfa.height) {
+            android.util.Log.w("ZoomCrop", "crop skipped: $crop escapes ${cfa.width}x${cfa.height}")
+            return cfa
+        }
+        android.util.Log.i(
+            "ZoomCrop",
+            "crop ${zoomMultiplier}x: ${cfa.width}x${cfa.height} -> ${crop.width}x${crop.height} " +
+                "at ${crop.left},${crop.top}",
+        )
         return applyTo(cfa, crop)
     }
 
