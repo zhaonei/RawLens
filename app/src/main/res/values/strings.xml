@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: 2026 RawLens contributors -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!--
+  The zoom track is the first piece of this UI that takes its text from resources rather
+  than an inline literal, so the strings it needs live here (and in values-zh-rCN). The
+  rest of the app still hard-codes its labels in Kotlin; localising those is a separate
+  extraction pass, not a translation.
+-->
+<resources>
+    <string name="zoom_slider_description">Zoom</string>
+</resources>

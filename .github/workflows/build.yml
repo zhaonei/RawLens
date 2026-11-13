@@ -76,12 +76,13 @@ jobs:
 
       # Two distribution flavors, so every task name carries one: the fork ships the
       # `github` flavor (update check on, F-Droid build would pin and strip it).
-      - name: Zoom-crop unit tests
+      - name: Zoom unit tests (crop geometry + track scale)
         run: |
           set -euo pipefail
           chmod +x ./gradlew
           ./gradlew :app:testGithubDebugUnitTest \
             --tests "com.matthew.rawlens.ZoomCropTest" \
+            --tests "com.matthew.rawlens.ZoomStopsTest" \
             --stacktrace
 
       # This project signs its own release output: with RAWLENS_KEYSTORE set,
