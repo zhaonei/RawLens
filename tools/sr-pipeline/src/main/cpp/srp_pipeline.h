@@ -222,6 +222,21 @@ Status SrpGreyFftGpu(Context* ctx, uint32_t w, uint32_t h, const float* in,
 Status SrpGreyFftMixedGpu(Context* ctx, uint32_t w, uint32_t h,
                           VkBuffer real_buffer, float* out,
                           VkShaderModule grey_module);
+// SrpGreyFirGpu: separable half-band FIR grey (grey_fir.comp), mobile
+// replacement for the FFT grey; taps from Grey.halfBandTaps.
+// SrpGreyFirToResGpu: FIR grey into a resident buffer (no download).
+Status SrpGreyFirToResGpu(Context* ctx, uint32_t w, uint32_t h, VkBuffer real_buffer,
+                          VkBuffer out_buffer, VkShaderModule fir_module,
+                          const float* taps, uint32_t radius,
+                          VkBuffer tmp_buffer = VK_NULL_HANDLE);
+// SrpPyrLevelGpu: one GPU moving-pyramid level (pyr_down.comp).
+Status SrpPyrLevelGpu(Context* ctx, VkBuffer src, uint32_t src_w, uint32_t src_h,
+                      uint32_t pad_w, uint32_t pad_h, VkBuffer dst, uint32_t out_w,
+                      uint32_t out_h, uint32_t factor, uint32_t k_taps,
+                      const float* half_taps, VkBuffer tmp_buffer, VkShaderModule module);
+Status SrpGreyFirGpu(Context* ctx, uint32_t w, uint32_t h, VkBuffer real_buffer,
+                     float* out, VkShaderModule fir_module, const float* taps,
+                     uint32_t radius);
 Status SrpGreyFftHaveGpu(Context* ctx, uint32_t w, uint32_t h,
                          VkBuffer real_buffer, float* out,
                          VkShaderModule fft_module,
@@ -257,12 +272,19 @@ Status SrpCorrExtractGpu(Context* ctx, uint32_t height, uint32_t width,
                          uint32_t chunk_tiles, VkBuffer mov_buffer,
                          VkBuffer flow_buffer, VkBuffer patch_buffer,
                          VkShaderModule shader_module);
+// Fused L2 block matching for one level (corr_l2_fused.comp), see .cpp.
+Status SrpCorrL2FusedGpu(Context* ctx, uint32_t width, uint32_t height,
+                         uint32_t tile_count, uint32_t tile_size, uint32_t radius,
+                         uint32_t ntx, uint32_t flip, VkBuffer ref_buffer,
+                         VkBuffer mov_buffer, VkBuffer flow_buffer,
+                         VkBuffer delta_buffer, VkShaderModule shader_module);
 Status SrpCorrArgminGpu(Context* ctx, uint32_t tile_count, uint32_t tile_size,
                         uint32_t radius, uint32_t ntx, uint32_t tile_offset,
                         uint32_t chunk_tiles, uint32_t patch_count,
                         uint32_t corr_count, VkBuffer patch_buffer,
                         VkBuffer corr_buffer, VkBuffer dflow_buffer,
-                        VkShaderModule shader_module);
+                        VkShaderModule shader_module,
+                        bool workgroup_per_tile = false);
 // SrpCorrCropGpu: `full_buffer` holds tile_count*S*S floats (full S×S
 // corr maps), `crop_buffer` receives tile_count*C*C floats (centre C×C
 // crop, C = 2*radius+1, crop=(S-1-C)/2 with the +1 offset — the host
@@ -296,7 +318,8 @@ Status SrpAlignL1Gpu(Context* ctx, uint32_t width, uint32_t height,
                      uint32_t tile_count, uint32_t tile_size,
                      uint32_t search_radius, uint32_t ntx, VkBuffer ref_buffer,
                      VkBuffer mov_buffer, VkBuffer flow_buffer,
-                     VkShaderModule shader_module);
+                     VkShaderModule shader_module,
+                     bool workgroup_per_tile = false);
 
 // 128-byte HmsrPush mirror shared by the port-style shaders (gat.comp,
 // align.comp, ...; port PUSH_FMT "<6I4fI21I"): 6x u32, 4x f32, mode u32,
@@ -437,6 +460,8 @@ Status SrpDivideGpu(Context* ctx, uint32_t count, VkBuffer num_buffer,
 // pad[1] = ntx, pad[2] = hr_w); fence-waited; context/buffers/module
 // stay caller-owned. Returns kOk / kInitFailed / kNoDevice /
 // kDispatchFailed.
+// ref_kernels bits: 0 reference-grid covariance, 1 reference frame,
+// 2 detail reconstruction (scale-aware comparison bandwidth). Legacy 0/1 unchanged.
 Status SrpMergeSplatGpu(Context* ctx, uint32_t lr_w, uint32_t lr_h,
                         uint32_t hr_w, uint32_t hr_h, VkBuffer comp_buffer,
                         VkBuffer flow_buffer, VkBuffer cov_buffer,
@@ -444,7 +469,9 @@ Status SrpMergeSplatGpu(Context* ctx, uint32_t lr_w, uint32_t lr_h,
                         VkBuffer den_buffer, uint32_t tile_size, float scale,
                         uint32_t mode, uint32_t ftx, uint32_t fty,
                         VkShaderModule shader_module,
-                        uint32_t ref_kernels = 0);
+                        uint32_t ref_kernels = 0, float chroma_scale = 1.0f,
+                        float green_frame_weight = 1.0f,
+                        float frame_equalize = 0.0f);
 
 // SrpCorrDirectGpu: L2 block-matching cross term (corr_direct.comp) for
 // `chunk_tiles` tiles from `tile_offset`: `ref_buffer` = pinned reference
@@ -471,7 +498,7 @@ Status SrpKernelNetCovGpu(Context* ctx, uint32_t raw_w, uint32_t raw_h,
                           VkBuffer act0_buffer, VkBuffer act1_buffer,
                           VkBuffer map_buffer, VkBuffer cov_buffer,
                           VkShaderModule shader_module, uint32_t flip_x,
-                          uint32_t flip_y);
+                          uint32_t flip_y, float sigma_floor = 0.90f);
 
 
 // Real GPU paths for robustness estimation (shaders/robustness.comp,
@@ -491,7 +518,9 @@ Status SrpKernelNetCovGpu(Context* ctx, uint32_t raw_w, uint32_t raw_h,
 // `s_buffer` holds the ftx*fty flow-spread map (op 6, SrpSmapGpu);
 // `out_buffer` receives the gh*gw locally-minimised robustness map.
 // `tile_size` is the raw-basis tile size (halved internally);
-// `noise_correction` toggles the LUT leg of op 3; `t_bits` carries the
+// `noise_correction` bit 0 toggles the LUT leg of op 3; bit 1 opts into
+// the continuous KernelNet flow/S field for warp and threshold. Existing
+// 0/1 callers retain reference sampling. `t_bits` carries the
 // threshold t by bit pattern. All intermediates (guide, comp stats,
 // warped, d, sigma, pre-min R) are allocated and freed inside the call.
 //

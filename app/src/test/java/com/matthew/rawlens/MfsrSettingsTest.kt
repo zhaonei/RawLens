@@ -10,6 +10,15 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MfsrSettingsTest {
+    @Test fun lkrKernelNetDefaultsOnAndPreservesExplicitChoice() {
+        assertTrue(MfsrSettings().lkrKernelNetDenoise)
+        assertTrue(MfsrSettings.fromPreferences(emptyMap<String, Any>()).lkrKernelNetDenoise)
+        for (enabled in listOf(false, true)) {
+            val settings = MfsrSettings(lkrKernelNetDenoise = enabled)
+            assertEquals(settings, MfsrSettings.fromPreferences(settings.toPreferences()))
+        }
+    }
+
     @Test fun preferencesSurviveReload() {
         for (enabled in listOf(false, true)) {
             val original = MfsrSettings(enabled = enabled, keepSourceBurst = enabled)
@@ -39,7 +48,7 @@ class MfsrSettingsTest {
         assertEquals(59, settings.activeFrameCount(80))
         assertEquals("LK-R\n×40", settings.quickText(MfsrEngine.LKR, 40, 40, true, false))
         for (z in listOf(LkrZoom.X1_5, LkrZoom.X2, LkrZoom.FULL_2X))
-            assertEquals(24, settings.copy(lkrZoom = z).activeFrameCount(40))
+            assertEquals(30, settings.copy(lkrZoom = z).activeFrameCount(40))
     }
 
     @Test fun quickTextUsesConfiguredCountAndWaitsForFullSelection() {
@@ -59,6 +68,13 @@ class MfsrSettingsTest {
         assertTrue(MfsrSettings.fromPreferences(emptyMap<String, Any>()).lkrMiddleReference)
         val off = MfsrSettings(lkrMiddleReference = false)
         assertFalse(MfsrSettings.fromPreferences(off.toPreferences()).lkrMiddleReference)
+    }
+
+    @Test fun kbSr2xDefaultsOffAndRoundTrips() {
+        assertFalse(MfsrSettings().mfsrFullRes)
+        assertFalse(MfsrSettings.fromPreferences(emptyMap<String, Any>()).mfsrFullRes)
+        val on = MfsrSettings(mfsrFullRes = true)
+        assertTrue(MfsrSettings.fromPreferences(on.toPreferences()).mfsrFullRes)
     }
 
     @Test fun lkrDefaultsToNoPrior() {

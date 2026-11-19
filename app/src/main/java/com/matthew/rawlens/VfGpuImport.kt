@@ -255,7 +255,7 @@ internal object VfGpuImport {
             " fract(dot(p + ch * 16.0 + 5.588238, vec2(0.06711056, 0.00583715)))); }"
 
     private const val AGX_UNIFORMS =
-        "uniform int u_jpeg;" +
+        "uniform int u_jpeg; uniform int u_basic;" +
             "uniform float u_agxPunchy; uniform float u_agxContrast; uniform float u_agxSaturation; uniform float u_agxPurity;" +
             "uniform float u_agxHue; uniform float u_agxShadowEv; uniform float u_agxHighlightEv;" +
             "uniform float u_agxGamut; uniform float u_exposureEv; uniform float u_highlightShoulder;" +
@@ -283,7 +283,24 @@ internal object VfGpuImport {
             " float whiteBlend = max(whiteB.r, max(whiteB.g, whiteB.b));" +
             " cam = mix(cam, u_cameraWhite, whiteBlend);" +
             " cam *= exp2(u_exposureEv);" +
-            " vec3 scene = max(acesCgToRec2020() * (u_camToAces * cam), vec3(0.0));" +
+            " vec3 balancedAces = camera_tone_balance(u_camToAces * cam);" +
+            " vec3 scene2020 = acesCgToRec2020() * balancedAces;" +
+            " if (u_basic == 3) { vec3 se=srgbOetf(clamp(aces2_output(balancedAces,u_displayP3),0.0,1.0));" +
+            " @OUT@=vec4(se,1.0); return; }" +
+            " if (u_basic == 2) { mat3 sm=rec2020ToSrgb(); if(u_displayP3!=0)sm=rec2020ToDisplayP3();" +
+            " vec3 se=srgbOetf(clamp(sm*dt_sigmoid(scene2020),0.0,1.0));" +
+            " @OUT@=vec4(se,1.0); return; }" +
+            " if (u_basic == 1) {" +
+            "  mat3 basicMat = rec2020ToSrgb(); if (u_displayP3 != 0) basicMat = rec2020ToDisplayP3();" +
+            "  vec3 basicScene = basicMat * scene2020; float peak = max(basicScene.r, max(basicScene.g, basicScene.b));" +
+            "  if (peak > 0.6 && u_highlightShoulder > 0.0) { float t = peak - 0.6;" +
+            "   float compressed = 0.6 + t / (1.0 + t / 0.4);" +
+            "   basicScene *= mix(1.0, compressed / peak, clamp(u_highlightShoulder, 0.0, 1.0)); }" +
+            "  vec3 x = pow(srgbOetf(clamp(basicScene, 0.0, 1.0)), vec3(1.0 / 1.1));" +
+            "  vec3 encBasic = 0.25 * x + 0.75 * x * x * (3.0 - 2.0 * x);" +
+            "  vec3 noiseBasic = vec3(ign(gl_FragCoord.xy, 0.0), ign(gl_FragCoord.xy, 1.0), ign(gl_FragCoord.xy, 2.0));" +
+            "  @OUT@ = vec4(encBasic + (noiseBasic - vec3(0.5)) / 255.0, 1.0); return; }" +
+            " vec3 scene = max(scene2020, vec3(0.0));" +
             " for (int c = 0; c < 3; ++c) { if (scene[c] > 0.9 && u_highlightShoulder > 0.0) {" +
             "  float t = (scene[c] - 0.9) / 0.8;" +
             "  float comp = 0.9 + 0.8 * (1.0 - exp(-t));" +
@@ -445,7 +462,7 @@ internal object VfGpuImport {
             "varying VFHP vec2 tex; uniform VFHP sampler2D raw; uniform vec4 gains; uniform mat3 color;" +
             AGX_UNIFORMS +
             LENS_UNIFORMS_COMMON +
-            TONEMAP_HELPERS +
+            TONEMAP_HELPERS + CameraToneBalance.glsl + "\n" + SigmoidDisplayTransform.glsl + "\n" + Aces2DisplayTransform.glsl +
             LENS_GAIN_ES1 +
             "void main() { vec4 b = texture2D(raw, tex); b *= vfLensGain(tex);" +
             TONEMAP_TAIL_TEMPLATE.replace("@OUT@", "gl_FragColor")
@@ -475,7 +492,7 @@ internal object VfGpuImport {
             "uniform vec4 gains; uniform mat3 color;" +
             AGX_UNIFORMS +
             "in highp vec2 tex; out vec4 fragColor;" +
-            TONEMAP_HELPERS +
+            TONEMAP_HELPERS + CameraToneBalance.glsl + "\n" + SigmoidDisplayTransform.glsl + "\n" + Aces2DisplayTransform.glsl +
             LENS_GAIN_ES3 +
             // Runtime-specialized unpack: black/white for the exact RAW bit depth
             // (10/12/16-bit sensor modes all present as unpacked 16-bit codes) are

@@ -32,12 +32,6 @@ class LinearRgbDngSaver(private val context: Context) {
      * [rgb], interleaved RGB in a native buffer, so no frame-sized heap copy
      * is made (C11: ~150 MB at 12 MP for MFSR).
      */
-    /**
-     * [sourceRowStride] (in pixels), [sourceColumnOffset] and [sourceRowOffset] describe where
-     * the frame to write sits inside [rgb], so a post-capture zoom crop is written straight out
-     * of the full merged buffer: only the rows and columns inside the window are read, and no
-     * copy of a buffer that can be hundreds of megabytes is made.
-     */
     fun saveLinearRgbStriped(
         width: Int,
         height: Int,
@@ -46,25 +40,15 @@ class LinearRgbDngSaver(private val context: Context) {
         provenance: MergeProvenance,
         captureId: Long = System.currentTimeMillis(),
         gps: GpsLocation? = null,
-        noiseProfileOverride: DoubleArray? = null,
-        sourceRowStride: Int = width,
-        sourceColumnOffset: Int = 0,
-        sourceRowOffset: Int = 0
+        noiseProfileOverride: DoubleArray? = null
     ): String {
-        require(sourceRowStride >= sourceColumnOffset + width) { "RGB source window exceeds its row stride" }
-        require(rgb.capacity() >= Math.multiplyExact(
-            Math.multiplyExact(sourceRowOffset + height, sourceRowStride) + sourceColumnOffset + width, 3
-        )) { "RGB buffer too small for the requested window" }
+        require(rgb.capacity() >= Math.multiplyExact(Math.multiplyExact(width, height), 3)) { "RGB buffer too small" }
         return publish(captureId) { out ->
             LinearRgbDngWriter.writeStriped(out, width, height, metadata, provenance, gps,
                 noiseProfileOverride = noiseProfileOverride, captureTimeMillis = captureId) { startY, rows, band ->
                 val src = rgb.duplicate()
-                for (row in 0 until rows) {
-                    src.position(
-                        ((sourceRowOffset + startY + row) * sourceRowStride + sourceColumnOffset) * 3
-                    )
-                    src.get(band, row * width * 3, width * 3)
-                }
+                src.position(startY * width * 3)
+                src.get(band, 0, rows * width * 3)
             }
         }
     }

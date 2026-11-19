@@ -77,7 +77,7 @@ jobs:
 
       # Two distribution flavors, so every task name carries one: the fork ships the
       # `github` flavor (update check on, F-Droid build would pin and strip it).
-      - name: Zoom unit tests (crop geometry + track scale)
+      - name: Unit tests (compile + JVM suite)
         run: |
           set -euo pipefail
           chmod +x ./gradlew
@@ -86,8 +86,6 @@ jobs:
           # be read back through the API instead of by scrolling.
           set +e
           ./gradlew :app:testGithubDebugUnitTest \
-            --tests "com.matthew.rawlens.ZoomCropTest" \
-            --tests "com.matthew.rawlens.ZoomStopsTest" \
             --stacktrace > /tmp/gradle-tests.log 2>&1
           status=$?
           set -e

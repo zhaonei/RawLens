@@ -37,6 +37,8 @@ internal class PhotoSettingsTab(
         fun clearTabStatusViews()
         /** Rebuild this page in place (after a reset). */
         fun reshow()
+        /** B&W mode changed: refresh the viewfinder and quick controls. */
+        fun onMonoChanged(mono: MonoSettings) {}
     }
 
     private val activity get() = kit.activity
@@ -44,6 +46,11 @@ internal class PhotoSettingsTab(
     fun show() {
         host.clearTabStatusViews()
         kit.content.removeAllViews()
+        kit.content.addView(kit.settingsButton("Develop DNGs · Import / export queue").apply {
+            setOnClickListener {
+                activity.startActivity(android.content.Intent(activity, DevelopQueueActivity::class.java))
+            }
+        })
         if (LapisRootProfile.supported()) {
             val profile = LapisRootProfile.preferences(activity)
             kit.content.addView(kit.sectionTitle("Redmi Note 15 Pro 5G"))
@@ -57,8 +64,8 @@ internal class PhotoSettingsTab(
                 }
             })
             if (LapisRootProfile.enabled(activity)) {
-                kit.content.addView(kit.sectionDesc("Choose 12.5 MP, 50 MP, 2× / 4× sensor RAW or DCG14 in the lens switcher. Root must be active and granted to RawLens. Sensor setup is automatic; camera settings are restored when the session closes."))
-                kit.content.addView(kit.sectionDesc("DCG14: 12.5 MP DCG/DSG RAW14 output at 30 fps; automatic exposure is required. Manual ISO/shutter and flash are unavailable in this mode. 50 MP: verified RAW10. 2× / 4×: RAW14 sensor interface, delivered as 10-bit RAW; extra precision is unverified. Firmware: ${LapisRootProfile.FIRMWARE}."))
+                kit.content.addView(kit.sectionDesc("Choose 12.5 MP, 50 MP, 200→50 MP, 2× / 4× sensor RAW or DCG14 in the lens switcher. Root must be active and granted to RawLens. Sensor setup is automatic; camera settings are restored when the session closes."))
+                kit.content.addView(kit.sectionDesc("DCG14: 12.5 MP DCG/DSG RAW14 output at 30 fps; automatic exposure is required. Manual ISO/shutter and flash are unavailable in this mode. 50 MP: verified RAW10. 2× / 4×: RAW14 sensor interface, delivered as 10-bit RAW; extra precision is unverified. 200→50 MP: one-shot DNG; the shutter reads the 200 MP sensor mode (about 20 s with camera restarts) and demosaics it at full resolution on the GPU, saving a 50 MP linear DNG. Preview stays at 12.5 MP; burst, HDR and ZSL are unavailable. Firmware: ${LapisRootProfile.FIRMWARE}."))
             }
         }
         // JPEG XL container options, mirroring darktable's export panel:
@@ -256,7 +263,7 @@ internal class PhotoSettingsTab(
         })
         }
         kit.content.addView(kit.sectionTitle("Photo output"))
-        kit.content.addView(kit.sectionDesc("Ultra HDR and Display P3 targets, JPEG quality and chroma, AgX look, adaptive exposure and highlight handling."))
+        kit.content.addView(kit.sectionDesc("Ultra HDR and Display P3 targets, JPEG quality and chroma, Basic / AgX / Sigmoid / ACES 2.0 tone mapping, adaptive exposure and highlight handling."))
         var currentJpegSettings = host.jpegOutputSettings()
         fun applyJpegOutputSettings(settings: JpegOutputSettings): Boolean {
             val resolved = settings.resolvedForPlatform()
@@ -274,7 +281,11 @@ internal class PhotoSettingsTab(
                 .putString(MainActivity.KEY_JPEG_DEMOSAIC, resolved.demosaic.name)
                 .putBoolean(ChromaCleanup.KEY_FALSE_COLOR, resolved.chromaCleanup.falseColorSuppression)
                 .putFloat(ChromaCleanup.KEY_DEFRINGE, resolved.chromaCleanup.defringeStrength)
+                .putBoolean(ChromaCleanup.KEY_RAPIDRAW, resolved.chromaCleanup.rapidRawPreprocessing)
+                .putFloat(ChromaCleanup.KEY_RAPIDRAW_COLOR_NR, resolved.chromaCleanup.rapidRawColorNoiseReduction)
+                .putFloat(ChromaCleanup.KEY_RAPIDRAW_SHARPENING, resolved.chromaCleanup.rapidRawSharpening)
                 .putFloat(MainActivity.KEY_JPEG_AGX_PURITY, resolved.agxPurityBoost)
+                .putString(PhotoToneMapper.PREFERENCE_KEY, resolved.toneMapper.name)
                 .putString(AgxLook.PREFERENCE_KEY, resolved.agxLook.name)
                 .putFloat(MainActivity.KEY_JPEG_AGX_CONTRAST, resolved.agxContrast)
                 .putFloat(MainActivity.KEY_JPEG_AGX_SATURATION, resolved.agxSaturation)
@@ -289,9 +300,32 @@ internal class PhotoSettingsTab(
                 .putFloat(MainActivity.KEY_JPEG_HIGHLIGHT_SHOULDER, resolved.highlightShoulder)
                 .putBoolean(MainActivity.KEY_JPEG_HL_RECONSTRUCTION, resolved.hlReconstruction)
                 .putBoolean(HighlightReconstructionDefaults.APPLIED, true)
+                .putString(MonoMode.PREFERENCE_KEY, resolved.mono.mode.name)
+                .putBoolean(MonoMode.KEY_KEEP_COLOR_DNG, resolved.mono.keepColorDng)
                 .apply()
+            host.onMonoChanged(resolved.mono)
             return true
         }
+        kit.content.addView(kit.sectionTitle("Black & white"))
+        kit.content.addView(Button(activity).apply {
+            fun refresh() { text = "B&W: ${currentJpegSettings.mono.mode.label}" }
+            refresh()
+            setOnClickListener {
+                kit.chooseEnum("Black & white", currentJpegSettings.mono.mode, { it.label }) { next ->
+                    if (applyJpegOutputSettings(currentJpegSettings.copy(
+                            mono = currentJpegSettings.mono.copy(mode = next)))) refresh()
+                }
+            }
+        })
+        kit.content.addView(kit.sectionDesc("Builds the picture straight from the sensor photosites, no demosaic (after rwmono). Detail: full resolution, colour checkerboard removed. Clean: 2x2 binned, half the width and height, about 1 stop cleaner. Clean is the default. Single frame and HDR+; the viewfinder previews in B&W at no extra cost. DNG becomes a monochrome linear DNG."))
+        kit.content.addView(SettingsSwitch(activity).apply {
+            text = "B&W: also keep colour DNG"
+            isChecked = currentJpegSettings.mono.keepColorDng
+            setOnCheckedChangeListener { _, checked ->
+                if (!applyJpegOutputSettings(currentJpegSettings.copy(
+                        mono = currentJpegSettings.mono.copy(keepColorDng = checked)))) isChecked = !checked
+            }
+        })
         kit.content.addView(Button(activity).apply {
             fun refresh() { text = "Active D-Lighting: ${currentJpegSettings.activeDLighting.label}" }
             refresh()
@@ -407,7 +441,7 @@ internal class PhotoSettingsTab(
             }
         }
         kit.content.addView(defringeButton)
-        kit.content.addView(kit.sectionDesc("Fused into the demosaic's final pass (no extra memory). False-color suppression: 3x3 color-difference median against moire on fine detail. Defringe: removes purple/magenta edges only at high-contrast edges."))
+        kit.content.addView(kit.sectionDesc("Fused into the demosaic's final pass (no extra memory). False-color suppression: two-radius color-difference median against moire and color speckles on fine detail. Defringe: removes purple/magenta edges only at high-contrast edges."))
         if (host.developedFormat == DevelopedFormat.JPEG) {
         var jpegQuality = currentJpegSettings.jpegQuality.coerceIn(1, 100)
         val jpegQualityLabel = TextView(activity).apply {
@@ -489,97 +523,128 @@ internal class PhotoSettingsTab(
                 })
             })
         }
-        kit.content.addView(SettingsSwitch(activity).apply {
-            text = "AgX look: " + if (currentJpegSettings.agxLook == AgxLook.BASE) "Base (default)" else "Punchy"
-            setTextColor(activity.getColor(R.color.text_primary))
-            isChecked = currentJpegSettings.agxLook == AgxLook.PUNCHY
-            setOnCheckedChangeListener { button, enabled ->
-                val look = if (enabled) AgxLook.PUNCHY else AgxLook.BASE
-                if (look != currentJpegSettings.agxLook &&
-                    !applyJpegOutputSettings(currentJpegSettings.copy(agxLook = look))) {
-                    button.isChecked = currentJpegSettings.agxLook == AgxLook.PUNCHY
-                }
-                text = "AgX look: " + if (currentJpegSettings.agxLook == AgxLook.BASE) "Base (default)" else "Punchy"
+        kit.content.addView(kit.sectionDesc("Tone Mapper"))
+        kit.content.addView(LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            for (mode in PhotoToneMapper.entries) {
+                addView(Button(activity).apply {
+                    text = mode.label
+                    isAllCaps = false
+                    val selected = currentJpegSettings.toneMapper == mode
+                    isSelected = selected
+                    contentDescription = "${mode.label} tone mapper${if (selected) ", selected" else ""}"
+                    setTextColor(if (selected) android.graphics.Color.BLACK else activity.getColor(R.color.text_primary))
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        cornerRadius = kit.dp(10).toFloat()
+                        setColor(if (selected) android.graphics.Color.WHITE else activity.getColor(R.color.surface_container))
+                    }
+                    setOnClickListener {
+                        if (mode != currentJpegSettings.toneMapper &&
+                            applyJpegOutputSettings(currentJpegSettings.copy(toneMapper = mode))) {
+                            host.reshow()
+                        }
+                    }
+                }, LinearLayout.LayoutParams(0, kit.dp(48), 1f).apply {
+                    setMargins(kit.dp(4), 0, kit.dp(4), 0)
+                })
             }
         })
-        val advancedLookStart = kit.content.childCount
-        var purityPercent = (currentJpegSettings.agxPurityBoost * 100f).toInt().coerceIn(0, 200)
-        val purityLabel = TextView(activity).apply {
-            text = "AgX purity boost: $purityPercent%"
-            setTextColor(activity.getColor(R.color.text_primary))
-            textSize = 14f
-            setPadding(kit.dp(12), kit.dp(8), kit.dp(12), 0)
+        if (currentJpegSettings.toneMapper == PhotoToneMapper.ACES_2) {
+            kit.content.addView(kit.sectionDesc("ACES 2.0 perceptual tone and gamut mapping. 100 nit SDR rendering for sRGB or Display P3."))
         }
-        kit.content.addView(purityLabel)
-        kit.content.addView(SettingsSlider(activity).apply {
-            max = 200
-            progress = purityPercent
-            setOnSettingsSliderChangeListener(object : SettingsSlider.OnSettingsSliderChangeListener {
-                override fun onProgressChanged(
-                    seekBar: SettingsSlider,
-                    progress: Int,
-                    fromUser: Boolean
-                ) {
-                    purityPercent = progress
-                    purityLabel.text = "AgX purity boost: $purityPercent%"
-                    if (fromUser) host.controller.previewAgxLive(
-                        currentJpegSettings.copy(agxPurityBoost = purityPercent / 100f)
-                    )
-                }
-
-                override fun onStartTrackingTouch(seekBar: SettingsSlider) = Unit
-
-                override fun onStopTrackingTouch(seekBar: SettingsSlider) {
-                    if (applyJpegOutputSettings(
-                        currentJpegSettings.copy(agxPurityBoost = purityPercent / 100f)
-                    )) {
-                        host.setStatus("AGX PURITY • $purityPercent%")
-                    } else {
-                        // Commit refused (saves in flight): revert the label
-                        // and drop the live candidate from the VF.
-                        purityPercent = (currentJpegSettings.agxPurityBoost * 100f).toInt()
-                        seekBar.progress = purityPercent
-                        host.controller.previewAgxLive(currentJpegSettings)
+        val advancedLookStart = kit.content.childCount
+        if (currentJpegSettings.toneMapper == PhotoToneMapper.AGX) {
+            kit.content.addView(SettingsSwitch(activity).apply {
+                text = "AgX look: " + if (currentJpegSettings.agxLook == AgxLook.BASE) "Base (default)" else "Punchy"
+                setTextColor(activity.getColor(R.color.text_primary))
+                isChecked = currentJpegSettings.agxLook == AgxLook.PUNCHY
+                setOnCheckedChangeListener { button, enabled ->
+                    val look = if (enabled) AgxLook.PUNCHY else AgxLook.BASE
+                    if (look != currentJpegSettings.agxLook &&
+                        !applyJpegOutputSettings(currentJpegSettings.copy(agxLook = look))) {
+                        button.isChecked = currentJpegSettings.agxLook == AgxLook.PUNCHY
                     }
+                    text = "AgX look: " + if (currentJpegSettings.agxLook == AgxLook.BASE) "Base (default)" else "Punchy"
                 }
             })
-        })
-        addAgxSlider(
-            "AgX contrast", 100,
-            ((currentJpegSettings.agxContrast - 0.5f) * 100f).toInt(),
-            { "${it + 50}%" },
-            { settings, value -> settings.copy(agxContrast = 0.5f + value / 100f) }
-        )
-        addAgxSlider(
-            "AgX saturation", 200,
-            (currentJpegSettings.agxSaturation * 100f).toInt(),
-            { "$it%" },
-            { settings, value -> settings.copy(agxSaturation = value / 100f) }
-        )
-        addAgxSlider(
-            "Preserve hue", 100,
-            (currentJpegSettings.agxHuePreservation * 100f).toInt(),
-            { "$it%" },
-            { settings, value -> settings.copy(agxHuePreservation = value / 100f) }
-        )
-        addAgxSlider(
-            "Highlight range", 70,
-            ((currentJpegSettings.agxHighlightEv - 3f) * 10f).toInt(),
-            { String.format(Locale.US, "+%.1f EV", 3f + it / 10f) },
-            { settings, value -> settings.copy(agxHighlightEv = 3f + value / 10f) }
-        )
-        addAgxSlider(
-            "Shadow range", 100,
-            ((currentJpegSettings.agxShadowEv - 4f) * 10f).toInt(),
-            { String.format(Locale.US, "%.1f EV", 4f + it / 10f) },
-            { settings, value -> settings.copy(agxShadowEv = 4f + value / 10f) }
-        )
-        addAgxSlider(
-            "Gamut compression", 100,
-            (currentJpegSettings.agxGamutCompression * 100f).toInt(),
-            { "$it%" },
-            { settings, value -> settings.copy(agxGamutCompression = value / 100f) }
-        )
+            var purityPercent = (currentJpegSettings.agxPurityBoost * 100f).toInt().coerceIn(0, 200)
+            val purityLabel = TextView(activity).apply {
+                text = "AgX purity boost: $purityPercent%"
+                setTextColor(activity.getColor(R.color.text_primary))
+                textSize = 14f
+                setPadding(kit.dp(12), kit.dp(8), kit.dp(12), 0)
+            }
+            kit.content.addView(purityLabel)
+            kit.content.addView(SettingsSlider(activity).apply {
+                max = 200
+                progress = purityPercent
+                setOnSettingsSliderChangeListener(object : SettingsSlider.OnSettingsSliderChangeListener {
+                    override fun onProgressChanged(
+                        seekBar: SettingsSlider,
+                        progress: Int,
+                        fromUser: Boolean
+                    ) {
+                        purityPercent = progress
+                        purityLabel.text = "AgX purity boost: $purityPercent%"
+                        if (fromUser) host.controller.previewAgxLive(
+                            currentJpegSettings.copy(agxPurityBoost = purityPercent / 100f)
+                        )
+                    }
+
+                    override fun onStartTrackingTouch(seekBar: SettingsSlider) = Unit
+
+                    override fun onStopTrackingTouch(seekBar: SettingsSlider) {
+                        if (applyJpegOutputSettings(
+                            currentJpegSettings.copy(agxPurityBoost = purityPercent / 100f)
+                        )) {
+                            host.setStatus("AGX PURITY • $purityPercent%")
+                        } else {
+                            // Commit refused (saves in flight): revert the label
+                            // and drop the live candidate from the VF.
+                            purityPercent = (currentJpegSettings.agxPurityBoost * 100f).toInt()
+                            seekBar.progress = purityPercent
+                            host.controller.previewAgxLive(currentJpegSettings)
+                        }
+                    }
+                })
+            })
+            addAgxSlider(
+                "AgX contrast", 100,
+                ((currentJpegSettings.agxContrast - 0.5f) * 100f).toInt(),
+                { "${it + 50}%" },
+                { settings, value -> settings.copy(agxContrast = 0.5f + value / 100f) }
+            )
+            addAgxSlider(
+                "AgX saturation", 200,
+                (currentJpegSettings.agxSaturation * 100f).toInt(),
+                { "$it%" },
+                { settings, value -> settings.copy(agxSaturation = value / 100f) }
+            )
+            addAgxSlider(
+                "Preserve hue", 100,
+                (currentJpegSettings.agxHuePreservation * 100f).toInt(),
+                { "$it%" },
+                { settings, value -> settings.copy(agxHuePreservation = value / 100f) }
+            )
+            addAgxSlider(
+                "Highlight range", 70,
+                ((currentJpegSettings.agxHighlightEv - 3f) * 10f).toInt(),
+                { String.format(Locale.US, "+%.1f EV", 3f + it / 10f) },
+                { settings, value -> settings.copy(agxHighlightEv = 3f + value / 10f) }
+            )
+            addAgxSlider(
+                "Shadow range", 100,
+                ((currentJpegSettings.agxShadowEv - 4f) * 10f).toInt(),
+                { String.format(Locale.US, "%.1f EV", 4f + it / 10f) },
+                { settings, value -> settings.copy(agxShadowEv = 4f + value / 10f) }
+            )
+            addAgxSlider(
+                "Gamut compression", 100,
+                (currentJpegSettings.agxGamutCompression * 100f).toInt(),
+                { "$it%" },
+                { settings, value -> settings.copy(agxGamutCompression = value / 100f) }
+            )
+        }
         kit.content.addView(SettingsSwitch(activity).apply {
             text = "Adaptive development exposure (AUTO and ZSL)"
             setTextColor(activity.getColor(R.color.text_primary))
@@ -599,7 +664,7 @@ internal class PhotoSettingsTab(
         )
         kit.content.addView(TextView(activity).apply {
             tag = "settings-description"
-            text = "Highlights: headroom caps the p99.5 spike at white; sky protection caps broad p95 skies; shoulder rolls off near-white into AgX."
+            text = "Highlights: headroom protects the brightest pixels; sky protection protects broad bright areas."
             setTextColor(activity.getColor(R.color.text_secondary))
             textSize = 12f
             setPadding(kit.dp(12), kit.dp(8), kit.dp(12), 0)

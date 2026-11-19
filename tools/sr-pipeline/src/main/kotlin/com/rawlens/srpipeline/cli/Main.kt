@@ -11,6 +11,7 @@ import com.rawlens.srpipeline.stages.KernelNetConfig
 import com.rawlens.srpipeline.stages.KernelParams
 import com.rawlens.srpipeline.stages.NoiseLut
 import com.rawlens.srpipeline.stages.NoiseLutGen
+import com.rawlens.srpipeline.stages.SceneNoise
 import com.rawlens.srpipeline.stages.PipelineConfig
 import com.rawlens.srpipeline.stages.RobustnessParams
 import com.rawlens.srpipeline.stages.VulkanPipeline
@@ -19,9 +20,9 @@ import java.nio.file.Path
 import java.nio.file.Paths
 import kotlin.system.exitProcess
 
-private data class Crop(val x: Int, val y: Int, val w: Int, val h: Int)
+internal data class Crop(val x: Int, val y: Int, val w: Int, val h: Int)
 
-private data class Plan(
+internal data class Plan(
     val inputDir: Path,
     val outputDir: Path,
     val ref: Int,
@@ -37,6 +38,7 @@ private data class Plan(
     val kernel: String = "wronski",
     val knScale: Float = KernelNet.DEFAULT_SIGMA_SCALE,
     val knCap: Float = KernelNet.DEFAULT_SIGMA_CAP,
+    val knFloor: Float? = null,
     /** Supplement S.3 high-frequency rejection (off = IPOL parity). */
     val s3: Boolean = true,
     /** Robustness strengths: [s1] where the flow varies (M > Mt), [s2] elsewhere (IPOL 2 / 12; paper S.2 12 / 2). */
@@ -44,10 +46,21 @@ private data class Plan(
     val s2: Float = 12f,
     /** GAT before Wronski kernel estimation (IPOL; the paper has none). */
     val kernelGat: Boolean = true,
-    /** Z1 colour-difference merge white balance (R, B gains); null = off. */
+    /** Explicit Z1 white-balance gains; null = automatic for Vulkan KernelNet. */
     val colourDiff: FloatArray? = null,
+    val colourDiffDisabled: Boolean = false,
+    val grainRetention: Float = PipelineConfig.DEFAULT_GRAIN_RETENTION,
     /** Own noise model var = a x + b (normalised raw) replacing the DNG/Camera2 NoiseProfile; null = profile. */
     val noiseAb: DoubleArray? = null,
+    /** KernelNet's continuous motion handling for Wronski (always on with KernelNet). */
+    val continuousMotion: Boolean = true,
+    /** KernelNet's wide gather + detail green + frame weights for Wronski kernels (app: on). */
+    val detailReconstruction: Boolean = true,
+    /** App tuning (`SrTuning`, "k=v,..."): app-parity kernels/robustness/colour diff; null = IPOL CLI defaults. */
+    val tune: String? = "app",
+    val organicReconstruction: Boolean = false,
+    val tiledPolynomial: Boolean = false,
+    val mobilePolynomial: Boolean = false,
 )
 
 private fun usage(): String = """
@@ -61,9 +74,26 @@ private fun usage(): String = """
       --backend NAME compute backend, one of: cpu, vulkan (required)
       --scale F      super-resolution factor, >= 1 (default 1, mirroring the Python default)
       --lib PATH     JNI library file to load (default: System.loadLibrary lookup)
-      --spv-dir DIR  directory with the 10 stage .spv modules (required for --backend vulkan)
+      --spv-dir DIR  directory with the compiled stage .spv modules (required for --backend vulkan)
       --lut PATH     noise LUT .npz (or "auto" to simulate it in-process); enables noise correction with its curves, validated
                      against the DNG noise profile (without it, noise correction is off)
+      --kn-floor F   reconstruction width floor override, > 0 and <= kn-cap
+      --colour-diff auto|off|R,B
+                     zipper correction (default: auto for Vulkan KernelNet with valid AsShotNeutral)
+      --grain-retention F
+                     uniform sensor-grain retention for Vulkan KernelNet colour differences, 0..1
+                     (default 1: six evenly spaced luma frames; 0: average all frames)
+      --continuous-motion on|off
+                     KernelNet's continuous motion handling for Wronski (default on, as the app; off = IPOL parity)
+      --detail-reconstruction on|off
+                     KernelNet's wide gather, green detail path and frame weights for Wronski kernels
+                     (default on, as the app; off = IPOL parity)
+      --reconstruction legacy|organic
+                     organic: experimental CPU Wronski with pooled local polynomial reconstruction
+      --tune app|ipol|k=v,...
+                     default app: app tuning (SrTuning), app kernels, robustness and colour difference;
+                     ipol: IPOL CLI defaults (no colour difference); overrides on app tuning, keys kDetailScale kDenoiseScale
+                     dThScale dTrScale kStretch kShrink kMin t s1 s2 mt chromaScale1x chromaScale2x frameEqualize
       --noise-ab a,b own noise model var = a*x + b (normalised raw) instead of the DNG/Camera2 NoiseProfile
       --heap-budget-mb N
                      peak JVM heap-pool gate in MB; fails the run when exceeded
@@ -86,7 +116,7 @@ private fun parseCrop(raw: String): Crop {
     return Crop(x, y, w, h)
 }
 
-private fun parseArgs(args: Array<String>): Plan {
+internal fun parseArgs(args: Array<String>): Plan {
     var inDir: String? = null
     var outDir: String? = null
     var ref = 0
@@ -101,16 +131,36 @@ private fun parseArgs(args: Array<String>): Plan {
     var kernel = "wronski"
     var knScale = KernelNet.DEFAULT_SIGMA_SCALE
     var knCap = KernelNet.DEFAULT_SIGMA_CAP
+    var knFloor: Float? = null
     var s3 = true
     var s1 = 2f
     var s2 = 12f
     var kernelGat = true
     var colourDiff: FloatArray? = null
+    var colourDiffDisabled = false
+    var grainRetention = PipelineConfig.DEFAULT_GRAIN_RETENTION
     var noiseAb: DoubleArray? = null
+    var continuousMotion = true
+    var detailReconstruction = true
+    var tune: String? = "app"
+    var organicReconstruction = false
+    var tiledPolynomial = false
+    var mobilePolynomial = false
 
     var i = 0
     while (i < args.size) {
         when (args[i]) {
+            "--reconstruction" -> {
+                val method = args.getOrNull(++i)
+                tiledPolynomial = method == "organic-tiled"
+                mobilePolynomial = method == "mobile"
+                organicReconstruction = when (method) {
+                    "organic", "organic-tiled" -> true
+                    "legacy", "mobile" -> false
+                    else -> fail("--reconstruction requires legacy|organic|organic-tiled|mobile")
+                }
+                i++
+            }
             "--in" -> {
                 inDir = args.getOrNull(++i) ?: fail("--in requires a DIR value")
                 i++
@@ -170,6 +220,11 @@ private fun parseArgs(args: Array<String>): Plan {
                 knCap = raw.toFloatOrNull()?.takeIf { it >= 0.25f } ?: fail("--kn-cap must be >= 0.25 (got \"$raw\")")
                 i++
             }
+            "--kn-floor" -> {
+                knFloor = args.getOrNull(++i)?.toFloatOrNull()?.takeIf { it.isFinite() && it > 0f }
+                    ?: fail("--kn-floor requires a positive finite value")
+                i++
+            }
             "--s3" -> {
                 s3 = when (args.getOrNull(++i)) { "on" -> true; "off" -> false; else -> fail("--s3 requires on|off") }
                 i++
@@ -182,10 +237,35 @@ private fun parseArgs(args: Array<String>): Plan {
                 s2 = args.getOrNull(++i)?.toFloatOrNull() ?: fail("--s2 requires a number")
                 i++
             }
+            "--grain-retention" -> {
+                grainRetention = args.getOrNull(++i)?.toFloatOrNull()?.takeIf { it.isFinite() && it in 0f..1f }
+                    ?: fail("--grain-retention requires a finite value in 0..1")
+                i++
+            }
             "--colour-diff" -> {
-                val parts = args.getOrNull(++i)?.split(",")?.mapNotNull { it.toFloatOrNull() }
-                colourDiff = parts?.takeIf { it.size == 2 && it.all { g -> g > 0f } }?.toFloatArray()
-                    ?: fail("--colour-diff requires wbR,wbB (positive gains, e.g. 1.88,1.49)")
+                val value = args.getOrNull(++i) ?: fail("--colour-diff requires auto, off or wbR,wbB")
+                colourDiffDisabled = value == "off"
+                colourDiff = if (value == "off" || value == "auto") null else {
+                    val parts = value.split(",").map { it.trim().toFloatOrNull() }
+                    if (parts.size != 2 || parts.any { it == null || !it.isFinite() || it <= 0f })
+                        fail("--colour-diff requires auto, off or two positive finite gains")
+                    floatArrayOf(parts[0]!!, parts[1]!!)
+                }
+                i++
+            }
+            "--tune" -> {
+                val next = args.getOrNull(++i) ?: fail("--tune requires app (defaults), ipol or k=v,...")
+                tune = if (next == "ipol") null else if (next == "app" || tune == null || tune == "app") next else "$tune,$next"
+                tune?.let { parseTune(it) }
+                i++
+            }
+            "--continuous-motion" -> {
+                continuousMotion = when (args.getOrNull(++i)) { "on" -> true; "off" -> false; else -> fail("--continuous-motion requires on|off") }
+                i++
+            }
+            "--detail-reconstruction" -> {
+                detailReconstruction = when (args.getOrNull(++i)) { "on" -> true; "off" -> false; else -> fail("--detail-reconstruction requires on|off") }
+                i++
             }
             "--kernel-gat" -> {
                 kernelGat = when (args.getOrNull(++i)) { "on" -> true; "off" -> false; else -> fail("--kernel-gat requires on|off") }
@@ -223,6 +303,8 @@ private fun parseArgs(args: Array<String>): Plan {
     if (b != "cpu" && b != "vulkan") fail("--backend must be cpu or vulkan (got \"$b\")")
     if (b == "vulkan" && spvDir.isNullOrBlank()) fail("--spv-dir DIR is required for --backend vulkan")
 
+    if (knFloor != null && knFloor > knCap) fail("--kn-floor must not exceed --kn-cap")
+
     return Plan(
         inputDir = Paths.get(inDir!!),
         outputDir = Paths.get(outDir!!),
@@ -238,13 +320,50 @@ private fun parseArgs(args: Array<String>): Plan {
         kernel = kernel,
         knScale = knScale,
         knCap = knCap,
+        knFloor = knFloor,
         s3 = s3,
         s1 = s1,
         s2 = s2,
         kernelGat = kernelGat,
         colourDiff = colourDiff,
+        colourDiffDisabled = colourDiffDisabled,
+        grainRetention = grainRetention,
         noiseAb = noiseAb,
+        continuousMotion = continuousMotion,
+        detailReconstruction = detailReconstruction,
+        tune = tune,
+        organicReconstruction = organicReconstruction,
+        tiledPolynomial = tiledPolynomial,
+        mobilePolynomial = mobilePolynomial,
     )
+}
+
+/** `--tune app` = app defaults; otherwise comma-separated [SrTuning] overrides. */
+internal fun parseTune(spec: String): com.rawlens.srpipeline.stages.SrTuning {
+    var t = com.rawlens.srpipeline.stages.SrTuning()
+    if (spec == "app") return t
+    for (kv in spec.split(',').filter { it.isNotBlank() }) {
+        val (k, raw) = kv.split('=', limit = 2).let { if (it.size == 2) it[0].trim() to it[1].trim() else fail("--tune: \"$kv\" is not k=v") }
+        val v = raw.toFloatOrNull()?.takeIf { it.isFinite() } ?: fail("--tune: $k needs a number (got \"$raw\")")
+        t = when (k) {
+            "kDetailScale" -> t.copy(kDetailScale = v)
+            "kDenoiseScale" -> t.copy(kDenoiseScale = v)
+            "dThScale" -> t.copy(dThScale = v)
+            "dTrScale" -> t.copy(dTrScale = v)
+            "kStretch" -> t.copy(kStretch = v)
+            "kShrink" -> t.copy(kShrink = v)
+            "kMin" -> t.copy(kMin = v)
+            "t" -> t.copy(t = v)
+            "s1" -> t.copy(s1 = v)
+            "s2" -> t.copy(s2 = v)
+            "mt" -> t.copy(mt = v)
+            "chromaScale1x" -> t.copy(chromaScale1x = v)
+            "chromaScale2x" -> t.copy(chromaScale2x = v)
+            "frameEqualize" -> t.copy(frameEqualize = v)
+            else -> fail("--tune: unknown key \"$k\"")
+        }
+    }
+    return t
 }
 
 /**
@@ -274,6 +393,17 @@ private fun spv(dir: Path, base: String): ByteArray {
     val f = dir.resolve("$base.spv").toFile()
     require(f.isFile) { "sr-pipeline: missing stage module: $f" }
     return f.readBytes()
+}
+
+/** Desktop KernelNet uses the same colour-difference reconstruction as the app. */
+internal fun colourDiffGains(plan: Plan, neutral: DoubleArray?): FloatArray? {
+    if (plan.colourDiffDisabled) return null
+    plan.colourDiff?.let { return it.copyOf() }
+    if ((plan.kernel != "kernelnet" && plan.tune == null && !plan.organicReconstruction && !plan.mobilePolynomial) || (plan.backend != "vulkan" && !plan.organicReconstruction && !plan.mobilePolynomial)) return null
+    if (neutral == null || neutral.size != 3 || neutral.any { !it.isFinite() || it <= 0.0 }) return null
+    val r = (neutral[1] / neutral[0]).toFloat()
+    val b = (neutral[1] / neutral[2]).toFloat()
+    return if (r.isFinite() && b.isFinite() && r > 0f && b > 0f) floatArrayOf(r,b) else null
 }
 
 private fun merge(plan: Plan) {
@@ -311,13 +441,14 @@ private fun merge(plan: Plan) {
     HotPixels.correct(refImg, defects)
     val compImgs = comps.map { p -> { readFrame(p, plan.crop).also { HotPixels.correct(it, defects) } } }
 
-    // Noise profile from the reference tags; LUT validated against it like
-    // `load_noise_lut`, otherwise noise correction stays off (zero curves).
+    // Noise model: never the vendor NoiseProfile tag. Our own estimate from
+    // the full reference frame (SceneNoise), or --noise-ab for all planes.
     val refMeta = DngRead.readMeta(refPath.toString())
-    // --noise-ab: our own estimate (e.g. tools/lkr-pipeline NoiseAB on the
-    // reference) for all four planes, instead of the vendor NoiseProfile.
+    val fullRef = if (plan.crop == null) refImg else readFrame(refPath, null)
     val (alpha, beta) = plan.noiseAb?.let { DoubleArray(4) { _ -> it[0] } to DoubleArray(4) { _ -> it[1] } }
-        ?: DngRead.noiseAlphaBeta(refMeta.noise, refMeta.noiseCount)
+        ?: SceneNoise.estimate(fullRef).also { (a, b) ->
+            println("sr-pipeline: estimated reference noise alpha=${a.contentToString()} beta=${b.contentToString()}")
+        }
     if (plan.noiseAb != null) println("sr-pipeline: noise model from --noise-ab a=${plan.noiseAb[0]} b=${plan.noiseAb[1]} (not the DNG profile)")
     // `--lut auto`: simulate in-process (NoiseLutGen, same model as the
     // Python monte_carlo; SRP_LUT_TRIALS overrides the trial count).
@@ -341,30 +472,46 @@ private fun merge(plan: Plan) {
     // supplement S.2) and the IPOL reference measures the full reference
     // in process() before any crop. A crop-local SNR (20.9 vs 29.5 dB on
     // the parity burst) changed tile size and every kernel parameter.
-    val fullRef = if (plan.crop == null) refImg else readFrame(refPath, null)
     val snr = BurstConfig.estimateSnr(fullRef, alpha, beta)
     val fin = BurstConfig.finalize(snr)
     val factors = listOf(1, 2, 4, 4)
     BurstConfig.sanitize(plan.scale, fin.tileSize, factors, fin.tileSizes, h, w)
+    val profile = SrpBridge.readDngColorProfile(refPath.toString())
+    val colourDiff = colourDiffGains(plan, profile.neutral)
+    val tuning = plan.tune?.let { parseTune(it) }
+    require(!plan.organicReconstruction || ((plan.backend == "cpu" || (plan.tiledPolynomial && plan.backend == "vulkan")) && plan.kernel == "wronski" && colourDiff != null)) {
+        "organic requires CPU Wronski; organic-tiled requires Vulkan Wronski and valid colour-difference white-balance gains"
+    }
+    require(!plan.mobilePolynomial || (plan.backend == "vulkan" && plan.kernel == "wronski" && colourDiff != null)) {
+        "mobile reconstruction requires Vulkan Wronski with valid colour-difference white-balance gains"
+    }
     val config = PipelineConfig(
         scale = plan.scale,
         bayer = true,
         factors = factors,
         tileSizes = fin.tileSizes,
-        kernelParams = KernelParams(
+        kernelParams = tuning?.kernelParams(fin) ?: KernelParams(
             kDetail = fin.kDetail.toFloat(),
             kDenoise = fin.kDenoise.toFloat(),
             dTh = fin.dTh.toFloat(),
             dTr = fin.dTr.toFloat(),
         ),
         kernelPreprocessing = if (plan.kernelGat) "gat" else null,
-        colourDiff = plan.colourDiff,
+        colourDiff = colourDiff,
+        chromaScale = if (plan.organicReconstruction && tuning == null) 1.5f else (tuning ?: com.rawlens.srpipeline.stages.SrTuning()).chromaScale(plan.scale),
+        grainRetention = plan.grainRetention,
         kernelAlpha = FloatArray(4) { alpha[it].toFloat() },
         kernelBeta = FloatArray(4) { beta[it].toFloat() },
-        robustnessParams = RobustnessParams(noiseCorrection = noiseCorrection, s3 = plan.s3, s1 = plan.s1, s2 = plan.s2),
+        robustnessParams = tuning?.robustnessParams(haveNoiseLut = noiseCorrection, s3 = plan.s3)
+            ?: RobustnessParams(noiseCorrection = noiseCorrection, s3 = plan.s3, s1 = plan.s1, s2 = plan.s2),
         robustnessEnabled = true,
         sigmaSqCurve = curves?.sigmaSq ?: floatArrayOf(0f, 0f),
         dSqCurve = curves?.dSq ?: floatArrayOf(0f, 0f),
+        continuousMotion = plan.continuousMotion,
+        detailReconstruction = plan.detailReconstruction,
+        organicReconstruction = plan.organicReconstruction,
+        mobilePolynomial = plan.mobilePolynomial,
+        frameEqualize = tuning?.frameEqualize ?: 0f,
         kernelNet = if (plan.kernel != "kernelnet") null else {
             val (fx, fy) = KernelNet.rggbFlips(refMeta.cfa)
             KernelNetConfig(
@@ -373,6 +520,8 @@ private fun merge(plan: Plan) {
                     FloatArray(4) { alpha[it].toFloat() }, FloatArray(4) { beta[it].toFloat() }),
                 sigmaScale = plan.knScale,
                 sigmaCap = plan.knCap,
+                // Same floor as the app: 0.90 at 1x, 0.70 at 2x (SrTuning).
+                sigmaFloor = plan.knFloor ?: minOf(plan.knCap, com.rawlens.srpipeline.stages.SrTuning().knFloor(plan.scale)),
                 fullReference = if (plan.crop == null) null else fullRef,
                 cropX = plan.crop?.x ?: 0,
                 cropY = plan.crop?.y ?: 0,
@@ -381,6 +530,9 @@ private fun merge(plan: Plan) {
             )
         },
     )
+    if (plan.mobilePolynomial) println("sr-pipeline: experimental mobile separable polynomial reconstruction (Vulkan)")
+    if (plan.organicReconstruction) println("sr-pipeline: experimental pooled polynomial reconstruction (CPU)")
+    println("sr-pipeline: colour-difference reconstruction ${colourDiff?.contentToString() ?: "off"}")
     println("sr-pipeline: ${w}x$h snr=${"%.2f".format(snr)} tile=${fin.tileSize} " +
         "backend=${plan.backend} noiseCorrection=$noiseCorrection kernel=${plan.kernel}" +
         (if (plan.kernel == "kernelnet") " knScale=${plan.knScale} knCap=${plan.knCap}" else ""))
@@ -400,7 +552,7 @@ private fun merge(plan: Plan) {
             }
             val buf = SrpBridge.directFloats(outH * outW * 3)
             val fb = buf.asFloatBuffer()
-            for (y in 0 until outH) fb.put(merged[outH - 1 - y])
+            for (y in 0 until outH) fb.put(merged[y]) // same bottom-up row order as the Vulkan buffer; the shared tail flips once
             buf.rewind()
             buf
         }
@@ -408,11 +560,12 @@ private fun merge(plan: Plan) {
             val dir = plan.spvDir!!
             val handle = SrpBridge.nativeCreate()
             require(handle != 0L) { "sr-pipeline: nativeCreate failed" }
+            val cache = if (plan.tiledPolynomial) com.rawlens.srpipeline.stages.PolynomialTileCache(w,h,config) else null
             try {
                 val fft = spv(dir, "fft")
                 val buf = VulkanPipeline.run(
                     { refImg }, compImgs.map { t -> { _: java.nio.ByteBuffer -> t() } },
-                    config, handle,
+                    if (plan.tiledPolynomial) config.copy(organicReconstruction=false) else config, handle,
                     AlignGpu.Spirvs(
                         align = spv(dir, "align"),
                         corr = spv(dir, "corr"),
@@ -429,14 +582,18 @@ private fun merge(plan: Plan) {
                         divide = spv(dir, "divide"),
                         robust = spv(dir, "robustness"),
                         mergeSplat = spv(dir, "merge_splat"),
+                        mergePolynomial = if(plan.mobilePolynomial) spv(dir,"merge_polynomial") else null,
                         fft = fft,
                         corr = spv(dir, "corr"),
                         kernelNet = if (plan.kernel == "kernelnet") spv(dir, "kernelnet") else null,
                         greyFft = if (System.getenv("SRP_LEGACY_FFT") == "1") null else spv(dir, "grey_fft"),
                     ),
+                    frameObserver = cache?.let { c -> { f, flow, r -> c.record(f,flow,r) } },
                 )
+                cache?.finish(buf)
                 buf
             } finally {
+                cache?.close()
                 SrpBridge.nativeDestroy(handle)
             }
         }
@@ -452,17 +609,27 @@ private fun merge(plan: Plan) {
     }
     VulkanPipeline.nanToBlack(rgb.asFloatBuffer(), outH * outW * 3)
     rgb.rewind()
-    // Pipeline rows run sensor-bottom-up (the GRBG->RGGB input flip is
-    // only undone inside the finished PNG path); the DNG stores true
-    // native top-down, so emit rows flipped, in place.
-    VulkanPipeline.flipRowsInPlace(rgb.asFloatBuffer(), outW, outH)
+    // Undo exactly the input RGGB normalisation (DngRead.flipToRggb): RGGB
+    // none, GRBG rows, GBRG columns, BGGR both. Flipping rows unconditionally
+    // wrote RGGB bursts upside down and GBRG/BGGR mirrored.
+    val (undoX, undoY) = KernelNet.rggbFlips(refMeta.cfa)
+    if (undoY) VulkanPipeline.flipRowsInPlace(rgb.asFloatBuffer(), outW, outH)
+    if (undoX) {
+        val fb = rgb.asFloatBuffer()
+        for (y in 0 until outH) {
+            var a = y * outW * 3; var b = a + (outW - 1) * 3
+            while (a < b) {
+                for (c in 0..2) { val t = fb.get(a + c); fb.put(a + c, fb.get(b + c)); fb.put(b + c, t) }
+                a += 3; b -= 3
+            }
+        }
+    }
     Files.createDirectories(plan.outputDir)
     val out = plan.outputDir.resolve("merged.dng").toString()
     // Camera color passthrough from the reference frame (rendering), cf.
     // the app's merge writer; absent tags select the writer defaults.
     // Orientation rides along so raw editors display the file exactly
     // like the finished PNG (0 = unknown, tag omitted).
-    val profile = SrpBridge.readDngColorProfile(refPath.toString())
     val orientation = SrpBridge.readDngOrientation(refPath.toString())
     val rc = SrpBridge.writeDng(out, outW, outH, rgb, profile.make, profile.model,
         profile.colorMatrix, profile.neutral, profile.illuminant, orientation)

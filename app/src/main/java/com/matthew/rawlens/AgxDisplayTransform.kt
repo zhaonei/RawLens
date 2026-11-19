@@ -44,13 +44,26 @@ object AgxDisplayTransform {
         return acescgToOutputLinear(acescg, REC2020_TO_DISPLAY_P3, settings.resolvedForPlatform())
     }
 
+    /** Calibrated output primaries before any tone curve or highlight compression. */
+    internal fun sceneOutput(acescg: FloatArray, displayP3: Boolean = false): FloatArray =
+        map(if (displayP3) REC2020_TO_DISPLAY_P3 else REC2020_TO_SRGB,
+            map(ACESCG_TO_REC2020_D65, acescg))
+
     private fun acescgToOutputLinear(
-        acescg: FloatArray,
+        inputAcescg: FloatArray,
         outputMatrix: FloatArray,
         settings: JpegOutputSettings
     ): FloatArray {
-        require(acescg.size == 3 && acescg.all(Float::isFinite))
+        require(inputAcescg.size == 3 && inputAcescg.all(Float::isFinite))
+        val acescg = CameraToneBalance.map(inputAcescg)
+        if (settings.toneMapper == PhotoToneMapper.ACES_2) return Aces2DisplayTransform.map(acescg, outputMatrix === REC2020_TO_DISPLAY_P3)
         val sceneRec2020 = map(ACESCG_TO_REC2020_D65, acescg)
+        if (settings.toneMapper == PhotoToneMapper.SIGMOID) return map(outputMatrix, SigmoidDisplayTransform.map(sceneRec2020))
+        if (settings.toneMapper == PhotoToneMapper.BASIC) {
+            val output = map(outputMatrix, sceneRec2020)
+            val encoded = BasicDisplayTransform.encodeRgb(output, settings.highlightShoulder)
+            return FloatArray(3) { BasicDisplayTransform.decode(encoded[it]) }
+        }
         // AgX's log domain is non-negative. This is the pinned view-transform domain guard,
         // not the final display-gamut boundary.
         val positiveScene = FloatArray(3) { max(0f, sceneRec2020[it]) }
@@ -135,9 +148,13 @@ object AgxDisplayTransform {
      *
      * Must stay in sync with the achromatic path above and agx_srgb8.glsl agx_base().
      */
-    fun scopeCurve(linear: Float, settings: JpegOutputSettings = JpegOutputSettings()): Float {
+    fun scopeCurve(inputLinear: Float, settings: JpegOutputSettings = JpegOutputSettings()): Float {
         val resolved = settings.resolvedForPlatform()
-        if (!linear.isFinite()) return 0f
+        if (!inputLinear.isFinite()) return 0f
+        val linear = inputLinear * CameraToneBalance.gain(inputLinear)
+        if (resolved.toneMapper == PhotoToneMapper.ACES_2) return srgbOetf(Aces2DisplayTransform.map(floatArrayOf(linear,linear,linear))[0])
+        if (resolved.toneMapper == PhotoToneMapper.SIGMOID) return srgbOetf(SigmoidDisplayTransform.curve(linear))
+        if (resolved.toneMapper == PhotoToneMapper.BASIC) return BasicDisplayTransform.encode(linear, resolved.highlightShoulder)
         val positive = max(0f, linear)
         val shoulder = resolved.highlightShoulder.coerceIn(0f, 1f)
         val soft = when {

@@ -9,7 +9,6 @@ import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureResult
 import android.net.Uri
-import android.os.FileUtils
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.MediaStore
@@ -100,7 +99,8 @@ internal object BurstCrawStore {
         frames: List<BufferedRawFrame>,
         characteristics: CameraCharacteristics,
         realtimeTimestamps: Boolean,
-        output: File
+        output: File,
+        deviceOrientationDegrees: Int = 0
     ): BurstDumpStats {
         require(frames.isNotEmpty()) { "Empty ZSL ring" }
         val cfa = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
@@ -116,9 +116,11 @@ internal object BurstCrawStore {
         }
         val orientation =
             characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val exifOrientation = CaptureOrientation.exif(orientation, deviceOrientationDegrees,
+            characteristics.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT)
         val baseJson = "{\"UniqueCameraModel\":\"${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\"," +
             "\"width\":$width,\"height\":$height," +
-            "\"crop\":\"FULL\",\"sensorOrientation\":$orientation,\"encoder\":\"RawLens-Burst\"}"
+            "\"crop\":\"FULL\",\"sensorOrientation\":$orientation,\"exifOrientation\":$exifOrientation,\"deviceOrientationDegrees\":$deviceOrientationDegrees,\"encoder\":\"RawLens-Burst\"}"
         val containerJson = CrawMetadata.container(
             baseJson, characteristics, realtimeTimestamps,
             audioRate = 0, audioChannels = 0, motion = false,
@@ -198,13 +200,17 @@ internal object BurstCrawStore {
                 ?: throw IOException("Could not open burst destination")
             ParcelFileDescriptor.AutoCloseOutputStream(descriptor).use { output ->
                 FileInputStream(source).use { input ->
-                    val copied = FileUtils.copy(input.fd, output.fd)
+                    val copied = input.copyTo(output)
                     if (copied != expected || source.length() != expected) {
                         throw IOException("Incomplete burst copy ($copied/$expected)")
                     }
                 }
                 output.fd.sync()
-                if (descriptor.statSize != expected) throw IOException("Burst size mismatch")
+                // Some document providers cannot report a size (statSize == -1).
+                val destinationSize = descriptor.statSize
+                if (destinationSize >= 0 && destinationSize != expected) {
+                    throw IOException("Burst size mismatch")
+                }
             }
             values.clear()
             values.put(MediaStore.Video.Media.IS_PENDING, 0)
@@ -263,13 +269,17 @@ internal object BurstCrawStore {
                 ?: throw IOException("Could not open granted-folder destination")
             ParcelFileDescriptor.AutoCloseOutputStream(descriptor).use { output ->
                 FileInputStream(source).use { input ->
-                    val copied = FileUtils.copy(input.fd, output.fd)
+                    val copied = input.copyTo(output)
                     if (copied != expected || source.length() != expected) {
                         throw IOException("Incomplete burst copy ($copied/$expected)")
                     }
                 }
                 output.fd.sync()
-                if (descriptor.statSize != expected) throw IOException("Burst size mismatch")
+                // Some document providers cannot report a size (statSize == -1).
+                val destinationSize = descriptor.statSize
+                if (destinationSize >= 0 && destinationSize != expected) {
+                    throw IOException("Burst size mismatch")
+                }
             }
         } catch (failure: Exception) {
             try { DocumentsContract.deleteDocument(resolver, fileUri) } catch (_: Exception) {

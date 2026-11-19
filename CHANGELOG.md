@@ -1,8 +1,46 @@
 # Changelog
 
+> See [current repository state](docs/CURRENT_STATE.md) for app integration, current merge names, build requirements and the scope of historical evidence.
+
 Notable changes to RawLens are documented here. The project follows [Semantic Versioning](https://semver.org/) for public releases.
 
-## [2.2.46] - Unreleased
+## [2.3.43] - 2026-11-15
+
+Changes since the previous published release, **2.2.86**. See the
+[release notes](docs/releases/2.3.43.md).
+
+- Default automatic LK-R KernelNet denoising to on, retaining the off switch,
+  saved choices and low-noise bypass; raise 2× burst capacity to 30 frames.
+- Improve 1×/2× detail and reduce Bayer-phase zipper; reduce MFSR tile seams/boxy contours through shared continuous motion and
+  rejection; enable desktop colour-difference correction with valid white balance.
+- Add lens-profile ZIP export and replacement import with confirmation.
+- Recover silent autofocus and abandoned tap scans with bounded retries.
+- Expand sequential two-exposure RAW HDR to manual RAW lenses and rooted DCG14.
+- Default photo tone mapping to Basic while preserving explicit saved choices.
+- Default HDR+ to HQ with strength 3, preserving saved automatic/manual choices.
+- Preserve Basic highlights, describe saved tone mapping in JPEG metadata, fix
+  developed merge filenames/status labels, and rename Denoise settings to Details.
+- Retain MFSR / LK-R names consistently; integrate LK-R Lite, keep reference-guide
+  rejection enabled, prewarm Vulkan pipelines and refine hybrid chroma handling.
+- Add MFSR Lab and 2× output controls; improve 2× detail/zipper handling and
+  mobile processing, with scene-noise fallback and a desktop launcher.
+- Default offline merges to JPEG, add quality controls and burst sharing, and
+  preserve orientation when loading staged takes.
+- Add Basic / AgX tone mapping across saved photos, previews, scopes and metering.
+- Add two-radius chroma cleanup, improve RAW white-balance fallback and root /
+  merged-DNG lens shading, and fix defringe stripping flat blue/purple colour.
+- Add experimental supported-firmware root lapis 200→50 MP capture, tiled Vulkan
+  development, LinearRaw DNG and shared JPEG development with early preview return.
+- Add gyro stabilization v2 and reduce Encoded Video preview processing work.
+- Pause the camera behind Settings and fix narrow-screen update-dialog actions.
+- Refresh user/developer guides, GPU audits, parity evidence and research tools.
+- Correct PROGRAM AE startup regression expectations for adaptive profiles.
+
+Validation: 2,021 app JVM tests (9 skipped; zero failures/errors), native debug
+build, 266 SR tests (76 skipped) and six KernelNet Vulkan cases passed. Earlier
+device evidence and experimental-mode limits are detailed in the release notes. APK signing/installation are separate release steps.
+
+## [2.2.46] - Historical development snapshot
 
 - Increase the shared default ZSL buffer and burst / merge frame selection from
   8 to 16, respecting saved choices and mode-specific limits.

@@ -113,12 +113,6 @@ data class RawFrameMetadata(
     val awbMode: Int? = null,
     val exposureCompensationEv: Double? = null,
     val digitalZoomRatio: Float? = null,
-    /**
-     * Viewfinder zoom frozen at the shutter press (1x..ZoomStops.MAX_MULTIPLIER). The
-     * sensor readout never changes for it: [ZoomCrop] trims the CFA after fusion, so the
-     * DNG and the JPEG of one capture are cropped identically. 1 means "no crop".
-     */
-    val zoomMultiplier: Float = 1f,
     /** Derived device/lens description using the optical 35 mm equivalent and aperture. */
     val lensModel: String? = null,
     /** Device manufacturer used as the inferred lens make; no optical supplier claim. */
@@ -137,7 +131,11 @@ data class RawFrameMetadata(
     /** Sensor limit used to distinguish analog from digital noise gain. */
     val maxAnalogSensitivityIso: Int? = null,
     /** Verified session-specific geometry; independent of the vendor's stale mode/result tags. */
-    val sensorReadoutProfile: String? = null
+    val sensorReadoutProfile: String? = null,
+    /** Paired physical capture calibration, in pre-correction active-array coordinates. */
+    val lensIntrinsics: ImmutableFloatValues? = null,
+    /** Camera2 LENS_DISTORTION (k1,k2,k3,p1,p2), never the deprecated radialDistortion. */
+    val lensDistortion: ImmutableFloatValues? = null
 ) {
     fun normalizationOrNull(): RawNormalization? {
         val pattern = cfaPattern ?: return null
@@ -165,11 +163,7 @@ object RawFrameMetadataFactory {
         characteristics: CameraCharacteristics,
         result: TotalCaptureResult,
         exifOrientation: Int,
-        levelOverrides: DngMetadataOverrides = DngMetadataOverrides(),
-        // Default to the multiplier frozen at the shutter: burst and bracket frames rebuild
-        // their metadata here at save time, and without this they would all look like 1x and
-        // export the whole sensor while the single frame of the same capture is cropped.
-        zoomMultiplier: Float = UiZoomState.captureMultiplier
+        levelOverrides: DngMetadataOverrides = DngMetadataOverrides()
     ): RawFrameMetadata {
         val cfaValue = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
         val cfaResult = runCatching { cfaValue?.let(BayerPattern::fromCamera2) }
@@ -285,7 +279,9 @@ object RawFrameMetadataFactory {
             runCatching {
                 RawWhiteBalanceFallback.estimate(plane.buffer, plane.rowStride, plane.pixelStride,
                     image.width, image.height, cfaValue, black, white,
-                    RawWhiteBalanceFallback.locusFor(characteristics))
+                    RawWhiteBalanceFallback.locusFor(characteristics),
+                    RawWhiteBalanceFallback.exposureEv100(sensorKey(CaptureResult.SENSOR_EXPOSURE_TIME),
+                        sensorKey(CaptureResult.SENSOR_SENSITIVITY), sensorKey(CaptureResult.LENS_APERTURE)))
             }.getOrNull()
         } else null
         val gains = fallbackNeutral?.let { ImmutableFloatValues(RawWhiteBalanceFallback.gainsFor(it)) } ?: halGains
@@ -362,8 +358,10 @@ object RawFrameMetadataFactory {
             preCorrectionActiveArray = preCorrection,
             rawCropRegion = rawCrop,
             bufferGeometry = geometry,
-            lensShadingAlreadyApplied = characteristics
-                .get(CameraCharacteristics.SENSOR_INFO_LENS_SHADING_APPLIED) == true,
+            // Camera2's returned map is the REMAINING correction even when the
+            // sensor applies some shading correction. Do not discard that map.
+            lensShadingAlreadyApplied = RawShadingCalibration.alreadyApplied(lensMap, characteristics
+                .get(CameraCharacteristics.SENSOR_INFO_LENS_SHADING_APPLIED) == true),
             lensShadingMap = lensMap,
             hotPixels = hotPixels,
             wbGains = gains,
@@ -418,7 +416,10 @@ object RawFrameMetadataFactory {
                 result.get(CaptureResult.CONTROL_ZOOM_RATIO) else null)
                 ?.takeIf { it.isFinite() && it >= 1f &&
                     capabilities?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA) != true },
-            zoomMultiplier = zoomMultiplier,
+            lensIntrinsics = (physical ?: result).get(CaptureResult.LENS_INTRINSIC_CALIBRATION)
+                ?.let(::ImmutableFloatValues),
+            lensDistortion = (physical ?: result).get(CaptureResult.LENS_DISTORTION)
+                ?.let(::ImmutableFloatValues),
             lensMake = LensExifIdentity.make(Build.MANUFACTURER),
             lensModel = LensExifIdentity.model(
                 Build.MODEL,

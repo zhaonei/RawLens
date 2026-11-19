@@ -26,7 +26,48 @@ class LapisNativeSessionInstrumentedTest {
     @Test fun fiftyMpNativePipeline() = run(LapisRootProfile.Mode.FULL)
     @Test fun sensor4xNativePipeline() = run(LapisRootProfile.Mode.CROP_4X)
     @Test fun sensor2xNativePipeline() = run(LapisRootProfile.Mode.CROP_2X)
+    @Test fun twoXDsgNativePipeline() = run(LapisRootProfile.Mode.CROP_2X_DSG)
     @Test fun dcg14NativePipeline() = run(LapisRootProfile.Mode.DCG14)
+
+    @Test fun twoXDsgEncodedVideo() = encodedVideo(1920,1080)
+    @Test fun twoXDsgEncodedVideo720p() = encodedVideo(1280,720)
+    @Test fun twoXDsgEncodedVideo4k() = encodedVideo(3840,2160)
+
+    private fun encodedVideo(outputWidth:Int,outputHeight:Int) {
+        assumeTrue(InstrumentationRegistry.getArguments().getString("lapisNativeSession")=="true")
+        val context=InstrumentationRegistry.getInstrumentation().targetContext
+        val key=java.util.UUID.randomUUID().toString()
+        val ready=CompletableFuture<LapisRootSession.Spec?>()
+        // Prime stock characteristics before setup, reproducing the preview-to-record cache.
+        val manager=context.getSystemService(CameraManager::class.java)
+        manager.getCameraCharacteristics("0")
+        LapisRootSessionControl.prepare(context,key,LapisRootProfile.Mode.CROP_2X_DSG) {
+            it.fold({ready.complete(it)},{ready.completeExceptionally(it)})
+        }
+        val lease=LapisRecordingLease(key,requireNotNull(ready.get(60,TimeUnit.SECONDS)))
+        val file=File(context.cacheDir,"lapis-2xdsg14-encoded.mp4")
+        val recorder=EncodedVideoRecorder(manager,"0",context,lease)
+        recorder.audioEnabled=false
+        recorder.width=outputWidth;recorder.height=outputHeight
+        var started=false
+        try {
+            recorder.start(file);started=true
+            Thread.sleep(4000)
+            recorder.stop();started=false
+            val extractor=android.media.MediaExtractor()
+            try {
+                extractor.setDataSource(file.path)
+                val track=(0 until extractor.trackCount).first { extractor.getTrackFormat(it).getString(android.media.MediaFormat.KEY_MIME)?.startsWith("video/")==true }
+                val format=extractor.getTrackFormat(track)
+                assertEquals(outputWidth,format.getInteger(android.media.MediaFormat.KEY_WIDTH))
+                assertEquals(outputHeight,format.getInteger(android.media.MediaFormat.KEY_HEIGHT))
+                extractor.selectTrack(track)
+                var frames=0
+                while(extractor.sampleTime>=0) { frames++;if(!extractor.advance())break }
+                assertTrue("Encoded DSG recording contains no video: $frames",frames>=20)
+            } finally { extractor.release() }
+        } finally { if(started)runCatching { recorder.stop() };lease.close() }
+    }
 
     @Test fun killedWorkerRestoresSensor() {
         assumeTrue(InstrumentationRegistry.getArguments().getString("lapisKillWorker")=="true")
@@ -43,18 +84,21 @@ class LapisNativeSessionInstrumentedTest {
         File(context.filesDir,"lapis-killed-worker-recovered.txt").writeText("Verified watchdog restoration after SIGKILL")
     }
 
-    @Test fun dcg14RawVideoContainer() {
+    @Test fun dcg14RawVideoContainer() = rawVideoContainer(LapisRootProfile.Mode.DCG14)
+    @Test fun twoXDsgRawVideoContainer() = rawVideoContainer(LapisRootProfile.Mode.CROP_2X_DSG)
+
+    private fun rawVideoContainer(mode: LapisRootProfile.Mode) {
         assumeTrue(InstrumentationRegistry.getArguments().getString("lapisNativeSession")=="true")
         val context=InstrumentationRegistry.getInstrumentation().targetContext
         val key=java.util.UUID.randomUUID().toString()
         val prepared=CompletableFuture<LapisRootSession.Spec?>()
-        LapisRootSessionControl.prepare(context,key,LapisRootProfile.Mode.DCG14) { result ->
+        LapisRootSessionControl.prepare(context,key,mode) { result ->
             result.fold({prepared.complete(it)},{prepared.completeExceptionally(it)})
         }
         val spec=requireNotNull(prepared.get(60,TimeUnit.SECONDS))
         val lease=LapisRecordingLease(key,spec)
-        val output=File(context.cacheDir,"lapis-dcg14-acceptance.craw")
-        val recorder=RawVideoRecorder(context.getSystemService(CameraManager::class.java),"0",android.util.Size(4080,3060),context,lease)
+        val output=File(context.cacheDir,"lapis-${mode.argument}-acceptance.craw")
+        val recorder=RawVideoRecorder(context.getSystemService(CameraManager::class.java),"0",android.util.Size(spec.width,spec.height),context,lease)
         recorder.audioEnabled=false
         recorder.compressionCodec=CrawWriter.CODEC_FAST
         var stopped=false
@@ -68,10 +112,10 @@ class LapisNativeSessionInstrumentedTest {
             assertEquals(16383,JSONObject(info.containerJson).getInt("whiteLevel"))
             val handle=CrawReader.open(output.path)
             try {
-                val data=java.nio.ByteBuffer.allocateDirect(4080*3060*2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                assertEquals(4080 to 3060,CrawReader.decodeFrame(handle,info.timestamps[info.timestamps.size/2],data))
+                val data=java.nio.ByteBuffer.allocateDirect(spec.width*spec.height*2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                assertEquals(spec.width to spec.height,CrawReader.decodeFrame(handle,info.timestamps[info.timestamps.size/2],data))
                 var maximum=0
-                for(i in 0 until 4080*3060 step 127)maximum=maxOf(maximum,data.getShort(i*2).toInt() and 65535)
+                for(i in 0 until spec.width*spec.height step 127)maximum=maxOf(maximum,data.getShort(i*2).toInt() and 65535)
                 assertTrue("CRAW truncated DCG to ten bits: $maximum",maximum>1023)
                 assertTrue(maximum<=16383)
             }finally { CrawReader.closeReader(handle) }
@@ -88,6 +132,48 @@ class LapisNativeSessionInstrumentedTest {
         LapisRootSessionControl.release(normalKey)
     }
 
+    /** Read only the TIFF IFD and opcode bytes; never allocate a 100 MB RAW payload. */
+    private fun verifySavedGainMap(context:android.content.Context,name:String,metadata:RawFrameMetadata) {
+        val collection=android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val id=context.contentResolver.query(collection,arrayOf(android.provider.MediaStore.Images.Media._ID),
+            "${android.provider.MediaStore.Images.Media.DISPLAY_NAME} = ?",arrayOf(name),null)!!.use {
+            assertTrue("Saved DNG not found: $name",it.moveToFirst());it.getLong(0)
+        }
+        val uri=android.content.ContentUris.withAppendedId(collection,id)
+        context.contentResolver.openFileDescriptor(uri,"r")!!.use { descriptor ->
+            java.io.FileInputStream(descriptor.fileDescriptor).channel.use { channel ->
+                fun read(at:Long,size:Int):java.nio.ByteBuffer {
+                    val b=java.nio.ByteBuffer.allocate(size);channel.position(at)
+                    while(b.hasRemaining())check(channel.read(b)>0) { "Truncated DNG" }
+                    b.flip();return b
+                }
+                val header=read(0,8)
+                val order=if(header.get(0).toInt()==73)java.nio.ByteOrder.LITTLE_ENDIAN else java.nio.ByteOrder.BIG_ENDIAN
+                header.order(order);assertEquals(42,header.getShort(2).toInt())
+                val offset=header.getInt(4).toLong() and 0xffffffffL
+                val count=read(offset,2).order(order).short.toInt() and 65535
+                val entries=read(offset+2,count*12).order(order)
+                var payload:java.nio.ByteBuffer?=null
+                repeat(count) {
+                    val tag=entries.short.toInt() and 65535;val type=entries.short.toInt() and 65535
+                    val n=entries.int;val at=entries.int.toLong() and 0xffffffffL
+                    if(tag==51009) { assertEquals(7,type);assertTrue(n in 100..131072);payload=read(at,n).order(java.nio.ByteOrder.BIG_ENDIAN) }
+                }
+                val opcode=requireNotNull(payload) { "Saved DNG has no OpcodeList2: $name" }
+                assertEquals(4,opcode.int)
+                val map=requireNotNull(metadata.lensShadingMap)
+                repeat(4) {
+                    assertEquals(9,opcode.int);opcode.int;opcode.int
+                    val size=opcode.int;val start=opcode.position()
+                    opcode.position(start+32)
+                    assertEquals(map.rows,opcode.int);assertEquals(map.columns,opcode.int)
+                    opcode.position(start+size)
+                }
+                assertFalse(opcode.hasRemaining())
+            }
+        }
+    }
+
     private fun run(mode: LapisRootProfile.Mode) {
         val args=InstrumentationRegistry.getArguments()
         assumeTrue(args.getString("lapisNativeSession")=="true")
@@ -97,7 +183,7 @@ class LapisNativeSessionInstrumentedTest {
         var device:CameraDevice?=null;var session:CameraCaptureSession?=null;var reader:ImageReader?=null
         val ring=RawZslBuffer(3)
         val images=HashMap<Long,Image>();val results=HashMap<Long,TotalCaptureResult>()
-        val warm=CountDownLatch(if(mode==LapisRootProfile.Mode.DCG14)90 else 8);val burst=CountDownLatch(6)
+        val warm=CountDownLatch(if(lease.spec.dcg)90 else 8);val burst=CountDownLatch(6)
         val errors=CompletableFuture<Throwable>()
         val burstFrames=mutableListOf<BufferedRawFrame>()
         val timestamps=mutableListOf<Long>()
@@ -150,6 +236,7 @@ class LapisNativeSessionInstrumentedTest {
                 set(CaptureRequest.SENSOR_FRAME_DURATION,100_000_000L)
                 set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,Range(10,10))
                 lease.spec.applyRequest(this)
+                set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
             }.build()
             val callback=object:CameraCaptureSession.CaptureCallback(){
                 override fun onCaptureCompleted(s:CameraCaptureSession,q:CaptureRequest,r:TotalCaptureResult){
@@ -169,14 +256,24 @@ class LapisNativeSessionInstrumentedTest {
             val metadata=RawFrameMetadataFactory.capture("0",reference.image,c,reference.result,1)
             assertNull(metadata.rawDevelopmentUnsupportedReason)
             assertEquals(mode.argument,metadata.sensorReadoutProfile)
+            if(args.getString("lapisShading")=="true") {
+                val map=requireNotNull(metadata.lensShadingMap) { "Root readout discarded its lens-shading map" }
+                assertFalse("Remaining map must be exported",metadata.lensShadingAlreadyApplied)
+                assertTrue("Expected measured nonidentity map",map.gains.toList().max()>1.01f)
+                val tags=TinyDngMetadata.create(metadata,DngMetadataOverrides(),BayerPattern.GBRG,
+                    metadata.blackLevels!!.toList().map(Float::toDouble).toDoubleArray(),metadata.whiteLevel!!.toInt(),RawCrop(0,0,width,height))
+                assertTrue("DNG GainMap opcode missing",tags.descriptors.chunked(3).any { it[0]==51009 })
+            }
             if(lease.spec.dcg) {
                 assertTrue("DCG14 white level lost",(metadata.whiteLevel?:0f)>1023f)
                 assertTrue("DCG14 black level lost",metadata.blackLevels!!.toList().all { it>256f })
             }
             val saved=DngSaver(context).save(reference.image,c,reference.result,1,DngMetadataOverrides(),metadata,DngWriterBackend.AUTO)
+            if(args.getString("lapisShading")=="true") verifySavedGainMap(context,saved,metadata)
             val report=JSONObject().put("mode",mode.argument).put("width",width).put("height",height)
                 .put("zslFrames",selected.size).put("sourceDng",saved).put("hardwareVerified",lease.spec.hardwareVerified)
-                .put("whiteLevel",metadata.whiteLevel).put("blackLevels",metadata.blackLevels?.toList())
+                .put("shadingRows",metadata.lensShadingMap?.rows).put("shadingColumns",metadata.lensShadingMap?.columns)
+                .put("shadingMaximum",metadata.lensShadingMap?.gains?.toList()?.maxOrNull()).put("whiteLevel",metadata.whiteLevel).put("blackLevels",metadata.blackLevels?.toList())
             if(lease.spec.dcg) {
                 val fps=(timestamps.size-1)*1e9/(timestamps.last()-timestamps.first())
                 report.put("verifiedFrames",timestamps.size).put("measuredFps",fps)
@@ -194,6 +291,7 @@ class LapisNativeSessionInstrumentedTest {
                 assertEquals(width,merged!!.width);assertEquals(height,merged.height)
                 val mergeName=DngSaver(context).saveMerged(merged,metadata.copy(compositeSourceCount=3,compositeUsedCount=3),sixteenBit=true)
                 report.put("mergedFrames",3).put("mergedDng",mergeName)
+                if(args.getString("lapisShading")=="true") verifySavedGainMap(context,mergeName,metadata)
             }
             selected.forEach { it.image.close() };selected=emptyList()
             synchronized(lock){collectingBurst=true;accepting=true}

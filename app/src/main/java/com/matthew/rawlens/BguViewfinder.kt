@@ -57,7 +57,7 @@ class BguViewfinder @JvmOverloads constructor(
     @Volatile private var previewCenterWeight = 0f
     @Volatile private var previewFocusX: Float? = null
     @Volatile private var previewFocusY: Float? = null
-    @Volatile private var agx = floatArrayOf(1f, 1f, 1f, 0f, 10f, 6.5f, 0f, 1f, 0f)
+    @Volatile private var agx = floatArrayOf(1f, 1f, 1f, 0f, 10f, 6.5f, 0f, 1f, 0f, 0f)
     @Volatile private var frameIntervalNs = 1_000_000_000L / 30
     override var onStarvation: (() -> Unit)? = null
     /**
@@ -123,7 +123,8 @@ class BguViewfinder @JvmOverloads constructor(
         val r = settings.resolvedForPlatform()
         agx = floatArrayOf(
             r.agxContrast, r.agxSaturation, r.agxPurityBoost, r.agxHuePreservation,
-            r.effectiveAgxShadowEv, r.agxHighlightEv, r.agxGamutCompression, r.highlightShoulder, if (r.agxLook == AgxLook.PUNCHY) 1f else 0f
+            r.effectiveAgxShadowEv, r.agxHighlightEv, r.agxGamutCompression, r.highlightShoulder, if (r.agxLook == AgxLook.PUNCHY) 1f else 0f,
+            r.toneMapper.shaderMode.toFloat()
         )
         // The VF meter runs the save's tuning, so VF EV == save EV: same
         // derived broad guard and shoulder as AdaptiveExposureTuning.
@@ -628,7 +629,18 @@ class BguViewfinder @JvmOverloads constructor(
      * (moved verbatim from offer(); only the CPU fallback can bypass it).
      * Returns false to drop the frame (fatal or transient).
      */
+    // ADPF: per-frame GPU guide dispatch against a 60 fps budget (offer thread).
+    private val guideHint = AdpfFrameHint(context, AdpfHint.frameNs(60))
+
     private fun offerGpuGuide(
+        image: android.media.Image, buf: ByteBuffer, rowStride: Int, pixelStride: Int,
+        geo: BguGuideGeo,
+        slot: Int, channels: IntArray, levels: FloatArray, white: Float, offerT0: Long
+    ): Boolean = guideHint.measure {
+        offerGpuGuideUnhinted(image, buf, rowStride, pixelStride, geo, slot, channels, levels, white, offerT0)
+    }
+
+    private fun offerGpuGuideUnhinted(
         image: android.media.Image, buf: ByteBuffer, rowStride: Int, pixelStride: Int,
         geo: BguGuideGeo,
         slot: Int, channels: IntArray, levels: FloatArray, white: Float, offerT0: Long
@@ -1059,13 +1071,16 @@ class BguViewfinder @JvmOverloads constructor(
                 halGains?.let { floatArrayOf(it.red, it.greenEven, it.greenOdd, it.blue) })
         ) {
             runCatching {
-                RawWhiteBalanceFallback.estimate(buf, rowStride, pixelStride, imgW, imgH, cfa, levels, white,
-                    RawWhiteBalanceFallback.locusFor(c))
+                RawWhiteBalanceFallback.estimateDetailed(buf, rowStride, pixelStride, imgW, imgH, cfa, levels, white,
+                    RawWhiteBalanceFallback.locusFor(c), RawWhiteBalanceFallback.exposureEv100(
+                        result?.get(CaptureResult.SENSOR_EXPOSURE_TIME),
+                        result?.get(CaptureResult.SENSOR_SENSITIVITY),
+                        result?.get(CaptureResult.LENS_APERTURE)))
             }.getOrNull()
         }
         if (fallbackNeutral != null && !wbFallbackLogged) {
             wbFallbackLogged = true
-            Log.w(TAG, "HAL reported no white balance; gray-world neutral=" +
+            Log.w(TAG, "HAL reported no white balance; estimated neutral=" +
                 ColorDiagnostics.values(fallbackNeutral))
         }
         val fallbackGains = fallbackNeutral?.let(RawWhiteBalanceFallback::gainsFor)
@@ -1241,7 +1256,7 @@ class BguViewfinder @JvmOverloads constructor(
             snapAgx[4], snapAgx[5], snapAgx[6], snapAgx[7]
         )
         val iparams = intArrayOf(
-            if (renderJpeg) (if (snapAgx[8] > 0.5f) 2 else 1) else 0, 0, if (lens != null) 1 else 0, greenRow,
+            if (renderJpeg) (if (snapAgx[9] > 0.5f) 3 else if (snapAgx[8] > 0.5f) 2 else 1) else 0, 0, if (lens != null) 1 else 0, greenRow,
             geo.left, geo.top, geo.step * BguGeometry.LOW_DF, aL, aT, aR, aB
         )
         return LookParams(
@@ -1265,20 +1280,8 @@ class BguViewfinder @JvmOverloads constructor(
     private var lensDiagDone = false
 
     private fun snapshotLens(c: CameraCharacteristics, result: CaptureResult?): LensSnap? {
-        // HAL pre-applied shading: no map to apply (meter and look both run
-        // unlensed, like the legacy path). A static read, cheap every frame.
-        val preApplied = try {
-            c.get(CameraCharacteristics.SENSOR_INFO_LENS_SHADING_APPLIED) == true
-        } catch (_: Exception) {
-            false
-        }
-        if (preApplied) {
-            if (!lensDiagDone) {
-                lensDiagDone = true
-                Log.i(TAG, "lens HAL pre-applied: meter+look run unlensed")
-            }
-            return null
-        }
+        // Apply any returned residual map even when the sensor reports that
+        // it has already performed part of the shading correction.
         val now = SystemClock.elapsedRealtime()
         val cached = lensCache
         if (cached == null || now - cached.atMs >= 1000) {

@@ -114,7 +114,8 @@ class SrpPipelineFullresDeviceTest {
             }
             val h = refBox!!.size
             val w = refBox!![0].size
-            val (alpha, beta) = DngRead.noiseAlphaBeta(refMeta.noise, refMeta.noiseCount)
+            // Our own noise estimate, never the DNG NoiseProfile (as MfsrMerge).
+            val (alpha, beta) = com.rawlens.srpipeline.stages.SceneNoise.estimate(refBox!!)
             // -e rawlensSrpLut gen: the in-app generator (cached per
             // profile, as MfsrMerge) instead of the pushed Python LUT.
             val curves = if (args.getString("rawlensSrpLut") == "gen") {
@@ -123,12 +124,16 @@ class SrpPipelineFullresDeviceTest {
                     Log.i("SrpFullresDevice", "noise LUT gen ${android.os.SystemClock.elapsedRealtime() - t0} ms")
                 }
             } else NoiseLut.load(lutFile.absolutePath, alpha, beta)
+            val srpScale = args.getString("rawlensSrpScale")?.toFloatOrNull() ?: 1f
             val snr = BurstConfig.estimateSnr(refBox!!, alpha, beta)
             val fin = BurstConfig.finalize(snr)
             val factors = listOf(1, 2, 4, 4)
             BurstConfig.sanitize(1f, fin.tileSize, factors, fin.tileSizes, h, w)
             val config = PipelineConfig(
-                scale = 1f, bayer = true, factors = factors, tileSizes = fin.tileSizes,
+                // -e rawlensSrpScale 2: 2x super-resolution output (default 1).
+                scale = srpScale, bayer = true, factors = factors, tileSizes = fin.tileSizes,
+                // -e rawlensSrpGrey FIR7|FIR11|FIR15 (mobile FIR grey) or FFT (default).
+                greyMethod = args.getString("rawlensSrpGrey") ?: "FFT",
                 kernelParams = KernelParams(
                     kDetail = fin.kDetail.toFloat(), kDenoise = fin.kDenoise.toFloat(),
                     dTh = fin.dTh.toFloat(), dTr = fin.dTr.toFloat()),
@@ -142,6 +147,9 @@ class SrpPipelineFullresDeviceTest {
                 // Collect after every frame: GC timing must not decide
                 // survival at the 512 MB ceiling (values-identical).
                 memoryTight = true,
+                // -e rawlensSrpColourDiff true: the app's default zipper-fix
+                // colour-difference merge (WB 1,1: same cost as the app).
+                colourDiff = if (args.getString("rawlensSrpColourDiff") == "true") floatArrayOf(1f, 1f) else null,
                 // -e rawlensSrpKernel kernelnet|wronski (default wronski);
                 // the merge input IS the full frame here.
                 kernelNet = if (args.getString("rawlensSrpKernel") != "kernelnet") null else {
@@ -166,17 +174,25 @@ class SrpPipelineFullresDeviceTest {
                 refThunk, compImgs, config, handle,
                 AlignGpu.Spirvs(
                     align = assetBytes("align"), corr = assetBytes("corr"),
-                    fft = fft, ica = assetBytes("ica"), corrDirect = assetBytes("corr_direct"), icaWg = assetBytes("ica_wg")),
+                    fft = fft, ica = assetBytes("ica"), corrDirect = assetBytes("corr_direct"), icaWg = assetBytes("ica_wg"),
+                    // -e rawlensSrpAlignWg true: workgroup-per-tile L1 search.
+                    alignWg = if (args.getString("rawlensSrpAlignWg") == "true") assetBytes("align_wg") else null,
+                    argminWg = if (args.getString("rawlensSrpArgminWg") == "true") assetBytes("corr_argmin_wg") else null,
+                    l2Fused = if (args.getString("rawlensSrpL2Fused") == "true") assetBytes("corr_l2_fused") else null),
                 VulkanPipeline.Spirvs(
                     gat = assetBytes("gat"), grad = assetBytes("grad"),
                     kernels = assetBytes("kernels"), divide = assetBytes("divide"),
                     robust = assetBytes("robustness"),
                     mergeSplat = assetBytes("merge_splat"),
-                    fft = fft, corr = assetBytes("corr"), greyFft = assetBytes("grey_fft"),
+                    fft = fft, corr = assetBytes("corr"), greyFft = assetBytes("grey_fft"), greyFir = assetBytes("grey_fir"),
+                    // -e rawlensSrpResident true: resident grey + GPU moving pyramid.
+                    pyrDown = if (args.getString("rawlensSrpResident") == "true") assetBytes("pyr_down") else null,
                     kernelNet = if (args.getString("rawlensSrpKernel") == "kernelnet") assetBytes("kernelnet") else null),
+                // Native output like MfsrMerge: a 2x frame (600 MB) cannot be a heap direct buffer.
+                output = SrpBridge.nativeFloats((w * srpScale).toInt() * (h * srpScale).toInt() * 3),
             )
-            val outH = h
-            val outW = w
+            val outH = (h * srpScale).toInt()
+            val outW = (w * srpScale).toInt()
             VulkanPipeline.nanToBlack(rgb.asFloatBuffer(), outH * outW * 3)
             rgb.rewind()
             VulkanPipeline.flipRowsInPlace(rgb.asFloatBuffer(), outW, outH)

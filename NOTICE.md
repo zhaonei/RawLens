@@ -1,5 +1,20 @@
 # Third-party notices
 
+## RapidRAW RAW preprocessing
+
+The JPEG chroma cleanup and gentle detail enhancement in
+`shaders/display/rapidraw_cleanup.glsl`, its Android/native bridge, and the
+`rapidraw_cleanup.{cpp,h}` CPU reference are ports of `src-tauri/src/image_processing.rs` from
+https://github.com/CyberTimon/RapidRAW at commit
+`1a39ae4e76d825c5abf0d4bafee798f99e0a0b63` (Timon Käch and contributors).
+The port and its bridge carry AGPL-3.0-only; the license is bundled in
+`app/src/main/assets/licenses/AGPL-3.0-RapidRAW.txt`.
+The remaining RawLens code retains its existing licenses. Distribution of the
+combined GPLv3/AGPLv3 work is subject to AGPLv3 section 13, including its network
+interaction requirements where applicable. Corresponding source includes this port.
+RawLens supplies ACEScg/sRGB conversion, Android buffer ownership and EGL integration.
+The chroma/detail defaults are 0.5/0.35; this does not claim full RAW renderer parity.
+
 ## PhotonCamera
 
 RawLens's PROGRAM shutter-first exposure policy and ZSL lifecycle acknowledge work from PhotonCamera:
@@ -374,3 +389,15 @@ helpers and `shader_common/shaders/cfa_common.glsl` come from the same commit.
 The upstream module notice and RAWR license are retained beside the code.
 A typed null handle in DeviceObjects.h is the sole portability adaptation,
 needed for Android armeabi-v7a; sharpening arithmetic is unchanged.
+
+## VidUltra (stabilization model)
+
+`StabPlanner.kt` follows the gyro stabilization model of Pixelgamer4k/VidUltra
+(`app/src/main/java/dev/vidultra/proto/Stabilizer.java`, GPL-3.0): quaternion
+camera orientation, rolling-shutter row timing evaluated in row bands, the
+virtual-camera projection with Brown lens distortion, and the border-point fit
+test. The implementation is a Kotlin rewrite. RawLens replaces VidUltra's causal
+smoothing and margin easing with a whole-take L1 path optimization
+(`StabPathSolver.kt`, after Grundmann, Kwatra & Essa, CVPR 2011) and adds
+self-calibration (`StabCalib.kt`, after Karpenko et al., 2011). No VidUltra source
+file is copied. Reviewed at commit `25674ef`.

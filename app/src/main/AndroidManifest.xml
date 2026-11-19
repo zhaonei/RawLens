@@ -15,6 +15,7 @@
         android:required="true"
         android:version="0x401000" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.VIBRATE" />
     <!-- RAW video sound: PCM16 inside the .craw. Requested at runtime only
         on first video-record press; stills never need the mic. No microphone
         uses-feature: mic-less devices record silent video instead. -->
@@ -54,6 +55,14 @@
         android:label="${appLabel}"
         android:supportsRtl="true"
         android:theme="@style/Theme.RawLens">
+        <provider
+            android:name=".BurstFileProvider"
+            android:authorities="${applicationId}.bursts"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/burst_paths" />
+        </provider>
         <service
             android:name=".JpegProcessingService"
             android:exported="false"
@@ -76,6 +85,13 @@
             android:exported="true"
             android:screenOrientation="portrait">
         </activity>
+        <service android:name=".DevelopQueueService" android:exported="false"
+            android:foregroundServiceType="mediaProcessing|specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Importing and developing queued linear DNG photos" />
+        </service>
+        <activity android:name=".DevelopQueueActivity" android:exported="false"
+            android:screenOrientation="portrait" />
         <!-- Offline burst merge: staged _BURST.craw takes only, never RAW video. -->
         <activity
             android:name=".MergesActivity"

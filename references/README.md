@@ -1,12 +1,13 @@
 # Algorithm reference checkouts
 
+> See [current repository state](../docs/CURRENT_STATE.md) for app integration, current merge names, build requirements and the scope of historical evidence.
+
 This directory is for isolated upstream source checkouts used to study camera algorithms and implementation patterns. They are not RawLens build dependencies and are excluded from RawLens release artifacts.
 
 ## PhotonCamera
 
-For the separate SkyKing working Bayer-direct merge reference used by RAW SR
-Prompt 4 / future 4B–4D, see [the pinned source contract and adaptation notes](../docs/raw-sr-skyking-reference.md).
-Its research-only checkout is `Photon-Camera-SkyKing/`, branch
+The historical SkyKing Bayer-direct merge reference uses the research-only checkout
+`Photon-Camera-SkyKing/`, branch
 `backup-26514-before-26515-short-bento-fix-20260820`, commit
 `e9855a3af7a79801a762ec3f99b441474926f009`. It is not a build dependency.
 

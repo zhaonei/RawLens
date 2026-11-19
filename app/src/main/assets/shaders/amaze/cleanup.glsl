@@ -2,7 +2,7 @@
 // costs no extra texture, pass, or readback.
 //
 //  * False-color suppression (RawTherapee / dcraw "median filter passes"):
-//    one 3x3 median of the color differences (R-G, B-G). Removes demosaic
+//    two nine-sample medians of the color differences (R-G, B-G). Removes demosaic
 //    maze / zipper moire on fine repeating detail (palm fronds, fabric)
 //    without touching luminance (G is kept).
 //  * Purple defringe: at strong local contrast edges only, strips the
@@ -13,7 +13,7 @@
 // Works in the white-balanced camera basis (neutral = 1,1,1). The includer
 // defines, BEFORE this import:
 //   highp vec3 fetch_bal(ivec2 off)  // balanced RGB (>= 0) at pixel + off, |off| <= 2
-uniform int u_fc_median;        // 1 = one 3x3 color-difference median pass
+uniform int u_fc_median;        // 1 = radius-1/radius-2 color-difference medians
 uniform highp float u_defringe; // 0 = off .. 1 = full purple-fringe removal
 
 #define CC_SORT(a, b) { highp vec2 t_ = min(a, b); b = max(a, b); a = t_; }
@@ -23,36 +23,73 @@ highp vec2 cc_diff(ivec2 off) {
     return s.rb - s.g;
 }
 
+// Nine samples at each radius; the second ring catches 2-3 pixel color
+// islands left by super-resolution without another image pass or texture.
+highp vec2 cc_median(highp vec2 center, int radius) {
+    highp vec2 p0 = cc_diff(ivec2(-radius, -radius)), p1 = cc_diff(ivec2(0, -radius)), p2 = cc_diff(ivec2(radius, -radius));
+    highp vec2 p3 = cc_diff(ivec2(-radius, 0)), p4 = center, p5 = cc_diff(ivec2(radius, 0));
+    highp vec2 p6 = cc_diff(ivec2(-radius, radius)), p7 = cc_diff(ivec2(0, radius)), p8 = cc_diff(ivec2(radius, radius));
+    CC_SORT(p1, p2) CC_SORT(p4, p5) CC_SORT(p7, p8) CC_SORT(p0, p1) CC_SORT(p3, p4)
+    CC_SORT(p6, p7) CC_SORT(p1, p2) CC_SORT(p4, p5) CC_SORT(p7, p8) CC_SORT(p0, p3)
+    CC_SORT(p5, p8) CC_SORT(p4, p7) CC_SORT(p3, p6) CC_SORT(p1, p4) CC_SORT(p2, p5)
+    CC_SORT(p4, p7) CC_SORT(p4, p2) CC_SORT(p6, p4) CC_SORT(p4, p2)
+    return p4;
+}
+
 highp vec3 chroma_cleanup(highp vec3 c) {
     if (u_fc_median == 0 && u_defringe <= 0.0) return c;
     highp vec2 d = c.rb - c.g;
     if (u_fc_median != 0) {
-        // Paeth's 19-exchange median-of-9 network, vectorized over (R-G, B-G).
-        highp vec2 p0 = cc_diff(ivec2(-1, -1)), p1 = cc_diff(ivec2(0, -1)), p2 = cc_diff(ivec2(1, -1));
-        highp vec2 p3 = cc_diff(ivec2(-1, 0)), p4 = d, p5 = cc_diff(ivec2(1, 0));
-        highp vec2 p6 = cc_diff(ivec2(-1, 1)), p7 = cc_diff(ivec2(0, 1)), p8 = cc_diff(ivec2(1, 1));
-        CC_SORT(p1, p2) CC_SORT(p4, p5) CC_SORT(p7, p8) CC_SORT(p0, p1) CC_SORT(p3, p4)
-        CC_SORT(p6, p7) CC_SORT(p1, p2) CC_SORT(p4, p5) CC_SORT(p7, p8) CC_SORT(p0, p3)
-        CC_SORT(p5, p8) CC_SORT(p4, p7) CC_SORT(p3, p6) CC_SORT(p1, p4) CC_SORT(p2, p5)
-        CC_SORT(p4, p7) CC_SORT(p4, p2) CC_SORT(p6, p4) CC_SORT(p4, p2)
-        d = p4;
+        highp vec2 fine = cc_median(d, 1);
+        highp vec2 wide = cc_median(d, 2);
+        // Prefer the less chromatic neighborhood estimate. Flat colors are
+        // identical at both radii; green/luminance detail is never filtered.
+        d = dot(wide, wide) < dot(fine, fine) ? wide : fine;
     }
     if (u_defringe > 0.0 && d.y > 0.0) {
         // Local green contrast over a 5x5 footprint (9 taps, stride 2).
         highp float hi = 0.0;
         highp float lo = 1e30;
+        highp vec3 background = vec3(0.0);
         for (int y = -2; y <= 2; y += 2) {
             for (int x = -2; x <= 2; x += 2) {
-                highp float g = fetch_bal(ivec2(x, y)).g;
+                highp vec3 sampleRgb = fetch_bal(ivec2(x, y));
+                highp float g = sampleRgb.g;
+                if (g > hi) background = sampleRgb;
                 hi = max(hi, g);
                 lo = min(lo, g);
             }
         }
         // ~3x step -> starts, ~7x step (twig against sky) -> full.
-        highp float edge = 1.0 - smoothstep(0.15, 0.35, lo / max(hi, 1e-6));
+        // Use relative range so a flat zero-green blue/purple patch has zero
+        // contrast. lo / max(hi, epsilon) incorrectly classified 0/0 as an edge
+        // and erased its blue/red chroma. Positive-green edge thresholds are unchanged.
+        highp float edge = smoothstep(0.65, 0.85, (hi - lo) / max(hi, 1e-6));
         // Violet/magenta hue: B above G, R not far below G.
         highp float violet = smoothstep(-0.6, -0.1, d.x / d.y);
-        highp float k = clamp(u_defringe, 0.0, 1.0) * edge * violet;
+        // Green contrast alone also selects real magenta petals against leaves.
+        // Fringes require a bright neutral/blue background, not green foliage,
+        // and belong to its dark side. Never strip blue from the sky itself.
+        highp float bgGreen = max(background.g, 1e-6);
+        highp float sky = smoothstep(0.65, 0.90, background.b / bgGreen)
+            * (1.0 - smoothstep(1.2, 1.8, background.r / bgGreen));
+        highp float darkSide = 1.0 - smoothstep(0.5, 0.85, c.g / max(hi, 1e-6));
+        // A fringe is a thin chroma ridge. A coherent purple surface (petal,
+        // fabric, paint) has neighboring pixels with the same chroma direction.
+        // Preserve those surfaces even when they are silhouetted against sky.
+        highp float support = 0.0;
+        if (edge * sky * darkSide > 0.0) {
+            highp float magnitude = max(length(d), 1e-6);
+            for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+                highp vec3 neighbor = fetch_bal(ivec2(x, y));
+                highp vec2 diff = neighbor.rb - neighbor.g;
+                highp float size = length(diff);
+                if (size > magnitude * 0.4 && dot(diff, d) > 0.9 * size * magnitude)
+                    support += 1.0;
+            }
+        }
+        highp float narrow = 1.0 - smoothstep(3.0, 5.0, support);
+        highp float k = clamp(u_defringe, 0.0, 1.0) * edge * violet * sky * darkSide * narrow;
         d = mix(d, min(d, vec2(0.0)), k);
     }
     return max(vec3(c.g + d.x, c.g, c.g + d.y), vec3(0.0));

@@ -1,3 +1,5 @@
+> Repository context: [current source state](../CURRENT_STATE.md). This audit, plan or evidence records its original scope; historical defaults, results and pending work do not establish current app behavior.
+
  # RawLens 2.0.0: remaining work (2026-10-22, cut revised 2026-10-25)
 
 Proposed cut: **[2.0]** must land before the 2.0.0 release; **[2.0.x]**
@@ -368,8 +370,37 @@ sustained zero-drop acceptance remains OPEN. See the audit for retained evidence
             green split, DNG writer layout, etc. - to be found), no
             masking filter. Prime suspect list overlaps the C13 core
             hypothesis below; diagnose with C13a, do not fix blind.
-      - [ ] C9 [2.0.x] Dim-burst divergence vs the Python reference
-            (70.5 dB).
+      - [x] C9 [2.0.x] Dim-burst divergence vs the Python reference
+            (70.5 dB). Explained 2026-11-14, no RawLens logic defect
+            ([report](mfsr-c9-reference-parity.md)). Chain checked:
+            original Numba-CUDA (run under the CUDA simulator, no GPU) ->
+            CPU port (fork 0b4371c) -> sr-pipeline. Engine vs reference on
+            the C9 burst: 81.9-82.4 dB; causes: (a) the intentional
+            computeK NaN guard on clipped highlights (reference: NaN
+            covariance -> flat 3x3 box; ours: Gaussian), all max-0.039
+            pixels; with the guard on both sides 113 dB; (b) float32 L2
+            block-matching near-ties (0.04 % SSD), 4-25 tiles per crop, ours
+            is the true float64 minimum. Fork fixed (branch
+            cuda-parity-fixes): round half-even like CUDA `__nv_llrint`,
+            float64 accumulators like CUDA; the original CUDA 64 px L1 and
+            ICA kernels (SNR <= 14 dB) are buggy, port and RawLens are
+            correct there by design. Paper leg (Wronski 2019 + supplement,
+            line by line): Eq. 1-9 and constants 1:1 except four IPOL
+            choices RawLens keeps (A formula, k-hat law, Dth/Dtr in GAT
+            units, s1/s2 swap).
+            - [x] C9a (2026-11-14, owner) Ties-to-even rounding like CUDA
+                  `__nv_llrint` in Kotlin + align.comp/robustness.comp.
+                  malioc G615/G57: same registers, no spills, arithmetic
+                  cycles slightly lower; C9 crop bit-identical on Vulkan.
+                  Also fixed the CLI `--backend cpu` upside-down output
+                  (double row flip since 7fabb64f; app unaffected).
+            - [x] C9b (2026-11-14) Paper-vs-IPOL benchmark on known truth
+                  (PaperVsIpolBenchTest): IPOL wins on the A formula and the
+                  k-hat law (paper -0.7..-1.4 dB, NaNs) and on Dth/Dtr
+                  (paper -2.4 dB dim). The paper's s1/s2 order gains
+                  <= 0.21 dB static but ghosts more. No default change.
+            - [ ] C9c CLI CPU vs Vulkan residual: 57.5 dB, 0.58 % px > 1/255,
+                  max 0.38 on the C9 crop (app is Vulkan-only).
       - [ ] C10 [2.0.x] Scale > 1 for zoom; S.3 thresholds; failed-tile
             alignment check (mfsr-paper-gaps.md).
             Failed-tile leg 2026-11-03: border band root-caused (zero-padded

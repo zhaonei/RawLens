@@ -387,6 +387,7 @@
             <com.matthew.rawlens.QuickControlTileView android:id="@+id/ettrQuick" style="@style/QuickControlTile" android:text="ETTR\nOFF" />
             <com.matthew.rawlens.QuickControlTileView android:id="@+id/resetTargetsQuick" style="@style/QuickControlTile" android:layout_marginStart="8dp" android:text="AF / AE\nRESET" />
             <com.matthew.rawlens.QuickControlTileView android:id="@+id/lightQuick" style="@style/QuickControlTile" android:layout_marginStart="8dp" android:text="LIGHT\nOFF" />
+            <com.matthew.rawlens.QuickControlTileView android:id="@+id/monoQuick" style="@style/QuickControlTile" android:layout_marginStart="8dp" android:text="B&amp;W\nOFF" />
         </LinearLayout>
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:orientation="horizontal" android:baselineAligned="false">
             <com.matthew.rawlens.QuickControlTileView android:id="@+id/hdrPlusQuick" style="@style/QuickControlTile" android:text="HDR+\nOFF" />
@@ -632,11 +633,12 @@
                     android:clickable="true"
                     android:focusable="true"
                     android:gravity="center"
-                    android:singleLine="true"
+                    android:maxLines="2"
+                    android:lineSpacingMultiplier="0.9"
                     android:text="OFF"
                     android:includeFontPadding="false"
                     android:textColor="@color/text_secondary"
-                    android:textSize="8sp" />
+                    android:textSize="9sp" />
 
                 <!-- LK-R output resolution: sensor MP <-> x2 super-resolution.
                      Round like its OFF / AUTO neighbours; shown only while
@@ -673,15 +675,4 @@
             </LinearLayout>
         </LinearLayout>
     </LinearLayout>
-
-    <!-- Zoom track. LAST child on purpose: it has to draw ABOVE the bottom panel, and in a
-         FrameLayout the draw order is declaration order. 252dp keeps it clear of the panel
-         top (the app's own panels sit at 248dp); MainActivity re-seats it against the real
-         panel once it has been measured. -->
-    <com.matthew.rawlens.ZoomSliderView
-        android:id="@+id/zoomSlider"
-        android:layout_width="wrap_content"
-        android:layout_height="46dp"
-        android:layout_gravity="bottom|center_horizontal"
-        android:layout_marginBottom="252dp" />
 </FrameLayout>

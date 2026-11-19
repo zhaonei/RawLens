@@ -23,16 +23,17 @@ data class DevelopedJpeg(val bitmap: Bitmap, val settings: JpegOutputSettings, v
 
 /** Converts an unclamped scene-linear ACEScg texture into a color-tagged JPEG Bitmap. */
 class Gles31JpegOutputProcessor(context: Context) {
+    private val cleanup = RapidRawDevelop(context.applicationContext)
     private val shaderSource = context.applicationContext.assets.open(SHADER).bufferedReader().use {
-        it.readText()
+        it.readText().replace("// SIGMOID_FUNCTIONS", CameraToneBalance.glsl + "\n" + SigmoidDisplayTransform.glsl + "\n" + Aces2DisplayTransform.glsl)
     }
     // This processor is invoked inside Gles31AmazeProcessor.process(), on its persistent writer
     // EGL context. Compile once per context instead of once per saved JPEG.
+    private val aces2 = Aces2Gl()
     private var program = 0
+    private val cleanupPrograms = IntArray(4)
     private var programThread: Thread? = null
     private var framebuffer = 0
-    private var baseReadback: ByteBuffer? = null
-    private var gainReadback: ByteBuffer? = null
 
     /** Completes readback only; AgX, gamut mapping, encoding and gain-map generation were fused. */
     fun processEncoded(
@@ -53,8 +54,7 @@ class Gles31JpegOutputProcessor(context: Context) {
                 encoded.gainmapTextureId,
                 ceilDiv(encoded.width, GAINMAP_DOWNSCALE),
                 ceilDiv(encoded.height, GAINMAP_DOWNSCALE),
-                colorSpace,
-                gainmap = true
+                colorSpace
             ).bitmap
         } else null
         val completedAt = SystemClock.elapsedRealtime()
@@ -68,7 +68,13 @@ class Gles31JpegOutputProcessor(context: Context) {
         return DevelopedJpeg(base.bitmap, resolved, gainmap)
     }
 
-    fun process(scene: AmazeGpuOutput, settings: JpegOutputSettings = JpegOutputSettings()): DevelopedJpeg {
+    fun process(scene: AmazeGpuOutput, settings: JpegOutputSettings = JpegOutputSettings()): DevelopedJpeg =
+        if (settings.chromaCleanup.rapidRawActive) {
+            cleanup.withPrepared(scene, settings.chromaCleanup.rapidRawAmounts) { prepared -> processCleaned(scene, settings, prepared) }
+        } else processCleaned(scene, settings)
+
+    private fun processCleaned(scene: AmazeGpuOutput, settings: JpegOutputSettings,
+                               prepared: RapidRawDevelop.Prepared? = null): DevelopedJpeg {
         val startedAt = SystemClock.elapsedRealtime()
         require(scene.internalFormat == AmazeTextureFormat.RGBA16F)
         require(scene.colorDomain == AmazeColorDomain.ACESCG) {
@@ -106,8 +112,9 @@ class Gles31JpegOutputProcessor(context: Context) {
             checkGl("encoded texture allocation")
             val allocatedAt = SystemClock.elapsedRealtime()
 
-            val outputProgram = outputProgram()
+            val outputProgram = outputProgram(prepared != null, resolved.toneMapper, resolved.ultraHdr)
             GLES31.glUseProgram(outputProgram)
+            if (prepared != null) cleanup.bindPrepared(outputProgram, prepared)
             GLES31.glBindImageTexture(
                 0, scene.textureId, 0, false, 0, GLES31.GL_READ_ONLY, GLES30.GL_RGBA16F
             )
@@ -123,6 +130,8 @@ class Gles31JpegOutputProcessor(context: Context) {
                 ceilDiv(scene.width, GAINMAP_DOWNSCALE), ceilDiv(scene.height, GAINMAP_DOWNSCALE)
             )
             GLES31.glUniform1i(location(outputProgram, "u_display_p3"), if (resolved.displayP3) 1 else 0)
+            GLES31.glUniform1i(GLES31.glGetUniformLocation(outputProgram, "u_basic"), resolved.toneMapper.shaderMode)
+            aces2.bind(outputProgram, resolved.toneMapper.shaderMode)
             GLES31.glUniform1f(location(outputProgram, "u_agx_purity_boost"), resolved.agxPurityBoost)
             GLES31.glUniform1i(location(outputProgram, "u_agx_punchy"), if (resolved.agxLook == AgxLook.PUNCHY) 1 else 0)
             GLES31.glUniform1f(location(outputProgram, "u_agx_contrast"), resolved.agxContrast)
@@ -141,11 +150,12 @@ class Gles31JpegOutputProcessor(context: Context) {
             GLES31.glUniform1f(location(outputProgram, "u_grain_amount"), 0f)
             GLES31.glUniform1f(location(outputProgram, "u_grain_size"), 0f)
             GLES31.glUniform1ui(location(outputProgram, "u_grain_seed"), System.nanoTime().toInt())
-            GLES31.glUniform1i(location(outputProgram, "u_write_gainmap"), 0)
+            GLES31.glUniform1i(location(outputProgram, "u_write_gainmap"), if (prepared != null && resolved.ultraHdr) 1 else 0)
             GLES31.glUniform1i(location(outputProgram, "u_gainmap_only"), 0)
             bindUltraHdrParams(outputProgram, resolved)
-            GLES31.glDispatchCompute(ceilDiv(scene.width, 8), ceilDiv(scene.height, 8), 1)
-            if (resolved.ultraHdr) {
+            if (prepared != null) cleanup.dispatchSlices(outputProgram, scene.width, scene.height)
+            else GLES31.glDispatchCompute(ceilDiv(scene.width, 8), ceilDiv(scene.height, 8), 1)
+            if (resolved.ultraHdr && prepared == null) {
                 GLES31.glUniform1i(location(outputProgram, "u_write_gainmap"), 1)
                 GLES31.glUniform1i(location(outputProgram, "u_gainmap_only"), 1)
                 GLES31.glDispatchCompute(
@@ -166,7 +176,7 @@ class Gles31JpegOutputProcessor(context: Context) {
             val gainmap = if (resolved.ultraHdr) {
                 readBitmap(
                     gainTexture[0], ceilDiv(scene.width, GAINMAP_DOWNSCALE),
-                    ceilDiv(scene.height, GAINMAP_DOWNSCALE), colorSpace, gainmap = true
+                    ceilDiv(scene.height, GAINMAP_DOWNSCALE), colorSpace
                 ).bitmap
             } else null
             val completedAt = SystemClock.elapsedRealtime()
@@ -190,13 +200,18 @@ class Gles31JpegOutputProcessor(context: Context) {
 
     /** Must be called while AMaZE's persistent EGL context is current on its worker thread. */
     fun close() {
-        if (program != 0) {
+        aces2.close()
+        cleanup.close()
+        if (program != 0 || cleanupPrograms.any { it != 0 }) {
             check(programThread == Thread.currentThread()) {
                 "JPEG output program must be closed by its owning worker thread"
             }
-            GLES31.glDeleteProgram(program)
-            MemoryLeakDiagnostics.glProgramReleased()
+            for (id in intArrayOf(program, *cleanupPrograms)) if (id != 0) {
+                GLES31.glDeleteProgram(id)
+                MemoryLeakDiagnostics.glProgramReleased()
+            }
             program = 0
+            cleanupPrograms.fill(0)
             programThread = null
         }
         if (framebuffer != 0) {
@@ -204,16 +219,13 @@ class Gles31JpegOutputProcessor(context: Context) {
             MemoryLeakDiagnostics.glFramebufferReleased()
             framebuffer = 0
         }
-        baseReadback = null
-        gainReadback = null
     }
 
     private fun readBitmap(
         texture: Int,
         width: Int,
         height: Int,
-        colorSpace: ColorSpace,
-        gainmap: Boolean = false
+        colorSpace: ColorSpace
     ): ReadbackResult {
         if (framebuffer == 0) {
             framebuffer = IntArray(1).also { GLES30.glGenFramebuffers(1, it, 0) }[0]
@@ -229,35 +241,43 @@ class Gles31JpegOutputProcessor(context: Context) {
             check(GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER) == GLES30.GL_FRAMEBUFFER_COMPLETE) {
                 "Encoded output framebuffer is incomplete"
             }
-            val byteCount = width * height * 4
-            var pixels = if (gainmap) gainReadback else baseReadback
-            if (pixels == null || pixels.capacity() < byteCount) {
-                pixels = ByteBuffer.allocateDirect(byteCount).order(ByteOrder.nativeOrder())
-                if (gainmap) gainReadback = pixels else baseReadback = pixels
+            val byteCount = Math.multiplyExact(Math.multiplyExact(width, height), 4)
+            // ART charges allocateDirect against its Java heap. A 50 MP RGBA
+            // readback is ~200 MB while B&W already owns full-frame CFA/mono
+            // arrays. Keep this staging allocation native and release it on
+            // every path, rather than caching an entire photo between saves.
+            val pixels = HdrPlusVulkan.allocBuffer(byteCount.toLong()).order(ByteOrder.nativeOrder())
+            try {
+                pixels.clear()
+                pixels.limit(byteCount)
+                GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
+                val readStartedAt = SystemClock.elapsedRealtime()
+                GLES30.glReadPixels(
+                    0, 0, width, height, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixels
+                )
+                checkGl("encoded output readback")
+                val readCompletedAt = SystemClock.elapsedRealtime()
+                // GLES RGBA readback is accepted directly by this device's ARGB_8888 Bitmap path.
+                // Do not apply a second R/B swap here: it turns the calibrated DNG's warm neutrals
+                // cyan and visibly exchanges blue and orange subjects.
+                pixels.rewind()
+                val bitmap = Bitmap.createBitmap(
+                    width, height, Bitmap.Config.ARGB_8888, false, colorSpace
+                )
+                try {
+                    bitmap.copyPixelsFromBuffer(pixels)
+                } catch (failure: Throwable) {
+                    bitmap.recycle()
+                    throw failure
+                }
+                return ReadbackResult(
+                    bitmap,
+                    readCompletedAt - readStartedAt,
+                    SystemClock.elapsedRealtime() - readCompletedAt
+                )
+            } finally {
+                HdrPlusVulkan.freeBuffer(pixels)
             }
-            pixels.clear()
-            pixels.limit(byteCount)
-            GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
-            val readStartedAt = SystemClock.elapsedRealtime()
-            GLES30.glReadPixels(
-                0, 0, width, height, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixels
-            )
-            checkGl("encoded output readback")
-            val readCompletedAt = SystemClock.elapsedRealtime()
-            // GLES RGBA readback is accepted directly by this device's ARGB_8888 Bitmap path.
-            // Do not apply a second R/B swap here: it turns the calibrated DNG's warm neutrals
-            // cyan and visibly exchanges blue and orange subjects.
-            pixels.rewind()
-            val bitmap = Bitmap.createBitmap(
-                width, height, Bitmap.Config.ARGB_8888, false, colorSpace
-            ).also {
-                it.copyPixelsFromBuffer(pixels)
-            }
-            return ReadbackResult(
-                bitmap,
-                readCompletedAt - readStartedAt,
-                SystemClock.elapsedRealtime() - readCompletedAt
-            )
         } finally {
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         }
@@ -314,21 +334,27 @@ class Gles31JpegOutputProcessor(context: Context) {
         return program
     }
 
-    private fun outputProgram(): Int {
+    private fun outputProgram(fusedCleanup: Boolean = false, tone: PhotoToneMapper = PhotoToneMapper.BASIC, gainmap: Boolean = false): Int {
         val thread = Thread.currentThread()
         val previousThread = programThread
         check(previousThread == null || previousThread == thread) {
             "JPEG output program must stay on AMaZE's owning worker thread"
         }
-        if (program == 0) {
-            program = compile(shaderSource)
-            programThread = thread
+        val index = (if(tone == PhotoToneMapper.BASIC) 2 else 0) + (if(gainmap)1 else 0)
+        if (fusedCleanup) {
+            if (cleanupPrograms[index] == 0) cleanupPrograms[index] = compile(cleanup.fusedSource(shaderSource, tone == PhotoToneMapper.BASIC, gainmap))
+        } else {
+            if (program == 0) program = compile(shaderSource)
         }
-        return program
+        programThread = thread
+        return if (fusedCleanup) cleanupPrograms[index] else program
     }
 
     private fun location(program: Int, name: String): Int =
-        GLES31.glGetUniformLocation(program, name).also { check(it >= 0) { "Missing uniform $name" } }
+        GLES31.glGetUniformLocation(program, name).also {
+            // Specialized Basic/AgX programs legitimately eliminate the other curve's controls.
+            check(it >= 0 || cleanupPrograms.contains(program)) { "Missing uniform $name" }
+        }
 
     private fun checkGl(operation: String) {
         val error = GLES20.glGetError()

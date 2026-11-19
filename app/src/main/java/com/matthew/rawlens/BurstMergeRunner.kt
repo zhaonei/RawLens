@@ -137,13 +137,6 @@ internal class BurstMergeRunner(private val appContext: Context) {
         }
     }
 
-    /**
-     * Crop window for a super-resolved linear-RGB merge, in the merge buffer's pixels. Linear
-     * RGB has no Bayer phase to preserve, so odd edges are acceptable here.
-     */
-    private fun mfsrWindow(width: Int, height: Int, multiplier: Float): RawCrop? =
-        ZoomCrop.rectFor(width, height, multiplier, minEdge = 2, evenAligned = false)
-
     private fun runMfsr(
         take: File,
         frames: List<OfflineBurstFrame>,
@@ -156,7 +149,7 @@ internal class BurstMergeRunner(private val appContext: Context) {
         val ordered = MfsrMerge.prepareDecoded(frames)
             ?: throw IllegalStateException("No usable frames for MFSR")
         val tMerge = SystemClock.elapsedRealtime()
-        val merged = MfsrMerge.mergeDecoded(appContext, ordered, inputs.mfsr)
+        val merged = AdpfHint.boosted(appContext) { MfsrMerge.mergeDecoded(appContext, ordered, inputs.mfsr) }
             ?: throw IllegalStateException("MFSR merge failed")
         try {
             val mergeMs = SystemClock.elapsedRealtime() - tMerge
@@ -164,36 +157,14 @@ internal class BurstMergeRunner(private val appContext: Context) {
             val provenance = sharpMergeProvenance(merged, inputs.mfsr.copy(engine = MfsrEngine.MFSR), frames.size,
                 ordered.take(merged.keptCount).map { it.source.metadata }, "auto (sharpness and blur rejection)")
             val outputs = ArrayList<String>()
-            // MFSR output is a linear RGB plane, not a CFA, so the viewfinder crop cannot go
-            // through ZoomCrop: the frame is cut where it is written and where it is
-            // developed instead. Both consumers read a WINDOW of the merge buffer -- GL
-            // unpacks the window for the develop, the striped writer copies only the window's
-            // rows -- so cropping costs no copy of a buffer that is 3 floats per super-resolved
-            // pixel.
-            val window = mfsrWindow(merged.width, merged.height, merged.refMetadata.zoomMultiplier)
-            val outWidth = window?.width ?: merged.width
-            val outHeight = window?.height ?: merged.height
-            val windowColumn = window?.left ?: 0
-            val windowRow = window?.top ?: 0
-            if (window != null) {
-                Log.i(
-                    "BurstMergeRunner",
-                    "MFSR crop ${merged.refMetadata.zoomMultiplier}x: " +
-                        "${merged.width}x${merged.height} -> ${outWidth}x${outHeight} " +
-                        "at $windowColumn,$windowRow",
-                )
-            }
             if (format.includesDng) {
                 merged.rgb.rewind()
                 // C11: striped from the native merge buffer (no 150 MB heap copy)
                 outputs += LinearRgbDngSaver(appContext).saveLinearRgbStriped(
-                    outWidth, outHeight, merged.rgb.asFloatBuffer(),
+                    merged.width, merged.height, merged.rgb.asFloatBuffer(),
                     merged.refMetadata,
                     provenance,
-                    captureId = captureId, gps = null,
-                    sourceRowStride = merged.width,
-                    sourceColumnOffset = windowColumn,
-                    sourceRowOffset = windowRow,
+                    captureId = captureId, gps = null
                 )
             }
             if (format.includesJpeg) {
@@ -206,13 +177,8 @@ internal class BurstMergeRunner(private val appContext: Context) {
                         captureTimeMillis = captureId,
                         typeSuffix = CaptureFileNames.TYPE_MFSR)
                 } else {
-                    val developed = developer.developMfsrJpeg(
-                        merged.rgb, outWidth, outHeight,
-                        merged.refMetadata, RawDevelopmentSettings(denoise = inputs.denoise), inputs.jpeg,
-                        sourceRowStride = merged.width,
-                        sourceColumnOffset = windowColumn,
-                        sourceRowOffset = windowRow,
-                    )
+                    val developed = developer.developMfsrJpeg(merged.rgb, merged.width, merged.height,
+                        merged.refMetadata, RawDevelopmentSettings(denoise = inputs.denoise), inputs.jpeg)
                     try {
                         outputs += JpegSaver(appContext).save(developed, merged.refMetadata, null,
                             captureTimeMillis = captureId,
@@ -232,7 +198,7 @@ internal class BurstMergeRunner(private val appContext: Context) {
     }
 
     /**
-     * LK-Reloaded (tools/lkr-pipeline): native over the decoded uint16
+     * LK-Reloaded (tools/lkr-lite): native over the decoded uint16
      * buffers, full frame at scale 1; same linear-RGB DNG / developed tail
      * as MFSR (shared [MfsrMerge.MfsrResult]).
      */
@@ -245,44 +211,22 @@ internal class BurstMergeRunner(private val appContext: Context) {
         listener: Listener
     ): Completed {
         val captureId = take.lastModified()
-        val merged = LkrMerge.mergeDecoded(appContext, frames,
-            LkrMerge.Settings(dctPrior = inputs.mfsr.lkrDctPrior, tuning = LkrTuning.overrides(appContext),
-                zoom = inputs.mfsr.lkrZoom, fullRes = inputs.mfsr.lkrFullRes))
-            ?: throw IllegalStateException("LK-Reloaded merge failed")
+        val merged = AdpfHint.boosted(appContext) { LkrMerge.mergeDecoded(appContext, frames,
+            LkrMerge.Settings(kernelNetDenoise = inputs.mfsr.lkrKernelNetDenoise, network = inputs.mfsr.lkrNetwork, dctPrior = inputs.mfsr.lkrDctPrior, tuning = LkrTuning.overrides(appContext),
+                zoom = inputs.mfsr.lkrZoom, fullRes = inputs.mfsr.lkrFullRes)) }
+            ?: throw IllegalStateException("LK-R merge failed")
         try {
             reportSaving(listener, t0, take, merged.width, merged.height, format, Method.LKR)
             val provenance = sharpMergeProvenance(merged, inputs.mfsr.copy(engine = MfsrEngine.LKR), frames.size,
                 frames.map { it.metadata }, "first frame of sampled burst")
             val outputs = ArrayList<String>()
-            // MFSR output is a linear RGB plane, not a CFA, so the viewfinder crop cannot go
-            // through ZoomCrop: the frame is cut where it is written and where it is
-            // developed instead. Both consumers read a WINDOW of the merge buffer -- GL
-            // unpacks the window for the develop, the striped writer copies only the window's
-            // rows -- so cropping costs no copy of a buffer that is 3 floats per super-resolved
-            // pixel.
-            val window = mfsrWindow(merged.width, merged.height, merged.refMetadata.zoomMultiplier)
-            val outWidth = window?.width ?: merged.width
-            val outHeight = window?.height ?: merged.height
-            val windowColumn = window?.left ?: 0
-            val windowRow = window?.top ?: 0
-            if (window != null) {
-                Log.i(
-                    "BurstMergeRunner",
-                    "MFSR crop ${merged.refMetadata.zoomMultiplier}x: " +
-                        "${merged.width}x${merged.height} -> ${outWidth}x${outHeight} " +
-                        "at $windowColumn,$windowRow",
-                )
-            }
             if (format.includesDng) {
                 merged.rgb.rewind()
                 outputs += LinearRgbDngSaver(appContext).saveLinearRgbStriped(
-                    outWidth, outHeight, merged.rgb.asFloatBuffer(),
+                    merged.width, merged.height, merged.rgb.asFloatBuffer(),
                     merged.refMetadata,
                     provenance,
-                    captureId = captureId, gps = null,
-                    sourceRowStride = merged.width,
-                    sourceColumnOffset = windowColumn,
-                    sourceRowOffset = windowRow,
+                    captureId = captureId, gps = null
                 )
             }
             if (format.includesJpeg) {
@@ -294,13 +238,8 @@ internal class BurstMergeRunner(private val appContext: Context) {
                     outputs += JxlSaver(appContext).save(developed, merged.refMetadata, null,
                         captureTimeMillis = captureId, typeSuffix = CaptureFileNames.TYPE_LKR)
                 } else {
-                    val developed = developer.developMfsrJpeg(
-                        merged.rgb, outWidth, outHeight,
-                        merged.refMetadata, RawDevelopmentSettings(denoise = inputs.denoise), inputs.jpeg,
-                        sourceRowStride = merged.width,
-                        sourceColumnOffset = windowColumn,
-                        sourceRowOffset = windowRow,
-                    )
+                    val developed = developer.developMfsrJpeg(merged.rgb, merged.width, merged.height,
+                        merged.refMetadata, RawDevelopmentSettings(denoise = inputs.denoise), inputs.jpeg)
                     try {
                         outputs += JpegSaver(appContext).save(developed, merged.refMetadata, null,
                             captureTimeMillis = captureId, typeSuffix = CaptureFileNames.TYPE_LKR, gps = null,
@@ -348,8 +287,8 @@ internal class BurstMergeRunner(private val appContext: Context) {
         }
         val referenceIndex = (mergedInputs.size / 2).coerceIn(mergedInputs.indices)
         val tMerge = SystemClock.elapsedRealtime()
-        val mergedRaw = processor.merge(mergedInputs, referenceIndex, inputs.hdrPlus,
-            noiseSource = WaveletDenoiser.NoiseSource.of(frames[referenceIndex].metadata))
+        val mergedRaw = AdpfHint.boosted(appContext) { processor.merge(mergedInputs, referenceIndex, inputs.hdrPlus,
+            noiseSource = WaveletDenoiser.NoiseSource.of(frames[referenceIndex].metadata)) }
             ?: throw IllegalStateException("HDR+ merge failed")
         val mergeMs = SystemClock.elapsedRealtime() - tMerge
         val decision = processor.lastDecision

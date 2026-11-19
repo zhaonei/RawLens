@@ -463,13 +463,6 @@ class Gles31AmazeProcessor(
      * [process]. Any failure throws: the coordinator falls back to the
      * DNG-only save.
      */
-    /**
-     * [sourceRowStride], [sourceColumnOffset] and [sourceRowOffset] describe where the frame
-     * to develop sits inside [rgb]: the buffer may hold the full merged frame while only a
-     * window of it is wanted (the post-capture zoom crop). GLES 3.0 unpacks the window
-     * directly through GL_UNPACK_ROW_LENGTH / SKIP_PIXELS / SKIP_ROWS, so the crop costs no
-     * copy of a buffer that can be hundreds of megabytes. Defaults read the whole buffer.
-     */
     fun <T> processMfsrRgb(
         rgb: java.nio.ByteBuffer,
         width: Int,
@@ -477,9 +470,6 @@ class Gles31AmazeProcessor(
         cameraToAcescgColumnMajor: FloatArray,
         cameraWhiteNormalized: FloatArray,
         cameraLinear: Boolean = false,
-        sourceRowStride: Int = width,
-        sourceColumnOffset: Int = 0,
-        sourceRowOffset: Int = 0,
         consume: (AmazeGpuOutput) -> T
     ): T {
         require(width >= 2 && height >= 2) { "Sharp RGB needs positive dimensions" }
@@ -495,14 +485,8 @@ class Gles31AmazeProcessor(
         require(rgb.isDirect && rgb.order() == java.nio.ByteOrder.nativeOrder()) {
             "Sharp RGB must be a native-order direct buffer"
         }
-        require(sourceRowStride >= sourceColumnOffset + width) { "Sharp RGB source window exceeds its row stride" }
-        require(sourceRowOffset >= 0 && sourceRowStride > 0 && sourceColumnOffset >= 0) {
-            "Sharp RGB source window must be non-negative"
-        }
-        require(rgb.capacity() >=
-            (sourceRowOffset + height - 1) * sourceRowStride * 3 * 4 + (sourceColumnOffset + width) * 3 * 4) {
-            "Sharp RGB buffer too small for a ${width}x$height window at " +
-                "row $sourceRowOffset, column $sourceColumnOffset of a $sourceRowStride-wide frame"
+        require(rgb.capacity() >= width * height * 3 * 4) {
+            "Sharp RGB buffer too small for ${width}x$height triplets"
         }
         val session = processingSession()
         return session.egl.run {
@@ -514,16 +498,10 @@ class Gles31AmazeProcessor(
                 GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
                 GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
                 rgb.rewind()
-                GLES31.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, sourceRowStride)
-                GLES31.glPixelStorei(GLES30.GL_UNPACK_SKIP_PIXELS, sourceColumnOffset)
-                GLES31.glPixelStorei(GLES30.GL_UNPACK_SKIP_ROWS, sourceRowOffset)
                 GLES31.glTexImage2D(
                     GLES31.GL_TEXTURE_2D, 0, GLES30.GL_RGB32F, width, height, 0,
                     GLES31.GL_RGB, GLES31.GL_FLOAT, rgb
                 )
-                GLES31.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, 0)
-                GLES31.glPixelStorei(GLES30.GL_UNPACK_SKIP_PIXELS, 0)
-                GLES31.glPixelStorei(GLES30.GL_UNPACK_SKIP_ROWS, 0)
                 checkGl("Sharp RGB upload")
                 val program = session.programs.get("rcd/rcd_final.glsl")
                 val output = session.textures.acquire(width, height, GLES30.GL_RGBA16F)
@@ -1249,6 +1227,7 @@ class Gles31AmazeProcessor(
                 val settings = requireNotNull(fusedSettings)
                 finalProgram.ivec2("u_output_size", input.width, input.height)
                 finalProgram.integer("u_display_p3", if (settings.displayP3) 1 else 0)
+                finalProgram.integer("u_basic", settings.toneMapper.shaderMode)
                 finalProgram.float("u_agx_purity_boost", settings.agxPurityBoost)
                 finalProgram.integer("u_agx_punchy", if (settings.agxLook == AgxLook.PUNCHY) 1 else 0)
                 finalProgram.float("u_agx_contrast", settings.agxContrast)
@@ -1320,6 +1299,7 @@ class Gles31AmazeProcessor(
         }
 
         private inner class BoundProgram(private val id: Int) {
+            private var toneMode: Int? = null
             private val pendingSamplers = ArrayList<Pair<String, GlTexture>>(4)
 
             init {
@@ -1352,7 +1332,10 @@ class Gles31AmazeProcessor(
             fun ivec4(name: String, values: IntArray) =
                 GLES31.glUniform4i(location(name), values[0], values[1], values[2], values[3])
             fun float(name: String, value: Float) = GLES31.glUniform1f(location(name), value)
-            fun integer(name: String, value: Int) = GLES31.glUniform1i(location(name), value)
+            fun integer(name: String, value: Int) {
+                GLES31.glUniform1i(location(name), value)
+                if (name == "u_basic") toneMode = value
+            }
             fun vec4(name: String, values: FloatArray) =
                 GLES31.glUniform4f(location(name), values[0], values[1], values[2], values[3])
             fun vec3(name: String, values: FloatArray) =
@@ -1370,6 +1353,7 @@ class Gles31AmazeProcessor(
                     GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, texture.id)
                     GLES31.glUniform1i(location(name), unit)
                 }
+                toneMode?.let { programs.bindAces2(id, it) }
                 GLES31.glDispatchCompute(
                     ceilDiv(width, AmazePipelineContract.LOCAL_SIZE_X),
                     ceilDiv(height, AmazePipelineContract.LOCAL_SIZE_Y),
@@ -1389,13 +1373,15 @@ class Gles31AmazeProcessor(
     }
 
     internal class ProgramCache(private val context: Context, private val slicedDispatch: Boolean = false) : Closeable {
+        private val aces2 = Aces2Gl()
+        fun bindAces2(id: Int, mode: Int) = aces2.bind(id, mode)
         private val programs = LinkedHashMap<String, Int>()
         private val common by lazy { read("shaders/utils/import_amaze.glsl") }
         private val cleanupCommon by lazy { read("shaders/amaze/cleanup.glsl") }
         private val agxOutputCommon by lazy {
             val source = read("shaders/display/agx_srgb8.glsl")
             source.substring(
-                source.indexOf("uniform highp int u_display_p3;").also { check(it >= 0) },
+                source.indexOf("uniform highp int u_basic;").also { check(it >= 0) },
                 source.indexOf("void main()").also { check(it >= 0) }
             )
         }
@@ -1411,7 +1397,7 @@ class Gles31AmazeProcessor(
         }.also(GLES31::glUseProgram)
 
         private fun read(path: String): String =
-            context.assets.open(path).bufferedReader().use { it.readText() }
+            context.assets.open(path).bufferedReader().use { it.readText().replace("// SIGMOID_FUNCTIONS", CameraToneBalance.glsl + "\n" + SigmoidDisplayTransform.glsl + "\n" + Aces2DisplayTransform.glsl) }
 
         private fun compile(source: String, name: String): Int {
             val shader = GLES31.glCreateShader(GLES31.GL_COMPUTE_SHADER)
@@ -1440,6 +1426,7 @@ class Gles31AmazeProcessor(
         }
 
         override fun close() {
+            aces2.close()
             programs.values.forEach {
                 GLES31.glDeleteProgram(it)
                 MemoryLeakDiagnostics.glProgramReleased()

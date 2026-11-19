@@ -12,12 +12,15 @@
 #include <android/hardware_buffer.h>
 #include <android/hardware_buffer_jni.h>
 #include <android/log.h>
+#include <sys/system_properties.h>
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_android.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -93,6 +96,16 @@ namespace {
 // this, concurrent submits race the shared command buffer, descriptor set,
 // import caches and fence. No entry point nests, so a plain mutex suffices.
 static std::mutex vkMutex;
+// Test-only A/B hook (VfVideoGrade.setFusedGreenOverrideNative): replaces the
+// embedded vf_mhc_green prepass for the next fused init, with its own
+// dispatch width (pixels per invocation). Empty = embedded shader, 2 px.
+static std::vector<uint32_t> gFusedGreenOverride;
+static uint32_t gFusedGreenPixels = 2;
+// GPU timing for the fused record submit: 3 timestamps per slot (start,
+// after green prepass, after main kernel). On by default (field logs, see
+// docs/refactor/shader-optimization/catalog.md "Field testing"); results
+// are read only after the slot's previous submit completed, never stalling.
+static bool gFusedTiming = true;
 // Viewfinder dispatches with an unlocked fence wait in flight (0/1:
 // the GL worker is single-threaded). Teardown/reset join on this
 // before destroying imports/outputs the dispatch reads/writes.
@@ -176,9 +189,10 @@ struct StabWarpParams {
     int32_t srcStrides[2];  // yStrideW, uvStrideW (u16 units, tight input)
     int32_t outStrides[2];  // yStrideW, uvStrideW (u16 units, staging)
     int32_t uvBase[2];      // srcUvBaseOffB, outUvBaseOffB
-    float mat[9];
+    float mat0[9];          // out->src homography at output row 0
+    float mat1[9];          // ... at the last output row (rolling shutter)
 };
-static_assert(sizeof(StabWarpParams) == 68, "stab warp push layout drift");
+static_assert(sizeof(StabWarpParams) == 104, "stab warp push layout drift");
 
 // Fold WB gains + exposure into CCM rows (record-path order: wb=rgb*gains,
 // ccm=CCM*wb, ex=ccm*exp2(ev)): out[r][i] = ccm[r][i]*gains[i]*evMult.
@@ -445,6 +459,10 @@ struct Context {
     VkDescriptorSetLayout rcdSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout rcdPipelineLayout = VK_NULL_HANDLE;
     VkPipeline rcdPipelines[4] = {};
+    // GPU timestamps per RCD mode (start/end), read via VfRcd.rcdTimingNative.
+    VkQueryPool rcdQueries = VK_NULL_HANDLE;
+    bool rcdQueryWritten[4] = {false, false, false, false};
+    double rcdTsPeriodNs = 0.0;
     VkDescriptorPool rcdPool = VK_NULL_HANDLE;
     // Each slot owns a descriptor set per mode: modes are submitted without CPU waits.
     VkDescriptorSet rcdSets[12] = {};
@@ -507,6 +525,17 @@ struct Context {
     VkDescriptorSetLayout fusedSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout fusedPipelineLayout = VK_NULL_HANDLE;
     VkPipeline fusedPipeline = VK_NULL_HANDLE;
+    // FUSED_PATH specializations: [0] = 1:1 interior, [1] = 2:1 / 3:2,
+    // [2] = 1:1 border cells (may be null; then the all-path pipeline runs).
+    VkPipeline fusedPathPipelines[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkQueryPool fusedQueries = VK_NULL_HANDLE;   // 3 per slot, test timing only
+    bool fusedQueryWritten[3] = {false, false, false};
+    double fusedTsPeriodNs = 0.0;
+    // Rolling field-log window (logged every kFusedLogFrames submits).
+    uint32_t fusedLogN = 0;
+    double fusedLogGreen = 0, fusedLogMain = 0, fusedLogGreenMax = 0, fusedLogMainMax = 0;
+    int fusedLogPath = -1, fusedLogDims[4] = {0, 0, 0, 0};
+    int fusedPathOverride = -1;   // debug.rawlens.fusedpath (0 = all-path), read at init
     VkPipeline fusedGreenPipeline = VK_NULL_HANDLE;
     VkBuffer fusedGreenBufs[3] = {VK_NULL_HANDLE,VK_NULL_HANDLE,VK_NULL_HANDLE};
     VkDeviceMemory fusedGreenMems[3] = {VK_NULL_HANDLE,VK_NULL_HANDLE,VK_NULL_HANDLE};

@@ -1,5 +1,7 @@
 # Bounded Encoded Video buffer diagnostics
 
+> Repository context: [current source state](../CURRENT_STATE.md). This audit, plan or evidence records its original scope; historical defaults, results and pending work do not establish current app behavior.
+
 Each take samples the first two submitted output frames. RAW sampling is
 also capped at two attempts so failed initial GPU submissions cannot
 produce repeated pixel dumps. Remaining frames do not perform diagnostic
@@ -41,9 +43,9 @@ each copied frame. A separate headless GPU-writer recording also passed.
 Sampling stages in this run took roughly 1–3 ms; these are startup samples,
 not a sustained-FPS A/B benchmark.
 
-Evidence: [device tests](results/directlog-diagnostics-2026-10-31/device-tests.txt),
-[exported diagnostic lines](results/directlog-diagnostics-2026-10-31/exported-diagnostics.txt),
-[GPU-writer recording](results/directlog-diagnostics-2026-10-31/gpu-writer-record.txt).
+Evidence: [device tests](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/directlog-diagnostics-2026-10-31/device-tests.txt),
+[exported diagnostic lines](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/directlog-diagnostics-2026-10-31/exported-diagnostics.txt),
+[GPU-writer recording](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/directlog-diagnostics-2026-10-31/gpu-writer-record.txt).
 
 Handoff APK: `/tmp/RawLens-2.0.52-Vivo-diagnostics-arm64.apk`, package
 `com.matthew.rawlens.vivocheck`, separately installable alongside the

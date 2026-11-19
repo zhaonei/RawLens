@@ -182,6 +182,18 @@ object HdrPlusDngWriter {
         require(cfa.values.all(Float::isFinite)) { "HDR+ DNG cannot contain NaN or infinity" }
 
         val fields = buildFields(cfa.pattern, metadata, provenance, compression)
+        // Only uncorrected samples need a gain-map opcode. HDR+ preprocessing
+        // normally bakes it into the CFA; repeating it brightens corners twice.
+        metadata.lensShadingMap?.takeUnless { cfa.lensShadingApplied || metadata.lensShadingAlreadyApplied }?.let {
+            val geometry = metadata.bufferGeometry as? RawBufferGeometry.Supported
+            val originY = (geometry?.sensorOriginY ?: 0) + (geometry?.processingCrop?.top ?: 0)
+            fields.undefined(51009, TinyDngMetadata.gainMap(it, cfa.pattern,
+                RawCrop(0, 0, cfa.width, cfa.height), originY))
+        }
+        (metadata.bufferGeometry as? RawBufferGeometry.Supported)?.processingCrop
+            ?.takeIf { it.width == cfa.width && it.height == cfa.height }
+            ?.let { DngLensCorrection.opcodeList(metadata, it) }
+            ?.let { fields.undefined(51022, it) }
         val exif = DngExifDirectory.fields(metadata, captureTimeMillis)
             ?: if (provenance != null) TiffFields() else null
         if (provenance != null && provenance.selectedFrames <= 65535 &&

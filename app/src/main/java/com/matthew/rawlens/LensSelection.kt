@@ -59,7 +59,11 @@ import android.os.SystemClock
 
 // First-run and settings lens discovery and selection screens. Moved verbatim from MainActivity.
 
-internal fun MainActivity.showLensDiscovery(firstRun: Boolean) {
+/**
+ * @param retestAf re-runs the AF scan probe on every route, discarding saved
+ *   AF verdicts (the "Re-test autofocus" link).
+ */
+internal fun MainActivity.showLensDiscovery(firstRun: Boolean, retestAf: Boolean = false) {
     // First launch covers the whole camera UI (including the top bar)
     // with an opaque black overlay — a dialog window can't reliably do
     // that — while later invocations keep the floating progress dialog.
@@ -106,26 +110,42 @@ internal fun MainActivity.showLensDiscovery(firstRun: Boolean) {
             .setCancelable(true)
             .show()
     }
-    val verdicts = runCatching { lensVerdictStore.snapshot() }.getOrDefault(LensVerdicts.EMPTY)
-    lensDiscovery.discover(verdicts) { lenses ->
+    val stored = runCatching { lensVerdictStore.snapshot() }.getOrDefault(LensVerdicts.EMPTY)
+    val verdicts = if (retestAf) stored.copy(af = emptyMap()) else stored
+    lensDiscovery.discover(verdicts) { discovered ->
+        // Active AF scan probe for routes never probed: characteristics lie
+        // both ways (AF state runs without the lens moving, or the lens moves
+        // with no AF state machine), so open each one and look.
+        val toProbe = discovered.filter {
+            it.kind != LensRouteKind.UNAVAILABLE && it.af == AfVerdict.UNKNOWN
+        }
+        val canProbe = toProbe.isNotEmpty() &&
+            checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        val lenses = if (!canProbe) discovered else {
+            val stopped = java.util.concurrent.CountDownLatch(1)
+            var restart = false
+            runOnUiThread {
+                controllerIfReady?.let { restart = it.isRunning(); it.stop() }
+                progressDialog?.setMessage("Testing autofocus on ${toProbe.size} route(s)…\nPoint the camera at something with detail.")
+                stopped.countDown()
+            }
+            stopped.await()
+            if (retestAf) runCatching { lensVerdictStore.clearAf(toProbe.map { it.id }) }
+            val probe = AfScanProbe(this)
+            val results = toProbe.associate { lens ->
+                if (isFinishing || isDestroyed) return@associate lens.id to AfVerdict.UNKNOWN
+                val verdict = probe.probe(lens)
+                runCatching { lensVerdictStore.markAf(lens.id, verdict) }
+                lens.id to verdict
+            }
+            if (restart) runOnUiThread { if (!isFinishing && !isDestroyed) controller.start() }
+            discovered.map { lens -> results[lens.id]?.let { applyAfVerdict(lens, it) } ?: lens }
+        }
         runOnUiThread {
             if (isFinishing || isDestroyed) return@runOnUiThread
             progressDialog?.dismiss()
             progressOverlay?.let { (it.parent as? ViewGroup)?.removeView(it) }
             progressOverlay = null
-            if (lenses.isEmpty()) {
-                // No selection page follows; stay fullscreen (the dialog
-                // re-hides the bars via onWindowFocusChanged on dismiss).
-                // The deferred first-run consent fires as this alert
-                // leaves, so it never stacks over discovery either.
-                RawLensDialogBuilder(this)
-                    .setTitle("No RAW lenses found")
-                    .setMessage("The camera service did not expose a RAW-capable camera ID.")
-                    .setPositiveButton("OK", null)
-                    .setOnDismissListener { updateFlow.showPendingConsent() }
-                    .show()
-                return@runOnUiThread
-            }
             val missingSaved = selectedLensIds()
                 .filterNot { savedId -> lenses.any { it.id == savedId } }
                 .map { unavailableLens(it) }
@@ -149,6 +169,7 @@ internal fun MainActivity.showLensSelection(lenses: List<DiscoveredLens>, firstR
     val opticCount = groupByOptic(lenses).count { it.key != "unavailable" }
     val routeCount = groups.sumOf { it.lenses.size }
     // Preserve saved choices; new routes remain unchecked.
+    val pickerLenses = lenses.toMutableList()
     val checked = lenses.associate { lens ->
         lens.id to (lens.id in selected)
     }.toMutableMap()
@@ -185,7 +206,7 @@ internal fun MainActivity.showLensSelection(lenses: List<DiscoveredLens>, firstR
             note.setTextColor(getColor(if (isChecked && clashing.isNotEmpty()) R.color.accent else R.color.text_muted))
             note.visibility = if (others.isEmpty()) View.GONE else View.VISIBLE
         }
-        val picked = available.filter { checked[it.id] == true }
+        val picked = pickerLenses.filter { checked[it.id] == true }
         val pickedLenses = picked.map(::opticFingerprint).distinct().size
         selectionSummary.text = when {
             picked.isEmpty() -> "Nothing checked yet."
@@ -255,6 +276,19 @@ internal fun MainActivity.showLensSelection(lenses: List<DiscoveredLens>, firstR
     quickRow.addView(clear, clearParams)
     container.addView(quickRow)
     container.addView(selectionSummary)
+    container.addView(LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        addView(Button(context).apply {
+            text = "Export profiles ZIP"
+            styleQuickButton(this)
+            setOnClickListener { lensProfilesTransfer.export() }
+        }, LinearLayout.LayoutParams(0, wrapContent(), 1f))
+        addView(Button(context).apply {
+            text = "Import profiles ZIP"
+            styleQuickButton(this)
+            setOnClickListener { lensProfilesTransfer.import() }
+        }, LinearLayout.LayoutParams(0, wrapContent(), 1f))
+    })
     // Secondary action as a plain text link: a third full-width chip
     // made the preset block dominate the screen.
     val copyReport = TextView(this).apply {
@@ -268,9 +302,26 @@ internal fun MainActivity.showLensSelection(lenses: List<DiscoveredLens>, firstR
     container.addView(copyReport, LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT, wrapContent()
     ))
+    // Set by whichever page variant is shown below, so the retest link can close it.
+    var closeSelection: () -> Unit = {}
+    val retestAf = TextView(this).apply {
+        text = "Re-test autofocus"
+        setTextColor(getColor(R.color.accent))
+        textSize = 12f
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER
+        setPadding(0, 0, 0, dp(10))
+        setOnClickListener {
+            closeSelection()
+            showLensDiscovery(firstRun, retestAf = true)
+        }
+    }
+    container.addView(retestAf, LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT, wrapContent()
+    ))
     copyReport.setOnClickListener {
         val report = lensReport(
-            lenses,
+            pickerLenses,
             chosenSize = { rawSizePreferenceStore.get(it) },
             chosenFormat = { rawFormatPreferenceStore.get(it) }
         )
@@ -482,6 +533,61 @@ internal fun MainActivity.showLensSelection(lenses: List<DiscoveredLens>, firstR
             }
         }
     }
+    val manualId = EditText(this).apply {
+        hint = "Lens ID, e.g. 0, 0-3 or 0/3"
+        contentDescription = "Lens ID"
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        setSingleLine(true)
+        setTextColor(getColor(R.color.text_primary))
+        setHintTextColor(getColor(R.color.text_muted))
+    }
+    val manualEntries = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+    val addManual = Button(this).apply {
+        text = "Add lens ID"
+        RawLensUi.styleButton(this)
+        setOnClickListener {
+            val id = manualId.text.toString().trim()
+            if (id.isEmpty()) {
+                manualId.error = "Enter a lens ID"
+                return@setOnClickListener
+            }
+            // Preserve the exact vendor ID: dashes and slashes have different meanings.
+            if (id !in checked) {
+                val lens = DiscoveredLens(
+                    id = id,
+                    label = "Camera $id · manually added",
+                    title = "Camera $id",
+                    details = "Manually added · RAW support checked when opened",
+                    route = "Manual camera route"
+                )
+                pickerLenses += lens
+                checked[id] = true
+                manualEntries.addView(lensCard(lens))
+            } else {
+                checked[id] = true
+                checkBoxes.firstOrNull { it.tag == id }?.isChecked = true
+            }
+            manualId.text.clear()
+            manualId.error = null
+            refreshQuickState()
+            refreshDuplicates()
+        }
+    }
+    listBody.addView(TextView(this).apply {
+        text = "Add a lens manually"
+        setTextColor(getColor(R.color.text_primary))
+        textSize = 14f
+        typeface = Typeface.DEFAULT_BOLD
+        setPadding(0, dp(16), 0, dp(4))
+    })
+    listBody.addView(TextView(this).apply {
+        text = "Enter any camera ID omitted by discovery. Tap Save to keep it; availability and RAW support depend on the camera service."
+        setTextColor(getColor(R.color.text_secondary))
+        textSize = 12f
+    })
+    listBody.addView(manualId)
+    listBody.addView(addManual)
+    listBody.addView(manualEntries)
     listBody.addView(virtualLensSection(lenses, ::zoomOf) { id -> checked[id] == true })
     container.addView(listScroll)
     container.addView(TextView(this).apply {
@@ -568,6 +674,7 @@ internal fun MainActivity.showLensSelection(lenses: List<DiscoveredLens>, firstR
             )
         )
         root.requestFocus()
+        closeSelection = { (root.parent as? ViewGroup)?.removeView(root) }
         fun dismissPage() {
             (root.parent as? ViewGroup)?.removeView(root)
             // Used to showStatusBar() here: first install kept the
@@ -601,6 +708,7 @@ internal fun MainActivity.showLensSelection(lenses: List<DiscoveredLens>, firstR
     // Later opens: a full-screen page like the rest of Settings (back arrow and title on
     // top, Cancel / Save pinned to the bottom) instead of a floating panel.
     val dialog = android.app.Dialog(this, R.style.Theme_RawLens)
+    closeSelection = { dialog.dismiss() }
     val backButton = TextView(this).apply {
         text = "←"
         textSize = 22f

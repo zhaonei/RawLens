@@ -7,6 +7,7 @@ import android.os.Build
 
 /** Output contract captured with each shutter press; it never changes while that RAW is queued. */
 data class JpegOutputSettings(
+    val toneMapper: PhotoToneMapper = PhotoToneMapper.SIGMOID,
     val ultraHdr: Boolean = false,
     val activeDLighting: ActiveDLighting = ActiveDLighting.OFF,
     val displayP3: Boolean = false,
@@ -38,8 +39,10 @@ data class JpegOutputSettings(
      */
     val highlightSoftHeadroom: Float = 0.85f,
     /**
-     * Scene-linear highlight shoulder strength: 0 = pinned Filament AgX only,
-     * 1 = full exponential soft shoulder (knee 0.9, scale 0.8). Default 1.
+     * Highlight shoulder strength: 0 bypasses compression, 1 is full strength.
+     * AgX uses a per-channel exponential shoulder (knee 0.9, scale 0.8).
+     * Basic uses one RGB scale from a rational shoulder (knee 0.6, white limit 1),
+     * preserving channel ratios before its display curve. Default 1.
      */
     val highlightShoulder: Float = 1f,
     /**
@@ -86,17 +89,29 @@ data class JpegOutputSettings(
      * darktable inpaint opposed on normalized Bayer data before demosaic.
      * Repairs clipped photosites; disable to compare with the measured CFA.
      */
-    val hlReconstruction: Boolean = true
+    val hlReconstruction: Boolean = true,
+    /** B&W photosite mode (after rwmono); OFF keeps the colour develop. */
+    val mono: MonoSettings = MonoSettings()
 ) {
     /**
      * Expand the existing AgX shadow range to restore middle grey after protection.
-     * Solving (S' - b)/(S' + H) = S/(S + H) gives S' = S + b*(S+H)/H.
+     * Solve the normalized AgX grey anchor after the shared camera shadow lift.
      * This also lifts shadows more than highlights; no extra shader/pass or LUT.
      * Kept separate from the stored knob so repeated resolution is idempotent.
      */
-    val effectiveAgxShadowEv: Float get() = if (activeDLighting == ActiveDLighting.OFF) agxShadowEv else
-        (agxShadowEv + activeDLighting.protectionEv.toFloat() *
-            (agxShadowEv + agxHighlightEv) / agxHighlightEv.coerceAtLeast(3f)).coerceAtMost(18f)
+    val effectiveAgxShadowEv: Float get() {
+        if (activeDLighting == ActiveDLighting.OFF) return agxShadowEv
+        // Solve the original grey restoration after the camera toe. Its nonlinear
+        // lift already compensates part of capture protection; do not add it twice.
+        val grey = .18f * CameraToneBalance.gain(.18f)
+        val protectedGrey = (.18 * kotlin.math.exp(-activeDLighting.protectionEv * kotlin.math.ln(2.0))).toFloat()
+        val liftedProtected = protectedGrey * CameraToneBalance.gain(protectedGrey)
+        val logGrey = kotlin.math.ln((grey / .18f).toDouble()) / kotlin.math.ln(2.0)
+        val bias = kotlin.math.ln((grey / liftedProtected).toDouble()) / kotlin.math.ln(2.0)
+        val h = agxHighlightEv.coerceAtLeast(3f)
+        return (agxShadowEv + bias.toFloat() * (agxShadowEv + h) /
+            (h - logGrey.toFloat()).coerceAtLeast(.1f)).coerceAtMost(18f)
+    }
 
     /** Ultra HDR is an Android 14 (API 34) platform JPEG feature. */
     fun resolvedForPlatform(): JpegOutputSettings {

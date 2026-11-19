@@ -1,5 +1,7 @@
 # Photo autofocus device acceptance — 2026-10-31
 
+> Repository context: [current source state](../../../CURRENT_STATE.md). This audit, plan or evidence records its original scope; historical defaults, results and pending work do not establish current app behavior.
+
 Tested current workspace build 2.0.40, githubDeviceTest, on Redmi 25080RABDG (`lapis`), MediaTek MT6878, Android 16 / OS3.0.303.0.WPPEUXM. Main Camera2 route `0`; RAW 4080×3060. This is evidence for this device/route/build, not Qualcomm or all MediaTek firmware.
 
 ## Results
@@ -22,12 +24,12 @@ Both instrumentation invocations passed: `touchFocusReachesVerdictHoldsAndReleas
 
 ## Evidence and limits
 
-- [Tap/hold instrumentation](tap-hold-test.txt)
-- [Preview/exposure instrumentation](preview-exposure-test.txt)
-- [Frame/state/distance telemetry](telemetry.txt)
-- [Camera log](logcat.txt)
-- [Indefinite lock screenshot](hold-after-timeout.png)
-- [Double-tap release screenshot](double-tap-release.png)
+- [Tap/hold instrumentation](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/photo-af-2026-10-31/tap-hold-test.txt)
+- [Preview/exposure instrumentation](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/photo-af-2026-10-31/preview-exposure-test.txt)
+- [Frame/state/distance telemetry](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/photo-af-2026-10-31/telemetry.txt)
+- [Camera log](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/photo-af-2026-10-31/logcat.txt)
+- [Indefinite lock screenshot](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/photo-af-2026-10-31/hold-after-timeout.png)
+- [Double-tap release screenshot](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/photo-af-2026-10-31/double-tap-release.png)
 
 The user moved a near textured bottle against a distant background. Screenshots show the live scene and lock/release UI; metadata shows lens movement and successful HAL lock reports. This was not a controlled optical MTF or distance/latency benchmark. Low-contrast failure behavior, other lenses, other devices and Qualcomm hardware were not certified by these two runs. No production AF tuning was needed from these observations.
 

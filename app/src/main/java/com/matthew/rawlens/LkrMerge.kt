@@ -5,7 +5,6 @@ package com.matthew.rawlens
 
 import android.content.Context
 import android.os.SystemClock
-import android.util.Log
 import com.rawlens.srpipeline.SrpBridge
 import java.nio.ByteOrder
 
@@ -19,7 +18,28 @@ import java.nio.ByteOrder
  * NoiseProfile). Reference = first frame of [frames].
  */
 internal object LkrMerge {
-    private const val LOG_TAG = "RawLensLkr"
+    private const val LOG_TAG = "RawLensCamera"
+    private val prewarmed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Compiles LK-R's Vulkan pipelines into the persistent cache on a low-priority daemon thread,
+     * once per process, so the first merge does not pay pipeline creation (4.8 s cold on Mali for
+     * 3 workers, 27 ms warm). Background priority keeps it off the viewfinder's way.
+     */
+    fun prewarm(context: Context) {
+        if (!prewarmed.compareAndSet(false, true)) return
+        val dir = context.codeCacheDir.absolutePath
+        Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            try {
+                val ms = LkrBridge.nativePrewarm(dir)
+                Log.i(LOG_TAG, "LK-R prewarm: pipelines cached in $ms ms")
+            } catch (failure: Throwable) {
+                prewarmed.set(false)
+                Log.w(LOG_TAG, "LK-R prewarm failed; the first merge builds its pipelines", failure)
+            }
+        }, "lkr-prewarm").apply { isDaemon = true; start() }
+    }
     /** Sensors deeper than this are staged as plain 16-bit: packing 14 bits saves only an eighth. */
     private const val MAX_PACKED_BITS = 12
 
@@ -29,6 +49,9 @@ internal object LkrMerge {
         val overlap: Int = 32,
         /** Regularise with the Vulkan sliding-DCT x-step; false = no prior. */
         val dctPrior: Boolean = false,
+        val kernelNetDenoise: Boolean = true,
+        /** Learned post-fit network on the NPU (Settings -> Merge -> "Network"). */
+        val network: Boolean = false,
         /** Sensor sub-rectangle `[x, y, w, h]`, or null for full frame. */
         val crop: IntArray? = null,
         /** LK-R Lab overrides (Settings -> Merge), NaN = code default; null = all defaults. */
@@ -167,23 +190,33 @@ internal object LkrMerge {
         LkrBridge.nativeSetNoiseModel(
             noiseSource?.let { WaveletDenoiser.storePath(WaveletDenoiser.noiseDir(context), it) },
             noiseSource?.iso?.toFloat() ?: 0f)
+        LkrBridge.nativeSetKernelNetDenoise(settings.kernelNetDenoise)
+        LkrBridge.nativeSetPrior(settings.network)
         val t0 = SystemClock.elapsedRealtime()
         // packedBits >= 0: frames from LkrBridge.nativeStage (tight rows, packed when > 0).
-        val rgb = (if (packedBits >= 0) LkrBridge.nativeMergeStaged(
-            buffers.toTypedArray(), w, h, packedBits, cfa, norm.blackLevels.toFloatArray(),
-            norm.whiteLevel, wb, settings.scale, settings.tile, settings.overlap, settings.crop,
-            settings.dctPrior,
-            stats,
-            settings.tuning,
-            outW, outH
-        ) else LkrBridge.nativeMerge(
-            buffers.toTypedArray(), w, h, rowStrideBytes / 2, cfa, norm.blackLevels.toFloatArray(),
-            norm.whiteLevel, wb, settings.scale, settings.tile, settings.overlap, settings.crop,
-            settings.dctPrior,
-            stats,
-            settings.tuning,
-            outW, outH
-        )) ?: return null
+        val diagnostics = LkrMergeDiagnostics(context)
+        val rgb = try {
+            if (packedBits >= 0) LkrBridge.nativeMergeStaged(
+                buffers.toTypedArray(), w, h, packedBits, cfa, norm.blackLevels.toFloatArray(),
+                norm.whiteLevel, wb, settings.scale, settings.tile, settings.overlap, settings.crop,
+                settings.dctPrior,
+                stats,
+                settings.tuning,
+                outW, outH
+            ) else LkrBridge.nativeMerge(
+                buffers.toTypedArray(), w, h, rowStrideBytes / 2, cfa, norm.blackLevels.toFloatArray(),
+                norm.whiteLevel, wb, settings.scale, settings.tile, settings.overlap, settings.crop,
+                settings.dctPrior,
+                stats,
+                settings.tuning,
+                outW, outH
+            )
+        } finally {
+            diagnostics.close()
+            LkrBridge.nativeLastProfile().lineSequence().filter { it.isNotBlank() }.forEach {
+                Log.i(LOG_TAG, "LK-R native: $it")
+            }
+        } ?: return null
         val mergeMs = SystemClock.elapsedRealtime() - t0
         rgb.order(ByteOrder.nativeOrder())
         val ow = stats[LkrBridge.STAT_OUT_W].toInt()
@@ -207,7 +240,7 @@ internal object LkrMerge {
             buildString {
                 append("- Tile size: ${settings.tile}, overlap: ${settings.overlap}\n")
                 append("- Tiles: ${stats[LkrBridge.STAT_TILES].toInt()}\n")
-                append("- Prior: ${if (settings.dctPrior) "Sliding DCT" else "None"}\n")
+                append("- Prior: ${if (settings.dctPrior) "Shadow luma DCT" else "Colour DCT only"}\n")
                 append("- Crop (x, y, width, height): ${region.joinToString()}\n")
                 append("- Noise sigma: ${stats[LkrBridge.STAT_SIGMA]}\n")
                 append("- Coarse alignment: ${stats[LkrBridge.STAT_MS_COARSE]} ms\n")

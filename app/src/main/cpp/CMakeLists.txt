@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(dngCreator)
 
-add_library(rawLensLapis SHARED lapis_root_camera_jni.cpp)
+add_library(rawLensLapis SHARED lapis_root_camera_jni.cpp hexa/hexa_v2.cpp)
+target_link_libraries(rawLensLapis PRIVATE vulkan)
+target_compile_options(rawLensLapis PRIVATE -O3)
 target_link_options(rawLensLapis PRIVATE "-Wl,-z,max-page-size=16384")
 
 # Independently implemented FP32 public-source RCD validation route. No retired
@@ -389,14 +391,17 @@ add_library(tinydng_v3 STATIC
     ${TINYDNG_DIR}/tiny_dng_ljpeg92_v2.c)
 target_include_directories(tinydng_v3 PUBLIC ${TINYDNG_DIR})
 target_compile_features(tinydng_v3 PUBLIC c_std_11)
-target_compile_definitions(tinydng_v3 PRIVATE TINYDNG_NO_ZIP
+target_include_directories(tinydng_v3 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/dng_import")
+target_link_libraries(tinydng_v3 PUBLIC z)
+target_compile_definitions(tinydng_v3 PRIVATE
     TINYDNG_NO_BASELINE_JPEG TINYDNG_NO_PSD TINYDNG_DISABLE_THREADS)
-add_library(rawLensDng SHARED tinydng_jni.cpp)
+add_library(rawLensDng SHARED tinydng_jni.cpp dng_import/dng_import_jni.cpp)
 target_link_libraries(rawLensDng PRIVATE tinydng_v3)
 target_link_options(rawLensDng PRIVATE "-Wl,-z,max-page-size=16384")
 # JXL-compressed DNG strips reuse the libjxl wired above for the still
 # encoder; without it the JXL DNG path reports "needs a libjxl build".
 if(TARGET jxl)
+    target_compile_definitions(rawLensDng PRIVATE RAWLENS_IMPORT_JXL)
     target_compile_definitions(tinydng_v3 PRIVATE TINYDNG_HAVE_JXL)
     target_link_libraries(tinydng_v3 PUBLIC jxl jxl_threads)
 endif()
@@ -408,10 +413,10 @@ endif()
 # identical DNG files.
 add_subdirectory("../../../../tools/sr-pipeline/src/main/cpp" srpipeline)
 
-# LK-Reloaded burst SR (tools/lkr-pipeline): links srpipeline for the shared
-# Vulkan context / DNG I/O;
-# exposed to Kotlin through LkrBridge.
-add_subdirectory("../../../../tools/lkr-pipeline/src/main/cpp" lkrpipeline)
+# LK-SR burst super-resolution = LK-R Lite (tools/lkr-lite, replaced tools/lkr-pipeline on
+# 2026-11-14): builds liblkrpipeline.so with the same JNI symbols, so LkrBridge is unchanged.
+# Links srpipeline for the shared Vulkan context / DNG I/O.
+add_subdirectory("../../../../tools/lkr-lite/src/main/cpp" lkrlite)
 
 # Cinematic RAW Studio (.CRAW) RAW video / burst container (vendored,
 # Apache-2.0; see third_party/craw/SOURCE.md, refresh with tools/sync_craw.sh).

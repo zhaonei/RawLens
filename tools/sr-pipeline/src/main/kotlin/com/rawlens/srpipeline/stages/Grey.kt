@@ -1,5 +1,7 @@
 package com.rawlens.srpipeline.stages
 
+import org.jtransforms.fft.DoubleFFT_1D
+
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
@@ -34,10 +36,60 @@ object Grey {
         requireRectImage(image, "image")
         return when (method) {
             "FFT" -> fftLowpass(image)
+            "FIR", "FIR7" -> firLowpass(image, 7)
+            "FIR11" -> firLowpass(image, 11)
+            "FIR15" -> firLowpass(image, 15)
             "decimating" -> Decimate.decimateToGrey(image)
             "demosaicing" -> Demosaic.demosaicToGrey(image)
             else -> throw IllegalArgumentException("Unknown grayscale method: $method")
         }
+    }
+
+    /**
+     * Half-band taps approximating the FFT grey's brick-wall mask (keep
+     * |f| < 0.25 cycles/px on each axis): h[n] = 0.5*sinc(n/2) with a Lanczos
+     * window of radius R+1, normalised to unit DC gain. Every even tap except
+     * the centre is exactly 0, so a pass costs R/2+1 multiply-adds per pixel.
+     * Shared with grey_fir.comp (the GPU path must use these exact values).
+     */
+    fun halfBandTaps(radius: Int): FloatArray {
+        val h = DoubleArray(radius + 1) { n ->
+            when {
+                n == 0 -> 0.5
+                n % 2 == 0 -> 0.0
+                else -> {
+                    val x = Math.PI * n / 2.0
+                    val wx = Math.PI * n / (radius + 1.0)
+                    0.5 * (kotlin.math.sin(x) / x) * (kotlin.math.sin(wx) / wx)
+                }
+            }
+        }
+        val sum = h[0] + 2 * (1..radius).sumOf { h[it] }
+        return FloatArray(radius + 1) { (h[it] / sum).toFloat() }
+    }
+
+    /**
+     * Separable FIR replacement for [fftLowpass] (mobile cost: two short
+     * passes instead of two full-frame 2-D FFTs). Circular borders, like the
+     * FFT it replaces. Output is NOT bit-equal to the FFT grey; it only feeds
+     * alignment (validated by flow error against known shifts).
+     */
+    fun firLowpass(image: Array<FloatArray>, radius: Int): Array<FloatArray> {
+        val h = image.size; val w = image[0].size
+        val t = halfBandTaps(radius)
+        fun wrap(i: Int, n: Int) = ((i % n) + n) % n
+        val tmp = Array(h) { y -> val row = image[y]; FloatArray(w) { x ->
+            var s = t[0] * row[x]
+            var k = 1
+            while (k <= radius) { s += t[k] * (row[wrap(x - k, w)] + row[wrap(x + k, w)]); k += 2 }
+            s
+        } }
+        return Array(h) { y -> FloatArray(w) { x ->
+            var s = t[0] * tmp[y][x]
+            var k = 1
+            while (k <= radius) { s += t[k] * (tmp[wrap(y - k, h)][x] + tmp[wrap(y + k, h)][x]); k += 2 }
+            s
+        } }
     }
 
     /**
@@ -85,6 +137,11 @@ object Grey {
     }
 
     private fun fft2(re: DoubleArray, im: DoubleArray, h: Int, w: Int, inverse: Boolean) {
+        // Full sensor dimensions are usually mixed-radix. Reuse one plan
+        // per axis; the old O(n²) DFT made full-frame CPU studies impractical.
+        val rowPlan = if (w > 1 && w and (w - 1) != 0) DoubleFFT_1D(w.toLong()) else null
+        val colPlan = if (h > 1 && h and (h - 1) != 0) DoubleFFT_1D(h.toLong()) else null
+        val packed = DoubleArray(2 * maxOf(h, w))
         val tmpRe = DoubleArray(maxOf(h, w))
         val tmpIm = DoubleArray(maxOf(h, w))
         for (y in 0 until h) {
@@ -92,7 +149,7 @@ object Grey {
                 tmpRe[x] = re[y * w + x]
                 tmpIm[x] = im[y * w + x]
             }
-            fft1d(tmpRe, tmpIm, w, inverse)
+            fft1d(tmpRe, tmpIm, w, inverse, rowPlan, packed)
             for (x in 0 until w) {
                 re[y * w + x] = tmpRe[x]
                 im[y * w + x] = tmpIm[x]
@@ -103,7 +160,7 @@ object Grey {
                 tmpRe[y] = re[y * w + x]
                 tmpIm[y] = im[y * w + x]
             }
-            fft1d(tmpRe, tmpIm, h, inverse)
+            fft1d(tmpRe, tmpIm, h, inverse, colPlan, packed)
             for (y in 0 until h) {
                 re[y * w + x] = tmpRe[y]
                 im[y * w + x] = tmpIm[y]
@@ -130,10 +187,13 @@ object Grey {
         }
     }
 
-    private fun fft1d(re: DoubleArray, im: DoubleArray, n: Int, inverse: Boolean) {
+    private fun fft1d(re: DoubleArray, im: DoubleArray, n: Int, inverse: Boolean, plan: DoubleFFT_1D?, packed: DoubleArray) {
         if (n == 1) return
         if (n and (n - 1) != 0) {
-            dft1d(re, im, n, inverse)
+            requireNotNull(plan)
+            for (i in 0 until n) { packed[2*i] = re[i]; packed[2*i+1] = im[i] }
+            if (inverse) plan.complexInverse(packed, true) else plan.complexForward(packed)
+            for (i in 0 until n) { re[i] = packed[2*i]; im[i] = packed[2*i+1] }
             return
         }
         var j = 0
@@ -183,26 +243,4 @@ object Grey {
         }
     }
 
-    private fun dft1d(re: DoubleArray, im: DoubleArray, n: Int, inverse: Boolean) {
-        val srcRe = re.copyOfRange(0, n)
-        val srcIm = im.copyOfRange(0, n)
-        val sign = if (inverse) 1.0 else -1.0
-        for (k in 0 until n) {
-            var sr = 0.0
-            var si = 0.0
-            for (t in 0 until n) {
-                val ang = sign * 2.0 * PI * k * t / n
-                val c = cos(ang)
-                val s = sin(ang)
-                sr += srcRe[t] * c - srcIm[t] * s
-                si += srcRe[t] * s + srcIm[t] * c
-            }
-            if (inverse) {
-                sr /= n
-                si /= n
-            }
-            re[k] = sr
-            im[k] = si
-        }
-    }
 }

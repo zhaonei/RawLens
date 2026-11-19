@@ -61,9 +61,17 @@ internal class RawFrameSaveJob(
         fun publishDevelopedScope(bitmap: Bitmap)
         fun publishDevelopedJxlScope(developed: DevelopedJxl)
         fun endJpegProcessing()
+        /**
+         * The RAW Image is no longer read: hand it and its reader/frame slot
+         * back before the slow encode (JXL takes ~24 s on Moto G75), so the
+         * ZSL shutter gate does not stay closed for the whole encode.
+         * Idempotent; the enclosing job still closes ownership in finally.
+         */
+        fun releaseRawFrame() {}
     }
 
     fun run() {
+            var mono: MonoFrame? = null
             try {
                 var dngName: String? = null
                 var jpegName: String? = null
@@ -90,6 +98,21 @@ internal class RawFrameSaveJob(
                     } else null
                 } else null
                 val denCfa: UnpackedRawCfa? = aiCfa
+                // B&W photosite mode: one Vulkan pass feeds the mono DNG and the
+                // develop. Any failure falls back to the colour outputs.
+                if (input.outputSettings.mono.enabled && !input.frameMetadata.quadBayer &&
+                    (input.outputFormat.includesDng || input.outputFormat.includesJpeg)) {
+                    mono = runCatching {
+                        val wantMono = input.outputFormat.includesDng
+                        val wantPacked = input.outputFormat.includesJpeg
+                        if (denCfa != null) developer.monoFromCfa(denCfa, input.frameMetadata,
+                            input.outputSettings, wantMono, wantPacked)
+                        else developer.monoFromRaw(
+                            requireNotNull(image.planes.singleOrNull()?.buffer) { "RAW image must have one plane" },
+                            input.frameMetadata, devSettings, input.outputSettings, wantMono, wantPacked)
+                    }.onFailure { Log.w(LOG_TAG, "B&W failed; saving colour", it) }.getOrNull()
+                }
+                val monoFrame = mono
                 fun saveOriginalDng(): String? = try {
                     DngSaver(context).save(
                         image, input.characteristics, result, input.orientation, input.dngOverrides,
@@ -107,7 +130,19 @@ internal class RawFrameSaveJob(
                     Log.e(LOG_TAG, "DNG save failed", failure)
                     null
                 }
-                if (aiCfa != null) {
+                if (monoFrame != null && input.outputFormat.includesDng) {
+                    try {
+                        dngName = MonoDngWriter.save(context, monoFrame, input.frameMetadata,
+                            input.captureTimeMillis, input.gps)
+                        Log.i(LOG_TAG, "B&W DNG saved name=$dngName mode=${monoFrame.mode}")
+                    } catch (failure: Exception) {
+                        dngFailure = failure
+                        Log.e(LOG_TAG, "B&W DNG save failed", failure)
+                    }
+                }
+                if (monoFrame != null && !input.outputSettings.mono.keepColorDng) {
+                    // B&W replaces the colour DNG.
+                } else if (aiCfa != null) {
                     if (input.outputFormat.includesDng) {
                         try {
                             dngName = DngSaver(context).saveAiDenoised(
@@ -129,7 +164,8 @@ internal class RawFrameSaveJob(
                         }
                     }
                 } else if (input.outputFormat.includesDng) {
-                    dngName = saveOriginalDng()
+                    val colorDng = saveOriginalDng()
+                    if (dngName == null) dngName = colorDng
                 }
                 if (input.outputFormat.includesJpeg) {
                     try {
@@ -141,7 +177,10 @@ internal class RawFrameSaveJob(
                                 if (aiCfa != null) " aiDenoised" else ""
                         )
                         if (input.developedFormat == DevelopedFormat.JXL) {
-                            val developed = if (denCfa != null) {
+                            val developed = if (monoFrame != null) {
+                                developer.developMonoJxl(monoFrame, input.frameMetadata, devSettings,
+                                    input.outputSettings, input.jxl)
+                            } else if (denCfa != null) {
                                 developer.developCfaJxl(
                                     denCfa, input.frameMetadata,
                                     settings = devSettings,
@@ -158,6 +197,7 @@ internal class RawFrameSaveJob(
                                     jxl = input.jxl
                                 )
                             }
+                            host.releaseRawFrame()
                             jpegName = JxlSaver(context).save(
                                 developed, input.frameMetadata, result,
                                 captureTimeMillis = input.captureTimeMillis,
@@ -172,7 +212,10 @@ internal class RawFrameSaveJob(
                                     "pendingSaves=${host.pendingSaves()}"
                             )
                         } else {
-                            val developed = if (denCfa != null) {
+                            val developed = if (monoFrame != null) {
+                                developer.developMonoJpeg(monoFrame, input.frameMetadata, devSettings,
+                                    input.outputSettings)
+                            } else if (denCfa != null) {
                                 developer.developCfaJpeg(
                                     denCfa, input.frameMetadata,
                                     settings = devSettings,
@@ -187,13 +230,15 @@ internal class RawFrameSaveJob(
                                     outputSettings = input.outputSettings
                                 )
                             }
+                            host.releaseRawFrame()
                             try {
                                 jpegName = JpegSaver(context).save(
                                     developed, input.frameMetadata, result,
                                     captureTimeMillis = input.captureTimeMillis,
                                     typeSuffix = input.fileNameSuffix,
                                     gps = input.gps,
-                                    subfolder = input.subfolder
+                                    subfolder = input.subfolder,
+                                    monochromeMode = monoFrame?.mode
                                 )
                                 host.publishDevelopedScope(developed.bitmap)
                                 Log.i(
@@ -206,13 +251,19 @@ internal class RawFrameSaveJob(
                                 developed.bitmap.recycle()
                             }
                         }
+                    } catch (failure: OutOfMemoryError) {
+                        // A failed full-resolution JPEG must not kill the process
+                        // while it owns a rooted camera session. Keep a saved DNG.
+                        jpegFailure = java.io.IOException("Not enough memory to develop JPEG", failure)
+                        Log.e(LOG_TAG, "JPEG allocation failed; retaining any saved DNG", failure)
                     } catch (failure: Exception) {
                         jpegFailure = failure
                         Log.e(LOG_TAG, "RAW developed still development/save failed", failure)
                     }
                 }
                 val label = input.captureLabel?.let { " • $it" }.orEmpty() +
-                    if (aiCfa != null) " • AI" else ""
+                    (if (aiCfa != null) " • AI" else "") +
+                    (mono?.let { " • B&W ${it.mode.label.uppercase()}" } ?: "")
                 val shadingNote = if (
                     input.frameMetadata.lensShadingMap == null &&
                     !input.frameMetadata.lensShadingAlreadyApplied
@@ -224,6 +275,7 @@ internal class RawFrameSaveJob(
                 Log.e(LOG_TAG, "Capture artifact save failed", failure)
                 host.reportSaveState("SAVE ERROR: ${failure.message ?: failure.javaClass.simpleName}")
             } finally {
+                mono?.close()
                 if (input.outputFormat.includesJpeg) host.endJpegProcessing()
             }
     }

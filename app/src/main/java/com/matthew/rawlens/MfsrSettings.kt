@@ -54,13 +54,18 @@ data class MfsrSettings(
     val zipperFix: Boolean = true,
     /**
      * Merge engine behind the same shutter / ZSL / save path: Wronski MFSR
-     * (sr-pipeline) or LK-Reloaded (tools/lkr-pipeline, Lecouat et al. 2021).
+     * (sr-pipeline) or LK-Reloaded (tools/lkr-lite = LK-R Lite, after Lecouat et al. 2021).
      * Each engine has its own quick tile (MFSR, LK-R); turning one on
      * switches the shared sharp-merge path to that engine.
      */
     val engine: MfsrEngine = MfsrEngine.MFSR,
     /** LK-R: regularise with the Vulkan sliding-DCT x-step; false (default) = no prior. */
     val lkrDctPrior: Boolean = false,
+    /** Noise-gated PhotonCamera KernelNet post-denoise; daylight bypass, enabled by default. */
+    val lkrKernelNetDenoise: Boolean = true,
+    /** LK-R: learned post-fit network (colour dots / colour zipper; colour only). Stored default: on with
+     *  an NPU (LkrBridge.nativeHasNpu); this constructor default only applies before settings load. */
+    val lkrNetwork: Boolean = false,
     /**
      * LK-R: reference = sharpest of the middle three frames instead of the
      * newest three ([BurstSharpness.plan]); more frames survive motion
@@ -78,7 +83,13 @@ data class MfsrSettings(
      * keep the x2 solve instead of returning to sensor size. 1x -> 4x the
      * sensor pixels; 1.5x -> crop x2 (~2.25x pixels); 2x -> sensor size.
      */
-    val lkrFullRes: Boolean = false
+    val lkrFullRes: Boolean = false,
+    /**
+     * MFSR resolution (same viewfinder round button as LK-R when MFSR is the
+     * active engine): merge at 2x (Wronski super-resolution, 12.5 -> 50 MP)
+     * instead of the sensor grid.
+     */
+    val mfsrFullRes: Boolean = false
 ) {
     /** Quick-tile / status label of the active engine. */
     val label: String get() = if (engine == MfsrEngine.LKR) "LK-R" else "MFSR"
@@ -95,9 +106,12 @@ data class MfsrSettings(
         "mfsr_zipper_fix" to zipperFix,
         "mfsr_engine" to engine.name,
         "lkr_dct_prior" to lkrDctPrior,
+        "lkr_kernelnet_denoise" to lkrKernelNetDenoise,
+        "lkr_network" to lkrNetwork,
         "lkr_middle_reference" to lkrMiddleReference,
         "lkr_zoom" to lkrZoom.name,
-        "lkr_full_res" to lkrFullRes
+        "lkr_full_res" to lkrFullRes,
+        "mfsr_full_res" to mfsrFullRes
     )
 
     /** True when the sharp merge is on with [which] as its engine (that engine's tile is active). */
@@ -124,11 +138,17 @@ data class MfsrSettings(
             zipperFix = values["mfsr_zipper_fix"] as? Boolean ?: true,
             engine = MfsrEngine.entries.firstOrNull { it.name == values["mfsr_engine"] } ?: MfsrEngine.MFSR,
             lkrDctPrior = values["lkr_dct_prior"] as? Boolean ?: false,
+            lkrKernelNetDenoise = values["lkr_kernelnet_denoise"] as? Boolean ?: true,
+            // Default: on for phones with an NPU (nearly free there; colour-only since d1affb09, no luma
+            // sharpening), off otherwise (the Vulkan fallback costs GPU time). Caught here: LkrBridge's class
+            // init loads the native library (absent in JVM tests).
+            lkrNetwork = values["lkr_network"] as? Boolean ?: runCatching { LkrBridge.nativeHasNpu() }.getOrDefault(false),
             lkrMiddleReference = values["lkr_middle_reference"] as? Boolean ?: true,
             // Legacy FULL_2X (zoom and resolution in one value) splits into 1x + full res.
             lkrZoom = (LkrZoom.entries.firstOrNull { it.name == values["lkr_zoom"] } ?: LkrZoom.X1)
                 .let { if (it == LkrZoom.FULL_2X) LkrZoom.X1 else it },
-            lkrFullRes = values["lkr_full_res"] as? Boolean ?: (values["lkr_zoom"] == LkrZoom.FULL_2X.name)
+            lkrFullRes = values["lkr_full_res"] as? Boolean ?: (values["lkr_zoom"] == LkrZoom.FULL_2X.name),
+            mfsrFullRes = values["mfsr_full_res"] as? Boolean ?: false
         )
 
         const val MIN_MERGE_FRAMES = 2
@@ -136,10 +156,10 @@ data class MfsrSettings(
         /** LK-R at x1 follows the largest burst the app captures. */
         const val MAX_LKR_FRAMES = 59
         /**
-         * LK-R x2 modes (1.5x, 2x, full 2x): per-frame solver buffers are 4x larger, so one
-         * worker at 24 frames already needs ~600 MB of native memory next to the frames and output.
+         * LK-R Lite x2 modes (1.5x, 2x, full 2x): tiled solving and FP16 GPU frame
+         * storage use a 30-frame cap, lower than x1 for input and solver memory.
          */
-        const val MAX_LKR_FRAMES_X2 = 24
+        const val MAX_LKR_FRAMES_X2 = 30
 
         fun maxFrames(engine: MfsrEngine, zoom: LkrZoom = LkrZoom.X1): Int = when {
             engine != MfsrEngine.LKR -> MAX_MERGE_FRAMES

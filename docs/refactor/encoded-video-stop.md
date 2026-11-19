@@ -1,5 +1,7 @@
 # Encoded Video naming and EOS stop fix
 
+> Repository context: [current source state](../CURRENT_STATE.md). This audit, plan or evidence records its original scope; historical defaults, results and pending work do not establish current app behavior.
+
 ## Vivo confirmation
 
 The user confirmed clean RCD and MHC output after the Qualcomm compatibility
@@ -53,10 +55,10 @@ Handoff: `/tmp/RawLens-2.0.60-Encoded-Video-stop-fix-arm64.apk`, package
 `com.matthew.rawlens.vivocheck`, separately installable. APK signature verified;
 the portable RCD shader payload matches the validated compatibility files.
 
-Evidence: [RCD regression](results/encoded-video-stop-2026-10-31/rcd-test.txt),
-[RCD timing](results/encoded-video-stop-2026-10-31/rcd-timing.txt),
-[cold MHC run](results/encoded-video-stop-2026-10-31/mhc-cold-run.txt),
-[MHC/superpixel rerun](results/encoded-video-stop-2026-10-31/mhc-retest.txt),
-[MHC timing](results/encoded-video-stop-2026-10-31/mhc-timing.txt),
-[superpixel timing](results/encoded-video-stop-2026-10-31/superpixel-timing.txt),
-[release build](results/encoded-video-stop-2026-10-31/release-build.txt).
+Evidence: [RCD regression](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/encoded-video-stop-2026-10-31/rcd-test.txt),
+[RCD timing](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/encoded-video-stop-2026-10-31/rcd-timing.txt),
+[cold MHC run](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/encoded-video-stop-2026-10-31/mhc-cold-run.txt),
+[MHC/superpixel rerun](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/encoded-video-stop-2026-10-31/mhc-retest.txt),
+[MHC timing](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/encoded-video-stop-2026-10-31/mhc-timing.txt),
+[superpixel timing](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/encoded-video-stop-2026-10-31/superpixel-timing.txt),
+[release build](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/encoded-video-stop-2026-10-31/release-build.txt).

@@ -1,5 +1,7 @@
 # Encoded Video internal namespace
 
+> Repository context: [current source state](../CURRENT_STATE.md). This audit, plan or evidence records its original scope; historical defaults, results and pending work do not establish current app behavior.
+
 The application and tooling use Encoded Video in class/file names, APIs,
 fields, preference keys, JNI symbols, native log tags, diagnostics, shader
 asset names, tests, and tool names. The former mode-specific probe/ladder
@@ -28,7 +30,7 @@ the previously documented exclusion of duplicate isolated lint tasks.
 Handoff: `/tmp/RawLens-2.0.62-Encoded-Video-renamed-arm64.apk`, separately
 installable package `com.matthew.rawlens.vivocheck`; APK signature verified.
 
-Evidence: [source audit](results/encoded-video-namespace-2026-10-31/source-audit.txt),
-[JVM summary](results/encoded-video-namespace-2026-10-31/unit-summary.txt),
-[migration/GPU checks](results/encoded-video-namespace-2026-10-31/migration-gpu-native-tests.txt),
-[recording and UI smoke](results/encoded-video-namespace-2026-10-31/recording-and-ui-smoke.txt).
+Evidence: [source audit](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/encoded-video-namespace-2026-10-31/source-audit.txt),
+[JVM summary](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/encoded-video-namespace-2026-10-31/unit-summary.txt),
+[migration/GPU checks](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/encoded-video-namespace-2026-10-31/migration-gpu-native-tests.txt),
+[recording and UI smoke](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/encoded-video-namespace-2026-10-31/recording-and-ui-smoke.txt).

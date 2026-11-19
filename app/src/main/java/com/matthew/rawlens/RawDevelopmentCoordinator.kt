@@ -131,13 +131,21 @@ class RawDevelopmentCoordinator(context: Context) {
     private val adaptiveWorkspace = AdaptiveDevelopmentExposure.workspace()
 
     private fun resolveMfsrExposure(
-        rgb: ByteBuffer, width: Int, height: Int, settings: RawDevelopmentSettings
+        rgb: ByteBuffer, width: Int, height: Int, settings: RawDevelopmentSettings,
+        metadata: RawFrameMetadata, output: JpegOutputSettings
     ): Double {
         if (settings.adaptiveExposureStrength <= 0f) return settings.exposureEv
         val result = AdaptiveDevelopmentExposure.analyzeRgb(
             rgb, width, height, adaptiveWorkspace, settings.adaptiveExposureTuning
         )
-        return settings.exposureEv + result.correctionEv *
+        val correction = if (output.toneMapper == PhotoToneMapper.BASIC) {
+            val transform = SceneLinearColorProcessor.resolve(SceneLinearColorMetadata.from(metadata))
+            minOf(result.correctionEv, BasicRgbExposureGuard.limitEv(rgb, width, height,
+                transform.cameraToAcescg.toDoubleArray(), output.highlightSoftHeadroom.toDouble(),
+                output.highlightHeadroom.toDouble(), output.displayP3))
+        } else result.correctionEv
+        android.util.Log.i("BasicRgbExposure", "sensorEV=${result.correctionEv} guardedEV=$correction")
+        return settings.exposureEv + correction *
             settings.adaptiveExposureStrength.coerceIn(0f, 1f)
     }
     private val aiDenoiser by lazy { RawNindDenoiser(appContext) }
@@ -161,6 +169,22 @@ class RawDevelopmentCoordinator(context: Context) {
         }
         return OpposedHighlightsVulkan.Session(handle, appContext.assets).also {
             opposedSession = it
+            handle.savePipelineCache(cache)
+        }
+    }
+
+    private var monoSession: MonoVulkan? = null
+
+    /** B&W session on the coordinator's Vulkan 1.0 device (shared with opposed). */
+    private fun monoSession(): MonoVulkan {
+        monoSession?.let { return it }
+        val cache = VulkanPipelineCache.file(appContext.cacheDir, VulkanPipelineCache.HOST_OPPOSED)
+        val handle = hlVkHandle ?: VulkanHub.openVulkan10().also {
+            it.loadPipelineCache(cache)
+            hlVkHandle = it
+        }
+        return MonoVulkan(handle, appContext.assets).also {
+            monoSession = it
             handle.savePipelineCache(cache)
         }
     }
@@ -620,7 +644,9 @@ class RawDevelopmentCoordinator(context: Context) {
             rawPlane,
             metadata,
             settings,
-            fusedOutputSettings = outputSettings
+            fusedOutputSettings = outputSettings,
+            // RapidRAW chroma/detail preprocessing needs the linear frame before encoding.
+            allowOutputFusion = !outputSettings.chromaCleanup.rapidRawActive
         ) { frame ->
             if (frame.texture.internalFormat == AmazeTextureFormat.RGBA8) {
                 jpegOutput.processEncoded(frame.texture, outputSettings)
@@ -750,15 +776,11 @@ class RawDevelopmentCoordinator(context: Context) {
      * exposure analyzed on the given CFA.
      */
     fun developCfaJpeg(
-        sourceCfa: UnpackedRawCfa,
+        cfa: UnpackedRawCfa,
         metadata: RawFrameMetadata,
         settings: RawDevelopmentSettings = RawDevelopmentSettings(),
         outputSettings: JpegOutputSettings = JpegOutputSettings()
     ): DevelopedJpeg {
-        // Same crop the DNG writer applies to this capture's CFA: the JPEG and the DNG
-        // must agree on framing, or the two files of one shutter press show different
-        // pictures.
-        val cfa = ZoomCrop.applyIfNeeded(sourceCfa, metadata.zoomMultiplier)
         amaze.chromaCleanup = outputSettings.chromaCleanup
         MemoryLeakDiagnostics.stillCapture()
         metadata.rawDevelopmentUnsupportedReason?.let { throw UnsupportedOperationException(it) }
@@ -791,7 +813,7 @@ class RawDevelopmentCoordinator(context: Context) {
                 clipPoint = reconstructedCfa.values.maxOrNull()?.coerceAtLeast(1f) ?: 1f,
                 cameraToAcescgColumnMajor = transform.glslColumnMajorMatrix(),
                 cameraWhiteNormalized = transform.glslCameraWhiteNormalized(),
-                fusedOutputSettings = if (cameraLinearPlan) null else outputSettings,
+                fusedOutputSettings = if (cameraLinearPlan || outputSettings.chromaCleanup.rapidRawActive) null else outputSettings,
                 whiteWindow = tapWhiteWindow,
                 cameraLinear = cameraLinearPlan
             ) { output ->
@@ -821,6 +843,99 @@ class RawDevelopmentCoordinator(context: Context) {
         }
     }
 
+    /**
+     * B&W from a fresh RAW plane: unpack + pre-demosaic corrections (defects,
+     * lens shading) + optional opposed highlights, then the photosite mono
+     * pass. Never demosaics. Quad-Bayer is not supported (caller keeps colour).
+     */
+    fun monoFromRaw(
+        rawPlane: ByteBuffer, metadata: RawFrameMetadata, settings: RawDevelopmentSettings,
+        look: JpegOutputSettings, wantMono: Boolean, wantPacked: Boolean,
+    ): MonoFrame {
+        metadata.rawDevelopmentUnsupportedReason?.let { throw UnsupportedOperationException(it) }
+        val geometry = metadata.bufferGeometry as? RawBufferGeometry.Supported
+            ?: throw UnsupportedOperationException("RAW buffer geometry is not proven")
+        val normalization = metadata.normalizationOrNull()
+            ?: throw UnsupportedOperationException("RAW black/white/CFA normalization metadata is invalid")
+        val rowStride = metadata.rawPlaneRowStride ?: throw UnsupportedOperationException("RAW row stride is missing")
+        val pixelStride = metadata.rawPlanePixelStride ?: throw UnsupportedOperationException("RAW pixel stride is missing")
+        val packedFormat = PackedRawFormat.ofInt(metadata.rawImageFormat)
+        val unpacked = if (packedFormat == null) {
+            RawSensorUnpacker.unpackNormalized(
+                rawPlane, RawPlaneLayout(metadata.imageWidth, metadata.imageHeight, rowStride, pixelStride,
+                    geometry.sensorOriginX, geometry.sensorOriginY),
+                normalization, geometry.processingCrop, ByteOrder.nativeOrder()
+            )
+        } else {
+            RawPackedUnpacker.unpackFrameNormalized(
+                rawPlane, metadata.imageWidth, metadata.imageHeight,
+                rowStride, pixelStride, metadata.rawImageFormat, normalization,
+                geometry.sensorOriginX, geometry.sensorOriginY,
+                geometry.processingCrop, ByteOrder.nativeOrder()
+            )
+        }
+        val cfa = requireNotNull(RawPreDemosaicPipeline.process(unpacked, metadata, settings.preDemosaic).cfa)
+        return monoFromCfa(cfa, metadata, look, wantMono, wantPacked)
+    }
+
+    /** B&W from an already-corrected CFA (single-frame AI denoise or HDR+ merge). */
+    fun monoFromCfa(
+        cfa: UnpackedRawCfa, metadata: RawFrameMetadata, look: JpegOutputSettings,
+        wantMono: Boolean, wantPacked: Boolean, merged: Boolean = false,
+    ): MonoFrame {
+        require(!metadata.quadBayer) { "B&W photosite mode needs a 2x2 Bayer CFA" }
+        cfa.requireAmazeCompatible()
+        val neutral = SceneLinearColorProcessor.resolve(SceneLinearColorMetadata.from(metadata), 0.0)
+            .glslCameraWhiteNormalized()
+        val balance = FloatArray(3) { 1f / neutral[it] }
+        // Opposed keeps clipped skies gradated in luma exactly as in colour.
+        val opposed = look.hlReconstruction && (!merged || cfa.highlightClipping != null)
+        val source = reconstructBayer(cfa, opposed, metadata)
+        return monoSession().run(source, look.mono.mode, balance, neutral, wantMono, wantPacked)
+    }
+
+    /** Develops a [MonoFrame] through the normal ACEScg -> AgX/Basic -> JPEG tail. */
+    fun developMonoJpeg(
+        frame: MonoFrame, metadata: RawFrameMetadata, settings: RawDevelopmentSettings,
+        outputSettings: JpegOutputSettings, merged: Boolean = false,
+    ): DevelopedJpeg {
+        MemoryLeakDiagnostics.stillCapture()
+        val transform = monoTransform(frame, metadata, settings, merged)
+        val camera = requireNotNull(frame.packed) { "B&W develop needs the packed camera-linear plane" }
+        return amaze.transformCameraLinear(camera, frame.width, frame.height, transform.glslColumnMajorMatrix()) {
+            finishJpeg(it, outputSettings)
+        }
+    }
+
+    fun developMonoJxl(
+        frame: MonoFrame, metadata: RawFrameMetadata, settings: RawDevelopmentSettings,
+        look: JpegOutputSettings, jxl: JxlOutputSettings, merged: Boolean = false,
+    ): DevelopedJxl {
+        MemoryLeakDiagnostics.stillCapture()
+        val transform = monoTransform(frame, metadata, settings, merged)
+        val camera = requireNotNull(frame.packed) { "B&W develop needs the packed camera-linear plane" }
+        return amaze.transformCameraLinear(camera, frame.width, frame.height, transform.glslColumnMajorMatrix()) {
+            finishJxl(it, look, jxl)
+        }
+    }
+
+    private fun monoTransform(
+        frame: MonoFrame, metadata: RawFrameMetadata, settings: RawDevelopmentSettings, merged: Boolean,
+    ): ResolvedSceneLinearTransform {
+        // Same metering as the colour develop of the same CFA.
+        val correction = if (merged) {
+            resolveMergedAdaptive(frame.cfa, settings, adaptiveWorkspace)?.correctionEv?.let {
+                it * if (settings.hdrAdaptiveTuning != null) 1.0
+                else settings.adaptiveExposureStrength.coerceIn(0f, 1f).toDouble()
+            } ?: 0.0
+        } else if (settings.adaptiveExposureStrength > 0f) {
+            (settings.sharedAdaptiveExposure ?: SharedAdaptiveExposure()).resolve {
+                AdaptiveDevelopmentExposure.analyze(frame.cfa, adaptiveWorkspace, settings.adaptiveExposureTuning)
+            }.correctionEv * settings.adaptiveExposureStrength.coerceIn(0f, 1f)
+        } else 0.0
+        return SceneLinearColorProcessor.resolve(SceneLinearColorMetadata.from(metadata), settings.exposureEv + correction)
+    }
+
     private fun finishJpeg(
         output: AmazeGpuOutput,
         outputSettings: JpegOutputSettings
@@ -835,15 +950,11 @@ class RawDevelopmentCoordinator(context: Context) {
     /** Develops an unclamped, normalized CFA produced by RAW HDR merging. */
     // Future SR hook: route SR merges through this develop path.
     fun developMergedJpeg(
-        sourceCfa: UnpackedRawCfa,
+        cfa: UnpackedRawCfa,
         metadata: RawFrameMetadata,
         settings: RawDevelopmentSettings = RawDevelopmentSettings(),
         outputSettings: JpegOutputSettings = JpegOutputSettings()
     ): DevelopedJpeg {
-        // Same crop the DNG writer applies to this capture's CFA: the JPEG and the DNG
-        // must agree on framing, or the two files of one shutter press show different
-        // pictures.
-        val cfa = ZoomCrop.applyIfNeeded(sourceCfa, metadata.zoomMultiplier)
         amaze.chromaCleanup = outputSettings.chromaCleanup
         MemoryLeakDiagnostics.stillCapture()
         metadata.rawDevelopmentUnsupportedReason?.let { throw UnsupportedOperationException(it) }
@@ -904,7 +1015,8 @@ class RawDevelopmentCoordinator(context: Context) {
                 clipPoint = reconstructed.values.maxOrNull()?.coerceAtLeast(1f) ?: 1f,
                 cameraToAcescgColumnMajor = transform.glslColumnMajorMatrix(),
                 cameraWhiteNormalized = transform.glslCameraWhiteNormalized(),
-                fusedOutputSettings = if (settings.denoise.captureSharpening.enabled && !metadata.quadBayer) null else developOutput,
+                fusedOutputSettings = if (developOutput.chromaCleanup.rapidRawActive ||
+                    (settings.denoise.captureSharpening.enabled && !metadata.quadBayer)) null else developOutput,
                 whiteWindow = whiteWindow,
                 cameraLinear = settings.denoise.captureSharpening.enabled && !metadata.quadBayer
             ) { output ->
@@ -937,26 +1049,19 @@ class RawDevelopmentCoordinator(context: Context) {
         height: Int,
         metadata: RawFrameMetadata,
         settings: RawDevelopmentSettings = RawDevelopmentSettings(),
-        outputSettings: JpegOutputSettings = JpegOutputSettings(),
-        /** Window of [rgb] to develop; see [Gles31AmazeProcessor.processMfsrRgb]. */
-        sourceRowStride: Int = width,
-        sourceColumnOffset: Int = 0,
-        sourceRowOffset: Int = 0
+        outputSettings: JpegOutputSettings = JpegOutputSettings()
     ): DevelopedJpeg {
         amaze.chromaCleanup = outputSettings.chromaCleanup
         MemoryLeakDiagnostics.stillCapture()
         metadata.rawDevelopmentUnsupportedReason?.let { throw UnsupportedOperationException(it) }
         val transform = SceneLinearColorProcessor.resolve(
-            SceneLinearColorMetadata.from(metadata), resolveMfsrExposure(rgb, width, height, settings)
+            SceneLinearColorMetadata.from(metadata), resolveMfsrExposure(rgb, width, height, settings, metadata, outputSettings)
         )
         return amaze.processMfsrRgb(
             rgb, width, height,
             transform.glslColumnMajorMatrix(),
             transform.glslCameraWhiteNormalized(),
-            cameraLinear = settings.denoise.captureSharpening.enabled,
-            sourceRowStride = sourceRowStride,
-            sourceColumnOffset = sourceColumnOffset,
-            sourceRowOffset = sourceRowOffset
+            cameraLinear = settings.denoise.captureSharpening.enabled
         ) { output ->
             consumeCaptureSharpened(output, transform,
                 capturePattern(metadata),
@@ -1015,7 +1120,8 @@ class RawDevelopmentCoordinator(context: Context) {
         amaze.chromaCleanup = outputSettings.chromaCleanup
         // Covers developMergedImagesJpeg too (it delegates here).
         MemoryLeakDiagnostics.stillCapture()
-        return mergedDevelop.develop(input, settings, cameraLinear = settings.denoise.captureSharpening.enabled) { scene ->
+        return mergedDevelop.develop(input, settings, cameraLinear = settings.denoise.captureSharpening.enabled,
+            chromaCleanup = outputSettings.chromaCleanup) { scene ->
             require(scene.internalFormat == AmazeTextureFormat.RGBA16F) {
                 "Merged develop must emit scene-linear RGBA16F"
             }
@@ -1170,6 +1276,7 @@ class RawDevelopmentCoordinator(context: Context) {
         look: JpegOutputSettings = JpegOutputSettings(),
         jxl: JxlOutputSettings = JxlOutputSettings()
     ): DevelopedJxl {
+        amaze.chromaCleanup = look.chromaCleanup
         MemoryLeakDiagnostics.stillCapture()
         metadata.rawDevelopmentUnsupportedReason?.let { throw UnsupportedOperationException(it) }
         cfa.requireAmazeCompatible()
@@ -1238,15 +1345,13 @@ class RawDevelopmentCoordinator(context: Context) {
      * half-float JXL output stage instead of the 8-bit JPEG one.
      */
     fun developMergedJxl(
-        sourceCfa: UnpackedRawCfa,
+        cfa: UnpackedRawCfa,
         metadata: RawFrameMetadata,
         settings: RawDevelopmentSettings = RawDevelopmentSettings(),
         look: JpegOutputSettings = JpegOutputSettings(),
         jxl: JxlOutputSettings = JxlOutputSettings()
     ): DevelopedJxl {
-        // Same crop the merged DNG and the merged JPEG take, so all three outputs of one
-        // shutter press agree on framing.
-        val cfa = ZoomCrop.applyIfNeeded(sourceCfa, metadata.zoomMultiplier)
+        amaze.chromaCleanup = look.chromaCleanup
         MemoryLeakDiagnostics.stillCapture()
         metadata.rawDevelopmentUnsupportedReason?.let { throw UnsupportedOperationException(it) }
         cfa.requireAmazeCompatible()
@@ -1318,25 +1423,19 @@ class RawDevelopmentCoordinator(context: Context) {
         metadata: RawFrameMetadata,
         settings: RawDevelopmentSettings = RawDevelopmentSettings(),
         look: JpegOutputSettings = JpegOutputSettings(),
-        jxl: JxlOutputSettings = JxlOutputSettings(),
-        /** Window of [rgb] to develop; see [Gles31AmazeProcessor.processMfsrRgb]. */
-        sourceRowStride: Int = width,
-        sourceColumnOffset: Int = 0,
-        sourceRowOffset: Int = 0
+        jxl: JxlOutputSettings = JxlOutputSettings()
     ): DevelopedJxl {
+        amaze.chromaCleanup = look.chromaCleanup
         MemoryLeakDiagnostics.stillCapture()
         metadata.rawDevelopmentUnsupportedReason?.let { throw UnsupportedOperationException(it) }
         val transform = SceneLinearColorProcessor.resolve(
-            SceneLinearColorMetadata.from(metadata), resolveMfsrExposure(rgb, width, height, settings)
+            SceneLinearColorMetadata.from(metadata), resolveMfsrExposure(rgb, width, height, settings, metadata, look)
         )
         return amaze.processMfsrRgb(
             rgb, width, height,
             transform.glslColumnMajorMatrix(),
             transform.glslCameraWhiteNormalized(),
-            cameraLinear = settings.denoise.captureSharpening.enabled,
-            sourceRowStride = sourceRowStride,
-            sourceColumnOffset = sourceColumnOffset,
-            sourceRowOffset = sourceRowOffset
+            cameraLinear = settings.denoise.captureSharpening.enabled
         ) { output ->
             consumeCaptureSharpened(output, transform,
                 capturePattern(metadata),
@@ -1409,6 +1508,8 @@ class RawDevelopmentCoordinator(context: Context) {
         amaze.close()
         opposedSession?.close()
         opposedSession = null
+        monoSession?.close()
+        monoSession = null
         hlVkHandle?.close()
         hlVkHandle = null
         MemoryLeakDiagnostics.sample(

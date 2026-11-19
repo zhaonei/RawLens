@@ -1,5 +1,7 @@
 # Issue 1: removal and distribution cleanup
 
+> Repository context: [current source state](../CURRENT_STATE.md). This audit, plan or evidence records its original scope; historical defaults, results and pending work do not establish current app behavior.
+
 Date: 2026-11-01. Issue: https://github.com/matthew777777/RawLens/issues/1.
 This records technical actions, not a finding about ownership or legal clearance.
 
@@ -78,7 +80,7 @@ An isolated Xiaomi foreground MHC recording test was attempted. Compilation,
 recording and prior pipeline assertions proceeded, but its final muxed-frame
 count assertion failed. Hardware acceptance is therefore incomplete. Further
 device testing was stopped at the user's request. The failure is retained in
-[the initial test report](results/issue1-removal-2026-11-01/initial-device-smoke-failure.txt).
+[the initial test report](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/issue1-removal-2026-11-01/initial-device-smoke-failure.txt).
 It is not reported as a passing recording check or a performance result.
 
 The new cleaned release target is 2.0.68 (versionCode 2068). Build with the
@@ -118,5 +120,5 @@ complete hosted-copy removal is made. The private support-request draft records
 the exact object/attachment identifiers. The repository issue remains open.
 
 See [distribution status](results/issue1-removal-2026-11-01/distribution-status.json),
-[remote refs](results/issue1-removal-2026-11-01/remote-refs-after.txt), and
+[remote refs](https://github.com/matthew777777/RawLens/blob/16f1a03acc51a9246e905f1a5bbf320316f670e0/docs/refactor/results/issue1-removal-2026-11-01/remote-refs-after.txt), and
 [remote history scan](results/issue1-removal-2026-11-01/remote-history-verification.json).

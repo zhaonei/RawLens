@@ -141,6 +141,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         var displayP3: Boolean
         var jpeg: Boolean
         var exposureEv: Float
+        var basicTone: Int
         var agxPunchy: Float
         var agxContrast: Float
         var agxSaturation: Float
@@ -202,6 +203,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         override var displayP3 = false
         override var jpeg = false
         override var exposureEv = 0f
+        override var basicTone = 0
         override var agxPunchy = 0f
         override var agxContrast = 1f
         override var agxSaturation = 1f
@@ -254,6 +256,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         override var displayP3 = false
         override var jpeg = false
         override var exposureEv = 0f
+        override var basicTone = 0
         override var agxPunchy = 0f
         override var agxContrast = 1f
         override var agxSaturation = 1f
@@ -282,6 +285,8 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
     /** Latest zero-copy frame; superseded entries are closed, never queued. Guarded by [lock]. */
     private var gpuPending: GpuFrame? = null
     /** Sticky NEON fallback after repeated GPU failures; reset per session. */
+    /** Photo B&W preview: luma-folded colour matrices (see snapshotRenderState). */
+    @Volatile var monoPreview = false
     @Volatile private var gpuDisabledForSession = false
     /** GL-worker-only consecutive GPU failure count driving [gpuDisabledForSession]. */
     private var consecutiveGpuFailures = 0
@@ -379,6 +384,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
      */
     @Volatile var engineMode: VfEngineMode = VfEngineMode.AUTO
         private set
+    @Volatile private var basicTone = 0
     @Volatile private var agxPunchy = 0f
     @Volatile private var agxContrast = 1f
     @Volatile private var agxSaturation = 1f
@@ -522,6 +528,8 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
     private var gpuPositionLoc = -1
     private var gpuUvLoc = -1
     private var gpuJpegLoc = -1
+    private val aces2 = Aces2Gl()
+    private var gpuBasicToneLoc = -1
     private var gpuAgxPunchyLoc = -1
     private var gpuAgxContrastLoc = -1
     private var gpuAgxSaturationLoc = -1
@@ -553,6 +561,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
     private var positionLoc = -1
     private var uvLoc = -1
     private var jpegLoc = -1
+    private var basicToneLoc = -1
     private var agxPunchyLoc = -1
     private var agxContrastLoc = -1
     private var agxSaturationLoc = -1
@@ -887,6 +896,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
      */
     override fun setAgx(settings: JpegOutputSettings) {
         val resolved = settings.resolvedForPlatform()
+        basicTone = resolved.toneMapper.shaderMode
         agxPunchy = if (resolved.agxLook == AgxLook.PUNCHY) 1f else 0f
         agxContrast = resolved.agxContrast
         agxSaturation = resolved.agxSaturation
@@ -1015,8 +1025,10 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
                 halGains?.let { floatArrayOf(it.red, it.greenEven, it.greenOdd, it.blue) }
             )) {
                 runCatching {
-                    RawWhiteBalanceFallback.estimate(plane.buffer, plane.rowStride, plane.pixelStride,
-                        image.width, image.height, cfaInt, levels, white, RawWhiteBalanceFallback.locusFor(c))
+                    RawWhiteBalanceFallback.estimateDetailed(plane.buffer, plane.rowStride, plane.pixelStride,
+                        image.width, image.height, cfaInt, levels, white, RawWhiteBalanceFallback.locusFor(c),
+                        RawWhiteBalanceFallback.exposureEv100(result?.get(CaptureResult.SENSOR_EXPOSURE_TIME),
+                            result?.get(CaptureResult.SENSOR_SENSITIVITY), result?.get(CaptureResult.LENS_APERTURE)))
                 }.getOrNull()
             }
             if (wbFallbackNeutral != null && !wbFallbackLogged) {
@@ -1199,19 +1211,11 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
     private fun snapshotLens(
         c: CameraCharacteristics, result: CaptureResult?, imageWidth: Int, imageHeight: Int
     ): VfLensSnapshot {
-        if (LapisRootSession.spec(c)?.metadataVerified == true)
-            return VfLensSnapshot(null, 1, 1, 0, 0, imageWidth, imageHeight, false, null, null)
-        val alreadyApplied =
-            c.get(CameraCharacteristics.SENSOR_INFO_LENS_SHADING_APPLIED) == true
-        if (alreadyApplied) {
-            val a = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-            return VfLensSnapshot(
-                null, 1, 1,
-                a?.left ?: 0, a?.top ?: 0,
-                a?.right ?: imageWidth, a?.bottom ?: imageHeight,
-                false, null, null
-            )
+        val readout = LapisRootSession.spec(c)?.takeIf {
+            it.metadataVerified && it.width == imageWidth && it.height == imageHeight
         }
+        // SENSOR_INFO_LENS_SHADING_APPLIED only describes sensor-side correction.
+        // A returned map still describes residual correction (as in the save path).
         // 1 Hz re-verify: skip the per-frame gain-copy + content hash while a
         // snapshot is cached. Active bounds are session-invariant for one
         // characteristics instance, so the cached verdict stays exact.
@@ -1223,7 +1227,11 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         ) {
             return cachedSnap
         }
-        val active = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        // Verified root sessions return a residual map for the actual readout.
+        // Match the save path: span the complete buffer, including in-sensor
+        // crop modes, rather than stretching/cropping it using stale stock bounds.
+        val active = if (readout != null) Rect(0, 0, imageWidth, imageHeight)
+            else c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
         val left = active?.left ?: 0
         val top = active?.top ?: 0
         val right = active?.right ?: imageWidth
@@ -1567,12 +1575,19 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
             smoothCamToAces.copyInto(out.camToAces)
             smoothCamWhite.copyInto(out.camWhite)
         }
+        // B&W photo mode: project every matrix row onto luma so the existing
+        // shaders output grey. Zero extra GPU work (no pass, no branch).
+        if (monoPreview) {
+            foldLuma(out.matrix, LUMA_709)
+            foldLuma(out.camToAces, LUMA_AP1)
+        }
         // Snapshot the WYSIWYG render state with the frame so AgX slider moves
         // and RAW/JPEG switches never tear a frame in flight.
         out.jpeg = renderJpeg
         out.displayP3 = previewP3
         out.lensGreenRow = VfGpuImport.lensGreenRow(channels)
         out.exposureEv = previewExposureEv
+        out.basicTone = basicTone
         out.agxPunchy = agxPunchy
         out.agxContrast = agxContrast
         out.agxSaturation = agxSaturation
@@ -1666,6 +1681,8 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         glUniform1i(displayP3Loc, if (state.displayP3) 1 else 0)
         glUniform1i(jpegLoc, if (state.jpeg) 1 else 0)
         glUniform1f(exposureEvLoc, state.exposureEv)
+        glUniform1i(basicToneLoc, state.basicTone)
+        aces2.bind(program, state.basicTone)
         glUniform1f(agxPunchyLoc, state.agxPunchy)
         glUniform1f(agxContrastLoc, state.agxContrast)
         glUniform1f(agxSaturationLoc, state.agxSaturation)
@@ -2123,6 +2140,8 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
                     glUniform3fv(gpuCameraWhiteLoc, 1, frame.camWhite, 0)
                     glUniform1i(gpuDisplayP3Loc, if (frame.displayP3) 1 else 0)
                     glUniform1i(gpuJpegLoc, if (frame.jpeg) 1 else 0)
+                    glUniform1i(gpuBasicToneLoc, frame.basicTone)
+                    aces2.bind(gpuProgram, frame.basicTone)
                     glUniform1f(gpuAgxPunchyLoc, frame.agxPunchy)
                     glUniform1f(gpuAgxContrastLoc, frame.agxContrast)
                     glUniform1f(gpuAgxSaturationLoc, frame.agxSaturation)
@@ -2316,7 +2335,14 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
     private fun runVulkanSuperpixel(frame: GpuFrame, copy: Boolean): Int =
         runVulkanSuperpixel(frame, if (copy) VulkanTier.COPY else VulkanTier.BUFFER)
 
-    private fun runVulkanSuperpixel(frame: GpuFrame, tier: VulkanTier): Int {
+    // ADPF: dispatch + fence wait per preview frame against a 60 fps budget, so
+    // the OS lifts CPU/GPU-feeding clocks before the viewfinder drops frames.
+    private val vfHint = AdpfFrameHint(context, AdpfHint.frameNs(60))
+
+    private fun runVulkanSuperpixel(frame: GpuFrame, tier: VulkanTier): Int =
+        vfHint.measure { runVulkanSuperpixelUnhinted(frame, tier) }
+
+    private fun runVulkanSuperpixelUnhinted(frame: GpuFrame, tier: VulkanTier): Int {
         if (!vulkanInitialized) {
             val spv = loadVulkanSpv() ?: return VfVulkan.PIPELINE_FAILED
             val code = try {
@@ -2674,6 +2700,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         positionLoc = glGetAttribLocation(program, "position")
         uvLoc = glGetAttribLocation(program, "uv")
         jpegLoc = glGetUniformLocation(program, "u_jpeg")
+        basicToneLoc = glGetUniformLocation(program, "u_basic")
         agxPunchyLoc = glGetUniformLocation(program, "u_agxPunchy")
         agxContrastLoc = glGetUniformLocation(program, "u_agxContrast")
         agxSaturationLoc = glGetUniformLocation(program, "u_agxSaturation")
@@ -2778,6 +2805,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
             gpuPositionLoc = glGetAttribLocation(id, "position")
             gpuUvLoc = glGetAttribLocation(id, "uv")
             gpuJpegLoc = glGetUniformLocation(id, "u_jpeg")
+            gpuBasicToneLoc = glGetUniformLocation(id, "u_basic")
             gpuAgxPunchyLoc = glGetUniformLocation(id, "u_agxPunchy")
             gpuAgxContrastLoc = glGetUniformLocation(id, "u_agxContrast")
             gpuAgxSaturationLoc = glGetUniformLocation(id, "u_agxSaturation")
@@ -2826,7 +2854,9 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
     }
 
     private fun releaseGl() {
+        aces2.close()
         // Runs on the GL worker: release native Vulkan imports first, then our refs.
+        vfHint.close()
         try {
             VfVulkan.resetNative()
         } catch (_: Exception) {
@@ -2861,7 +2891,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         surface = EGL14.EGL_NO_SURFACE; eglContext = EGL14.EGL_NO_CONTEXT; display = EGL14.EGL_NO_DISPLAY
         gainsLoc = -1; colorLoc = -1; camToAcesLoc = -1; cameraWhiteLoc = -1; displayP3Loc = -1
         positionLoc = -1; uvLoc = -1
-        jpegLoc = -1; agxPunchyLoc = -1; agxContrastLoc = -1; agxSaturationLoc = -1; agxPurityLoc = -1
+        jpegLoc = -1; basicToneLoc = -1; agxPunchyLoc = -1; agxContrastLoc = -1; agxSaturationLoc = -1; agxPurityLoc = -1
         agxHueLoc = -1; agxShadowEvLoc = -1; agxHighlightEvLoc = -1; agxGamutLoc = -1
         highlightShoulderLoc = -1
         exposureEvLoc = -1
@@ -2873,7 +2903,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         gpuProgram = 0; gpuBayerTexture = 0; vkTexture = 0
         gpuGainsLoc = -1; gpuColorLoc = -1; gpuCamToAcesLoc = -1; gpuCameraWhiteLoc = -1
         gpuDisplayP3Loc = -1; gpuPositionLoc = -1; gpuUvLoc = -1
-        gpuJpegLoc = -1; gpuAgxPunchyLoc = -1; gpuAgxContrastLoc = -1; gpuAgxSaturationLoc = -1; gpuAgxPurityLoc = -1
+        gpuJpegLoc = -1; gpuBasicToneLoc = -1; gpuAgxPunchyLoc = -1; gpuAgxContrastLoc = -1; gpuAgxSaturationLoc = -1; gpuAgxPurityLoc = -1
         gpuAgxHueLoc = -1; gpuAgxShadowEvLoc = -1; gpuAgxHighlightEvLoc = -1; gpuAgxGamutLoc = -1
         gpuHighlightShoulderLoc = -1
         gpuExposureEvLoc = -1
@@ -2910,6 +2940,17 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
             if (value.isFinite() && value >= 0f) value else 1f
 
         /** CCM elements may be negative (off-diagonals); only non-finite is rejected. */
+        private val LUMA_709 = floatArrayOf(0.2126f, 0.7152f, 0.0722f)
+        private val LUMA_AP1 = floatArrayOf(0.2722287f, 0.6740818f, 0.0536895f)
+
+        /** Column-major 3x3 [m] := 1 * lumaᵀ * m, in place: every output row becomes Y. */
+        internal fun foldLuma(m: FloatArray, luma: FloatArray) {
+            for (col in 0..2) {
+                val y = luma[0] * m[col * 3] + luma[1] * m[col * 3 + 1] + luma[2] * m[col * 3 + 2]
+                m[col * 3] = y; m[col * 3 + 1] = y; m[col * 3 + 2] = y
+            }
+        }
+
         internal fun sanitizeCcmElement(value: Float, identity: Float): Float =
             if (value.isFinite()) value else identity
 

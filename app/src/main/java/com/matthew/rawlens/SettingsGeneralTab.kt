@@ -71,6 +71,47 @@ internal fun MainActivity.showGeneralSettings(p: SettingsPage) {
     fun markActive(active: Button) = p.markActive(active)
     val generalTab = p.tabs[0]
         content.removeAllViews()
+        content.addView(sectionTitle("Shutter"))
+        content.addView(SettingsSwitch(this).apply {
+            text = "Shutter sound"
+            isChecked = lensPreferences().getBoolean(KEY_SHUTTER_SOUND, true)
+            setOnCheckedChangeListener { _, enabled ->
+                lensPreferences().edit().putBoolean(KEY_SHUTTER_SOUND, enabled).apply()
+            }
+        })
+        content.addView(sectionDesc("Classic film SLR click. Follows Android silent/vibrate mode and system sound volume. Touch vibration follows Android's haptic feedback setting."))
+        val hapticsEnabled = lensPreferences().getBoolean(KEY_SHUTTER_HAPTICS, true)
+        val hapticsStrength = lensPreferences().getInt(
+            KEY_SHUTTER_HAPTICS_STRENGTH, DEFAULT_SHUTTER_HAPTICS_STRENGTH
+        ).coerceIn(0, 100)
+        val strengthLabel = sectionDesc("Vibration strength: $hapticsStrength%")
+        val strengthSlider = SettingsSlider(this).apply {
+            max = 100
+            progress = hapticsStrength
+            contentDescription = "Photo vibration strength"
+            isEnabled = hapticsEnabled
+            setOnSettingsSliderChangeListener(object : SettingsSlider.OnSettingsSliderChangeListener {
+                override fun onProgressChanged(seekBar: SettingsSlider, progress: Int, fromUser: Boolean) {
+                    strengthLabel.text = "Vibration strength: $progress%"
+                    if (fromUser) lensPreferences().edit().putInt(KEY_SHUTTER_HAPTICS_STRENGTH, progress).apply()
+                }
+                override fun onStartTrackingTouch(seekBar: SettingsSlider) = Unit
+                override fun onStopTrackingTouch(seekBar: SettingsSlider) = Unit
+            })
+        }
+        content.addView(SettingsSwitch(this).apply {
+            text = "Photo vibration"
+            isChecked = hapticsEnabled
+            setOnCheckedChangeListener { _, enabled ->
+                lensPreferences().edit().putBoolean(KEY_SHUTTER_HAPTICS, enabled).apply()
+                strengthSlider.isEnabled = enabled
+                strengthLabel.alpha = if (enabled) 1f else 0.5f
+            }
+        })
+        strengthLabel.alpha = if (hapticsEnabled) 1f else 0.5f
+        content.addView(strengthLabel)
+        content.addView(strengthSlider)
+        content.addView(sectionDesc("One vibration per photo or burst. 0% disables vibration. On phones without intensity control, strength adjusts pulse length."))
         content.addView(sectionTitle("RAW capture"))
         content.addView(Button(this).apply {
             text = "DNG sensor calibration: levels, noise, color"
@@ -101,7 +142,7 @@ internal fun MainActivity.showGeneralSettings(p: SettingsPage) {
         })
         content.addView(TextView(this).apply {
             tag = "settings-description"
-            text = "Android DngCreator is the default. AUTO falls back to patched TinyDNG only if the platform writer fails."
+            text = "Android DngCreator is the default. AUTO falls back to TinyDNG. Compatibility applies lens shading to single-frame Bayer pixels for editors such as RapidRAW: permanent correction, larger uncompressed 32-bit files, no JXL. It requires a shading map or shading already applied by the camera. It does not straighten distortion or change merged/AI DNG saves."
             setTextColor(getColor(R.color.text_secondary))
             textSize = 11f
         })
@@ -134,15 +175,22 @@ internal fun MainActivity.showGeneralSettings(p: SettingsPage) {
             textSize = 11f
         })
         content.addView(sectionTitle("Viewfinder"))
-        content.addView(p.kit.settingsCheck("ISP preview (instead of RAW viewfinder)", ispPreviewAlways()).apply {
+        content.addView(p.kit.settingsCheck("Pause camera while in Settings", pauseCameraInSettings()).apply {
+            setOnCheckedChangeListener { _, on ->
+                lensPreferences().edit().putBoolean(KEY_PAUSE_CAMERA_IN_SETTINGS, on).apply()
+                if (on) pauseCameraForSettings() else startCameraWhenReady()
+            }
+        })
+        content.addView(sectionDesc("Saves battery by closing the camera while Settings is open. Active recordings continue."))
+        content.addView(p.kit.settingsCheck("Always use ISP viewfinder", ispPreviewAlways()).apply {
             setOnCheckedChangeListener { _, checked ->
-                setIspPreviewSettings(checked, ispPreviewDuringMerge())
+                setIspPreviewAlways(checked)
                 setStatus(if (checked) "ISP PREVIEW • ON" else "ISP PREVIEW • OFF")
             }
         })
         content.addView(p.kit.sectionDesc(
             "Shows the camera's own ISP preview (no noise reduction, no sharpening) instead of " +
-                "the RAW viewfinder: less GPU, battery and heat while framing, but not the RAW " +
+                "the RAW viewfinder, including full-resolution capture: less GPU, battery and heat while framing, but not the RAW " +
                 "look. Some phones cannot run a preview stream together with RAW; they stay on " +
                 "the RAW viewfinder."
         ))

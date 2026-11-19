@@ -6,7 +6,7 @@ package com.matthew.rawlens
 import java.nio.ByteBuffer
 
 /**
- * JNI surface of `liblkrpipeline.so` (tools/lkr-pipeline): LK-Reloaded burst
+ * JNI surface of `liblkrpipeline.so` (tools/lkr-lite, LK-R Lite since 2026-11-14): LK-Reloaded burst
  * super-resolution (Lecouat, Ponce, Mairal, ICCV 2021) on Vulkan.
  *
  * [nativeMerge] reads the caller's direct uint16 RAW buffers in place and
@@ -19,6 +19,9 @@ internal object LkrBridge {
         System.loadLibrary("srpipeline")
         System.loadLibrary("lkrpipeline")
     }
+
+    /** Consumes diagnostics of the last merge on this calling thread, including failures. */
+    @JvmStatic external fun nativeLastProfile(): String
 
     /** Indices into the `stats` array filled by [nativeMerge]. */
     const val STAT_TILES = 0
@@ -81,7 +84,20 @@ internal object LkrBridge {
         tuning: FloatArray?, outWidth: Int, outHeight: Int
     ): ByteBuffer?
 
+    /** Per-merge switch; enabled strength is gated by the measured scene noise. */
+    @JvmStatic external fun nativeSetKernelNetDenoise(enabled: Boolean)
+
+    /** Settings -> Merge -> "Network": learned post-fit prior (NPU: MediaTek MDLA / Qualcomm Hexagon via
+     *  NNAPI; no NPU: Vulkan fallback). */
+    @JvmStatic external fun nativeSetPrior(enabled: Boolean)
+
+    /** A usable NPU for the network (MDLA / Hexagon through NNAPI, every op on that one device). */
+    @JvmStatic external fun nativeHasNpu(): Boolean
+
     @JvmStatic external fun nativeSetCacheDir(dir: String)
+
+    /** Builds every LK-R (LK-R Lite) pipeline into the persistent cache in [dir]; wall ms, -1 = no Vulkan. */
+    @JvmStatic external fun nativePrewarm(dir: String): Long
 
     /**
      * Learned per-device noise model (WaveletDenoiser store file, [iso]) for the next

@@ -12,6 +12,10 @@ import android.content.SharedPreferences
  * tuning as immediate merges; if those builders gain a knob, mirror it here.
  */
 internal object MergeScreenSettings {
+    /** New offline jobs produce a developed photo; explicit RAW choices stay persisted. */
+    fun outputFormat(value: String?): CaptureFormat =
+        CaptureFormat.entries.firstOrNull { it.name == value } ?: CaptureFormat.JPEG
+
     fun jpeg(prefs: SharedPreferences): JpegOutputSettings = JpegOutputSettings(
         activeDLighting = ActiveDLighting.fromName(prefs.getString(ActiveDLighting.PREFERENCE_KEY, null)),
         ultraHdr = prefs.getBoolean(MainActivity.KEY_JPEG_ULTRA_HDR, false),
@@ -24,6 +28,7 @@ internal object MergeScreenSettings {
             prefs.getString(MainActivity.KEY_JPEG_DEMOSAIC, null)
         ),
         chromaCleanup = ChromaCleanup.read(prefs),
+        toneMapper = PhotoToneMapper.fromPreference(prefs.getString(PhotoToneMapper.PREFERENCE_KEY, null)),
         agxPurityBoost = prefs.getFloat(MainActivity.KEY_JPEG_AGX_PURITY, 1f),
         agxLook = AgxLook.fromPreference(prefs.getString(AgxLook.PREFERENCE_KEY, null)),
         agxContrast = prefs.getFloat(MainActivity.KEY_JPEG_AGX_CONTRAST, 1f),

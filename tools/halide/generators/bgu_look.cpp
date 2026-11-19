@@ -210,6 +210,13 @@ public:
                    camToAces_(2, row) * camW.b;
         };
         Vec3 toAces{acesRow(0), acesRow(1), acesRow(2)};
+        // CameraToneBalance: same bounded RGB scale as the CPU/GLSL paths.
+        Expr peak = max(0.0f, max(toAces.r, max(toAces.g, toAces.b)));
+        Expr balanceT = clamp((peak - 0.18f) / 0.42f, 0.0f, 1.0f);
+        Expr balanceFade = 1.0f - balanceT * balanceT * (3.0f - 2.0f * balanceT);
+        Expr toe = 0.06f / (0.06f + peak);
+        Expr balanceGain = select(peak >= 0.6f, 1.0f, 1.0f + 3.0f * toe * toe * balanceFade);
+        toAces = Vec3{toAces.r * balanceGain, toAces.g * balanceGain, toAces.b * balanceGain};
         Vec3 rec = matVecConst(ACESCG_TO_REC2020, toAces);
         Vec3 scene{max(rec.r, 0.0f), max(rec.g, 0.0f), max(rec.b, 0.0f)};
         auto shoulder = [&](Expr s) {
@@ -292,6 +299,25 @@ public:
             srgbOetfCh(clamp(vg.b, 0.0f, 1.0f)),
         };
 
+        // JPEG mode 3: Basic, in output primaries before the transfer curve.
+        Vec3 basicSrgb = matVecConst(REC2020_TO_SRGB, rec);
+        Vec3 basicP3 = matVecConst(REC2020_TO_DISPLAY_P3, rec);
+        Vec3 basicDisplay{select(displayP3_ != 0, basicP3.r, basicSrgb.r),
+                          select(displayP3_ != 0, basicP3.g, basicSrgb.g),
+                          select(displayP3_ != 0, basicP3.b, basicSrgb.b)};
+        Expr basicPeak = max(basicDisplay.r, max(basicDisplay.g, basicDisplay.b));
+        Expr t = max(basicPeak - 0.6f, 0.0f);
+        Expr basicCompressed = 0.6f + t / (1.0f + t / 0.4f);
+        Expr basicScale = select(basicPeak > 0.6f,
+            lerp(1.0f, basicCompressed / max(basicPeak, 1e-6f), clamp(highlightShoulder_, 0.0f, 1.0f)), 1.0f);
+        auto basicChannel = [&](Expr srgb, Expr p3) {
+            Expr linear = clamp(select(displayP3_ != 0, p3, srgb) * basicScale, 0.0f, 1.0f);
+            Expr x = pow(srgbOetfCh(linear), 1.0f / 1.1f);
+            return 0.25f * x + 0.75f * x * x * (3.0f - 2.0f * x);
+        };
+        enc = Vec3{select(jpeg_ == 3, basicChannel(basicSrgb.r, basicP3.r), enc.r),
+                   select(jpeg_ == 3, basicChannel(basicSrgb.g, basicP3.g), enc.g),
+                   select(jpeg_ == 3, basicChannel(basicSrgb.b, basicP3.b), enc.b)};
         Expr isJpeg = jpeg_ != 0;
         developed_(x, y, c) =
             select(c == 0, select(isJpeg, enc.r, rawOutR),

@@ -206,6 +206,8 @@ class MainActivity : Activity() {
     /** Settings JSON awaiting the export picker result; cleared once written or cancelled. */
     internal val settingsTransfer =
         SettingsTransfer(this, SETTINGS_EXPORT_REQUEST, SETTINGS_IMPORT_REQUEST) { setStatus(it) }
+    internal val lensProfilesTransfer =
+        SettingsTransfer(this, LENS_PROFILES_EXPORT_REQUEST, LENS_PROFILES_IMPORT_REQUEST, lensProfiles = true) { setStatus(it) }
     /** Update consent, release checks, download and install ([UpdateFlow]). */
     internal val updateFlow = UpdateFlow(this, UPDATE_INSTALL_SOURCES) { setStatus(it) }
     internal var videoCrop = VideoCrop.OPEN_GATE
@@ -216,6 +218,8 @@ class MainActivity : Activity() {
     private var videoAudioPeak = 0f
     /** Stereo meter peak hold [L, R] in dBFS. */
     private val videoAudioPeakDb = floatArrayOf(AudioPcmRecorder.METER_MIN_DB, AudioPcmRecorder.METER_MIN_DB)
+
+    private var photoCaptureFeedback: PhotoCaptureFeedback? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -239,9 +243,22 @@ class MainActivity : Activity() {
 
         val viewfinder = findViewById<AutoFitSurfaceView>(R.id.viewfinder)
         val shutter = findViewById<View>(R.id.shutter)
+        photoCaptureFeedback = PhotoCaptureFeedback(this)
         bindViewsAndOverlays()
         createController(dngInfo, sensorInfo, viewfinder, shutter)
-        wireZoomSlider()
+        controller.onPhotoCaptureAccepted = {
+            runOnUiThread {
+                if (activityResumed && !isVideoMode) {
+                    val preferences = lensPreferences()
+                    photoCaptureFeedback?.play(
+                        shutter,
+                        preferences.getBoolean(KEY_SHUTTER_SOUND, true),
+                        preferences.getBoolean(KEY_SHUTTER_HAPTICS, true),
+                        preferences.getInt(KEY_SHUTTER_HAPTICS_STRENGTH, DEFAULT_SHUTTER_HAPTICS_STRENGTH)
+                    )
+                }
+            }
+        }
         applyControllerSettings(shutter)
         wireModeAndQuickControls(shutter)
         wireTouchAndManualControls(viewfinder)
@@ -476,67 +493,6 @@ class MainActivity : Activity() {
     }
 
     /** onCreate stage: The camera controller and its UI callbacks (status, scopes, focus, route). */
-    /**
-     * Zoom track wiring. The slider owns no camera state: it reports multipliers and is fed
-     * the controller's current one, so lens switching, snapping and the crop all stay in
-     * RawCameraController. Detents are re-read whenever the slider is touched into a lens,
-     * because rawCameraIds is only known once the camera has opened.
-     */
-    private fun wireZoomSlider() {
-        val slider = findViewById<ZoomSliderView>(R.id.zoomSlider)
-        if (slider == null) {
-            android.util.Log.w("Spektra", "zoom slider is not in this layout; zoom stays off")
-            return
-        }
-        if (!::controller.isInitialized) return
-        slider.setDetents(controller.zoomDetents())
-        slider.onZoom = { multiplier -> controller.setUiZoom(multiplier) }
-        // Lens switches restart the session (black frame + AF re-hunt), so they only happen
-        // once the finger lifts instead of on every pixel of the drag.
-        slider.onZoomSettled = { multiplier -> controller.commitUiZoom(multiplier) }
-        // The visible preview is whichever surface the active route draws into: the ISP
-        // SurfaceView, the RAW GPU viewfinder, or the BGU one. All of them get the same
-        // transform; the overlays (focus, level, guides, scopes) deliberately do not, or the
-        // framing guides would zoom with the picture.
-        controller.setPreviewZoomApplier { scale ->
-            for (id in PREVIEW_SURFACE_IDS) {
-                val view = findViewById<View>(id) ?: continue
-                if (view.width > 0 && view.height > 0) {
-                    view.pivotX = view.width / 2f
-                    view.pivotY = view.height / 2f
-                }
-                view.scaleX = scale
-                view.scaleY = scale
-            }
-        }
-        controller.setUiZoomListener { multiplier ->
-            slider.setDetents(controller.zoomDetents())
-            slider.setZoom(multiplier)
-        }
-        // The bottom panel's height depends on the mode and on how many lenses the row
-        // holds, so the 252dp in the layout is only a fallback: once both views are
-        // measured, sit the track directly above the panel with a small gap.
-        slider.post {
-            val panel = findViewById<View>(R.id.controlPanel)
-            val root = slider.parent as? View
-            if (panel != null && root != null && panel.height > 0) {
-                val gap = (8 * resources.displayMetrics.density).toInt()
-                val params = slider.layoutParams as FrameLayout.LayoutParams
-                val margin = (root.height - panel.top + gap).coerceAtLeast(gap)
-                if (params.bottomMargin != margin) {
-                    params.bottomMargin = margin
-                    slider.layoutParams = params
-                }
-            }
-            android.util.Log.i(
-                "Spektra",
-                "zoom slider wired: detents=" + controller.zoomDetents() +
-                    " visible=" + (slider.visibility == View.VISIBLE) +
-                    " size=" + slider.width + "x" + slider.height,
-            )
-        }
-    }
-
     private fun createController(dngInfo: TextView, sensorInfo: TextView, viewfinder: AutoFitSurfaceView, shutter: View) {
         controller = RawCameraController(this, viewfinder,
             { message -> runOnUiThread { setStatus(message) } },
@@ -912,6 +868,7 @@ class MainActivity : Activity() {
         }
         wireVideoQuickControls()
         findViewById<View>(R.id.dLightingQuick).setOnClickListener { cycleQuickDLighting() }
+        findViewById<View>(R.id.monoQuick).setOnClickListener { cycleQuickMono() }
         levelQuick.setOnClickListener { toggleLevel() }
         aeMeteringQuick.setOnClickListener { cycleAeMeteringMode() }
         hdrPlusQuick.setOnClickListener { toggleHdrPlus() }
@@ -1167,6 +1124,13 @@ class MainActivity : Activity() {
             handleEncodedVideoLutResult(resultCode, data)
             return
         }
+        if (requestCode == LENS_PROFILES_EXPORT_REQUEST) {
+            lensProfilesTransfer.onExportResult(resultCode, data)
+            return
+        } else if (requestCode == LENS_PROFILES_IMPORT_REQUEST) {
+            lensProfilesTransfer.onImportResult(resultCode, data)
+            return
+        }
         if (requestCode == SETTINGS_EXPORT_REQUEST) {
             settingsTransfer.onExportResult(resultCode, data)
             return
@@ -1287,12 +1251,17 @@ class MainActivity : Activity() {
         return super.onKeyDown(keyCode, event)
     }
 
-    private fun startCameraWhenReady() {
+    internal fun startCameraWhenReady() {
         // The recorder owns the camera while video state exists (rolling or
         // stopping): a stills start here would STEAL the session and kill the
         // take silently (no frames, audio keeps running). Never touch it.
         if (videoRecording || videoRecorder != null || encodedVideoRecorder != null) {
             Log.i(LOG_TAG, "startCameraWhenReady suppressed: video owns camera")
+            return
+        }
+        // Settings is fullscreen: the camera stays closed until it is dismissed.
+        if (settingsDialog != null && pauseCameraInSettings()) {
+            Log.i(LOG_TAG, "startCameraWhenReady suppressed: settings open")
             return
         }
         if (activityResumed && cameraViewportReady &&
@@ -1352,6 +1321,8 @@ class MainActivity : Activity() {
     }.getOrDefault("camera=? gps=?")
 
     override fun onDestroy() {
+        photoCaptureFeedback?.close()
+        photoCaptureFeedback = null
         recordingTools.close()
         gpsProvider?.close()
         lensDiscovery.close()
@@ -1913,7 +1884,7 @@ class MainActivity : Activity() {
 
     private fun triggerCapture(shutter: View, forceBurst: Boolean) {
         closeFloatingPanels()
-        shutter.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+        if (isVideoMode) shutter.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
         shutter.animate().cancel()
         shutter.animate().scaleX(0.9f).scaleY(0.9f).setDuration(70L).withEndAction {
             shutter.animate().scaleX(1f).scaleY(1f).setDuration(110L).start()
@@ -2309,6 +2280,7 @@ class MainActivity : Activity() {
             return
         }
         val recorder = RawVideoRecorder(manager, cameraId, size, this, lapisRecordingLease).apply {
+            fps = rawVideoFpsPref()
             crop = videoCrop
             compressionCodec = CrawWriter.normalizeCodec(lensPreferences().getInt(KEY_VIDEO_CODEC, CrawWriter.CODEC_LIVE))
             binning = lensPreferences().getBoolean(KEY_VIDEO_BINNING, false)
@@ -2436,8 +2408,8 @@ class MainActivity : Activity() {
         val recorder = EncodedVideoRecorder(manager, cameraId, applicationContext, lapisRecordingLease).apply {
             captureGps = currentGpsLocation()
             audioEnabled = withAudio
-            // Direct single-file recording never starts a second re-encode/sidecar.
-            stabEnabled = false
+            // Gyro + row-timing sidecar only when a stabilized copy is wanted.
+            stabEnabled = stabOutputMode() != StabOutputMode.OG_ONLY
             exposureEv = encodedVideoGainPref()
             saturation = encodedVideoSaturationPref()
             vibrance = encodedVideoVibrancePref()
@@ -2645,15 +2617,84 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 Log.e(LOG_TAG, "Recording finalization failed at ${destination?.uri}", e)
             }
-            runOnUiThread { finishEncodedVideoStop(stats, saved, rearmPreview, afterStop) }
+            // Post-record stabilization, still on the stop thread (camera
+            // closed, so the warp has the GPU). Any failure keeps the OG.
+            var stabNote: String? = null
+            val sidecar = recorder.stabSidecarFile
+            val origin = saved
+            if (stats != null && origin != null && destination != null && sidecar != null) {
+                val r = stabilizeDirectTake(origin, destination.name, sidecar, stats)
+                stabNote = r.first
+                if (r.second != null) saved = r.second
+            } else if (stats != null && stabOutputMode() != StabOutputMode.OG_ONLY) {
+                stabNote = "NO GYRO • OG KEPT"
+            }
+            val note = stabNote
+            runOnUiThread { finishEncodedVideoStop(stats, saved, rearmPreview, afterStop, note) }
         }, "EncodedVideoStop").start()
+    }
+
+    /**
+     * Warps a finished direct take into `<stem>_STAB.mp4` in the same
+     * recording folder (cache file, then one copy into a new destination).
+     * Returns the status note and, for "Stabilized only" success (original
+     * deleted), the URI to report as saved. Stop thread; never throws.
+     */
+    private fun stabilizeDirectTake(
+        origin: Uri, originName: String, sidecar: File, stats: EncodedVideoRecorder.Stats,
+    ): Pair<String, Uri?> {
+        val mode = stabOutputMode()
+        val work = File(File(cacheDir, "stab").apply { mkdirs() }, originName.substringBeforeLast('.') + "_STAB.mp4")
+        try {
+            if (!stats.hasStabGyro || !sidecar.isFile) return "NO GYRO • OG KEPT" to null
+            runOnUiThread { setStatus("STABILIZING…") }
+            val report = EncodedVideoStabilizer(applicationContext).stabilize(
+                origin, sidecar, work, EncodedVideoProfile.fromName(stats.profile)
+            ) { done, total ->
+                if (done % 30 == 0) runOnUiThread { setStatus("STABILIZING $done/$total") }
+            }
+            Log.i(LOG_TAG, "encoded-video stab ok=${report.ok} warped=${report.framesWarped} " +
+                "degraded=${report.framesDegraded} ms=${report.elapsedMs} err=${report.error}")
+            if (!report.ok || !work.isFile || work.length() <= 0) return "STAB FAILED • OG KEPT" to null
+            val out = DirectRecordingOutput.create(this, work.name, "video/mp4")
+            val copied = try {
+                java.io.FileInputStream(work).use { input ->
+                    java.io.FileOutputStream(out.fileDescriptor).use { input.copyTo(it, 1 shl 20) }
+                }
+                out.finish(true)
+            } catch (e: Exception) {
+                Log.w(LOG_TAG, "stabilized copy failed", e)
+                out.close()
+                false
+            }
+            if (!copied) return "STAB SAVE FAILED • OG KEPT" to null
+            if (mode == StabOutputMode.STABILIZED_ONLY && DirectRecordingOutput.delete(this, origin)) {
+                return "STAB ${report.framesWarped}F" to out.uri
+            }
+            return "STAB ${report.framesWarped}F" to null
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "encoded-video stabilization failed", e)
+            return "STAB FAILED • OG KEPT" to null
+        } finally {
+            try { work.delete() } catch (_: Exception) {}
+            // `adb shell setprop debug.rawlens.stab_keep 1` keeps the sidecar
+            // (cache/stab_keep/) for host-side analysis of a take.
+            try {
+                val keep = Class.forName("android.os.SystemProperties")
+                    .getMethod("get", String::class.java)
+                    .invoke(null, "debug.rawlens.stab_keep") == "1"
+                if (keep) sidecar.copyTo(File(File(cacheDir, "stab_keep").apply { mkdirs() }, sidecar.name), true)
+            } catch (_: Exception) {}
+            try { sidecar.delete() } catch (_: Exception) {}
+        }
     }
 
     private fun finishEncodedVideoStop(
         stats: EncodedVideoRecorder.Stats?,
         saved: Uri?,
         rearmPreview: Boolean,
-        afterStop: (() -> Unit)?
+        afterStop: (() -> Unit)?,
+        stabNote: String? = null,
     ) {
         encodedVideoRecorder = null
         updateQuickControls()
@@ -2676,7 +2717,8 @@ class MainActivity : Activity() {
                     " • ${stats.profile}" +
                     (if (stats.hasAudio) "" else " • SILENT") +
                     (if (stats.framesDropped > 0) " • D${stats.framesDropped}" else "") +
-                    (if (stats.fallbackWaits > 0) " • FB${stats.fallbackWaits}" else "")
+                    (if (stats.fallbackWaits > 0) " • FB${stats.fallbackWaits}" else "") +
+                    (if (stabNote != null) " • $stabNote" else "")
             )
             Log.i(
                 LOG_TAG, "encoded-video saved sensor=${stats?.sensorSize} " +
@@ -2697,7 +2739,7 @@ class MainActivity : Activity() {
                     "fenceAvg=${"%.1f".format(stats?.fenceWaitMsAvg ?: 0f)}ms " +
                     "fenceMax=${"%.1f".format(stats?.fenceWaitMsMax ?: 0f)}ms " +
                     "shaded=${stats?.shadedFrames} " +
-                    "stabGyro=${stats?.stabGyroSamples ?: 0} " +
+                    "stabGyro=${stats?.stabGyroSamples ?: 0} stab=${stabNote ?: "-"} " +
                     "destination=$saved " +
                     "file=${"%.1f".format(mb)}MB"
             )
@@ -2924,15 +2966,16 @@ class MainActivity : Activity() {
     internal fun encodedVideoVibrancePref(): Float =
         lensPreferences().getFloat(KEY_ENCODED_VIDEO_VIBRANCE, 0f).coerceIn(-1f, 1f)
 
-    /** Persisted Encoded Video frame rate: 24 or 30, 30 out of the box. Any
+    /** Persisted Encoded Video frame rate: 24, 30 or 60, 30 out of the box. Any
      * other stored value heals to 30. Applies to the next take (encoder
      * format + AE range are fixed at take start). */
     internal fun encodedVideoFpsPref(): Int =
-        if (lensPreferences().getInt(KEY_ENCODED_VIDEO_FPS, EncodedVideoProbe.FPS) == 24) 24 else 30
+        lensPreferences().getInt(KEY_ENCODED_VIDEO_FPS, EncodedVideoProbe.FPS).takeIf { it in listOf(24,30,60) } ?: 30
 
     internal fun cycleEncodedVideoFps() {
         if (videoRecording) return
-        val next = if (encodedVideoFpsPref() == 24) 30 else 24
+        val rates=listOf(24,30,60)
+        val next = rates[(rates.indexOf(encodedVideoFpsPref())+1)%rates.size]
         lensPreferences().edit().putInt(KEY_ENCODED_VIDEO_FPS, next).apply()
         refreshVideoAudioDescription()
         refreshVideoSensorInfo()
@@ -3011,7 +3054,7 @@ class MainActivity : Activity() {
 
     /** Blackmagic-style timecode HH:MM:SS:FF at the record rate. */
     private fun videoTimecode(elapsedMs: Long): String {
-        val fps = if (encodedVideoEnabled) encodedVideoFpsPref() else RawVideoRecorder.FPS
+        val fps = if (encodedVideoEnabled) encodedVideoFpsPref() else rawVideoFpsPref()
         val frames = elapsedMs * fps / 1000
         val ff = (frames % fps).toInt()
         val totalSeconds = frames / fps
@@ -3119,7 +3162,7 @@ class MainActivity : Activity() {
             else -> "FULL SENSOR"
         }
         val binTag = if (binned) " • BIN" else ""
-        findViewById<TextView>(R.id.sensorInfo)?.text = "$dims • ${RawVideoRecorder.FPS}FPS"
+        findViewById<TextView>(R.id.sensorInfo)?.text = "$dims • ${rawVideoFpsPref()}FPS"
         findViewById<TextView>(R.id.dngInfo)?.text =
             "CRAW • ${videoCrop.label.uppercase(Locale.US)}$binTag"
     }
@@ -3154,6 +3197,11 @@ class MainActivity : Activity() {
             .getOrDefault(emptyList())).distinct()
         for (id in ids) {
             val chars = resolveVideoCameraRoute(manager, id)?.characteristics ?: continue
+            val rootMode=LapisRootProfile.mode(this)
+            if(id=="0" && LapisRootSession.Spec(rootMode).video) {
+                val spec=LapisRootSession.Spec(rootMode)
+                return id to android.util.Size(spec.width,spec.height)
+            }
             val size = chars.get(android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
                 ?.getOutputSizes(android.graphics.ImageFormat.RAW_SENSOR)
                 ?.maxByOrNull { it.width * it.height }
@@ -3180,7 +3228,7 @@ class MainActivity : Activity() {
         )
         return "{\"UniqueCameraModel\":\"${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\"," +
             "\"width\":${size.width},\"height\":${size.height}," +
-            "\"crop\":\"${videoCrop.name}\",\"fps\":${RawVideoRecorder.FPS}," +
+            "\"crop\":\"${videoCrop.name}\",\"fps\":${rawVideoFpsPref()}," +
             (if (bin) "\"binning\":\"" +
                 (if (lensPreferences().getString(KEY_VIDEO_BINNING_MODE, BINNING_RGB) == BINNING_CFA) "remosaic2x2" else "rgb2x2") +
                 "\"," else "") +
@@ -3320,14 +3368,14 @@ class MainActivity : Activity() {
         // Controller may be saving (LOCKED): keep the tile honest by
         // only clearing on success.
         if (applyMfsrSettings(mfsrSettings.copy(enabled = false))) {
-            Log.i(LOG_TAG, "MFSR enabled=false")
+            Log.i(LOG_TAG, "${mfsrSettings.label} enabled=false")
             updateQuickControls()
         }
     }
 
     internal fun applyMfsrSettings(settings: MfsrSettings): Boolean {
         if (!controller.setMfsrSettings(settings)) {
-            setStatus("MFSR LOCKED • SAVING")
+            setStatus("${mfsrSettings.label} LOCKED • SAVING")
             return false
         }
         mfsrSettings = settings
@@ -3442,11 +3490,13 @@ class MainActivity : Activity() {
     /** Badge-style pairing label: developed container plus DNG when paired. */
     private fun captureBadgeLabel(): String =
         when (redmiRootMode()) {
+            LapisRootProfile.Mode.HEXADECA_200 -> "200→50 MP • DNG"
             LapisRootProfile.Mode.FULL -> "50 MP • " + if (captureFormat.includesJpeg) developedFormat.badgeLabel(captureFormat.includesDng) else "DNG"
             LapisRootProfile.Mode.DCG14 -> "DCG14 • AUTO AE • " + if (captureFormat.includesJpeg) developedFormat.badgeLabel(captureFormat.includesDng) else "DNG"
             LapisRootProfile.Mode.CROP_4X -> "4× • " + if (captureFormat.includesJpeg) developedFormat.badgeLabel(captureFormat.includesDng) else "DNG"
             LapisRootProfile.Mode.CROP_2X -> "2× • " + if (captureFormat.includesJpeg) developedFormat.badgeLabel(captureFormat.includesDng) else "DNG"
-            LapisRootProfile.Mode.DCG14 -> "DCG14 • " + if (captureFormat.includesJpeg) developedFormat.badgeLabel(captureFormat.includesDng) else "DNG"
+            LapisRootProfile.Mode.VIDEO60 -> "9.4 MP • RAW10 • " + if (captureFormat.includesJpeg) developedFormat.badgeLabel(captureFormat.includesDng) else "DNG"
+            LapisRootProfile.Mode.CROP_2X_DSG -> "2× DSG • AUTO AE • " + if (captureFormat.includesJpeg) developedFormat.badgeLabel(captureFormat.includesDng) else "DNG"
             LapisRootProfile.Mode.NORMAL -> if (captureFormat.includesJpeg)
                 developedFormat.badgeLabel(captureFormat.includesDng) else "DNG"
         }
@@ -3492,7 +3542,7 @@ class MainActivity : Activity() {
         rawVfDebugOverlay.contentDescription =
             "RAW viewfinder engine ${mode.name}. Tap to switch the GPU / CPU / BGU / BGU-CPU engine."
         vfEngineButton?.apply {
-            text = if (mode == VfEngineMode.BGU_CPU) "BGU\nCPU" else mode.name
+            text = chipCaption(if (mode == VfEngineMode.BGU_CPU) "BGU·CPU" else mode.name, "RAW VF")
             contentDescription = rawVfDebugOverlay.contentDescription
         }
     }
@@ -3515,16 +3565,14 @@ class MainActivity : Activity() {
     }
 
     internal fun ispPreviewAlways(): Boolean = lensPreferences().getBoolean(KEY_ISP_PREVIEW_ALWAYS, false)
-    internal fun ispPreviewDuringMerge(): Boolean = lensPreferences().getBoolean(KEY_ISP_PREVIEW_MERGE, false)
 
-    internal fun setIspPreviewSettings(always: Boolean, duringMerge: Boolean) {
-        lensPreferences().edit().putBoolean(KEY_ISP_PREVIEW_ALWAYS, always)
-            .putBoolean(KEY_ISP_PREVIEW_MERGE, duringMerge).apply()
+    internal fun setIspPreviewAlways(always: Boolean) {
+        lensPreferences().edit().putBoolean(KEY_ISP_PREVIEW_ALWAYS, always).apply()
         applyIspPreviewSettings()
     }
 
     private fun applyIspPreviewSettings() =
-        controller.setIspPreview(ispPreviewAlways(), ispPreviewDuringMerge())
+        controller.setIspPreviewAlways(ispPreviewAlways())
 
     /** Recording fan-out target: the same routed engine [applyVfRoute] shows. */
     private fun recorderViewfinder(isBgu: Boolean): VfEngine? =
@@ -3789,6 +3837,7 @@ class MainActivity : Activity() {
             lensPreferences().getString(KEY_JPEG_DEMOSAIC, null)
         ),
         chromaCleanup = ChromaCleanup.read(lensPreferences()),
+        toneMapper = PhotoToneMapper.fromPreference(lensPreferences().getString(PhotoToneMapper.PREFERENCE_KEY, null)),
         agxPurityBoost = lensPreferences().getFloat(KEY_JPEG_AGX_PURITY, 1f),
         agxLook = AgxLook.fromPreference(lensPreferences().getString(AgxLook.PREFERENCE_KEY, null)),
         agxContrast = lensPreferences().getFloat(KEY_JPEG_AGX_CONTRAST, 1f),
@@ -3808,7 +3857,8 @@ class MainActivity : Activity() {
         highlightHeadroom = lensPreferences().getFloat(KEY_JPEG_HIGHLIGHT_HEADROOM, 1f),
         highlightSoftHeadroom = lensPreferences().getFloat(KEY_JPEG_SKY_PROTECTION, 0.85f),
         highlightShoulder = lensPreferences().getFloat(KEY_JPEG_HIGHLIGHT_SHOULDER, 1f),
-        hlReconstruction = HighlightReconstructionDefaults.read(lensPreferences())
+        hlReconstruction = HighlightReconstructionDefaults.read(lensPreferences()),
+        mono = MonoSettings.read(lensPreferences())
     ).resolvedForPlatform()
 
     /** JPEG XL container options (darktable parity); defaults resolve to 16-bit lossless. */
@@ -4238,11 +4288,11 @@ class MainActivity : Activity() {
 
     private fun refreshRawExposureToggle() {
         findViewById<TextView>(R.id.rawExposureToggle).apply {
-            text = when (rawExposureSettings.overlay) {
+            text = chipCaption(when (rawExposureSettings.overlay) {
                 RawExposureOverlayMode.OFF -> "OFF"
                 RawExposureOverlayMode.ZEBRAS -> "ZEBRA"
                 RawExposureOverlayMode.FALSE_COLOR -> "FALSE"
-            }
+            }, "OVERLAY")
             isSelected = rawExposureSettings.overlay != RawExposureOverlayMode.OFF
             contentDescription = "RAW exposure assist: ${rawExposureSettings.overlay.label}. Tap to cycle Off, Zebra, False colour."
         }
@@ -4309,7 +4359,7 @@ class MainActivity : Activity() {
         val sharp = mfsrQuick
         val hdrPlus = hdrPlusQuick
         val ettr = ettrQuick
-        if (dualRawEnabled && controller.activeCameraId() != "0") dualRawEnabled = false
+        if (dualRawEnabled && !controller.supportsDualRaw()) dualRawEnabled = false
         release.isEnabled = !dualRawEnabled
         release.alpha = if (dualRawEnabled) .4f else 1f
         grid.text = "GRID\n${if (gridEnabled) "THIRDS" else "OFF"}"
@@ -4376,6 +4426,14 @@ class MainActivity : Activity() {
             contentDescription = "Active D-Lighting ${lighting.label}. Tap to cycle Off, Low, Normal, High, Extra High."
             setQuickTileState(this, lighting != ActiveDLighting.OFF)
         }
+        findViewById<TextView>(R.id.monoQuick).apply {
+            val mono = jpegOutputSettings().mono.mode
+            visibility = if (isVideoMode) View.GONE else View.VISIBLE
+            text = "B&W\n${mono.label.uppercase(Locale.US)}"
+            contentDescription = "Black and white ${mono.label}. Tap to cycle Off, Detail, Clean."
+            setQuickTileState(this, mono.enabled)
+        }
+        applyMonoPreview()
         setQuickTileState(grid, gridEnabled)
         setQuickTileState(histogram, histogramEnabled)
         setQuickTileState(level, levelEnabled)
@@ -4460,6 +4518,8 @@ class MainActivity : Activity() {
         const val LOCATION_PERMISSION = 43
         const val SIDECAR_TREE_REQUEST = 44
         private const val RECORDING_TREE_REQUEST = 0x5246
+        private const val LENS_PROFILES_EXPORT_REQUEST = 0x4c50
+        private const val LENS_PROFILES_IMPORT_REQUEST = 0x4c51
         const val SETTINGS_EXPORT_REQUEST = 45
         const val SETTINGS_IMPORT_REQUEST = 46
         const val UPDATE_INSTALL_SOURCES = 47
@@ -4521,7 +4581,6 @@ class MainActivity : Activity() {
         // Future SR hook: KEY_RAW_SR_ENABLED / KEY_RAW_SR_DNG_MODE here.
         const val KEY_ZSL_HYBRID_TOPUP = "zsl_hybrid_topup"
         const val KEY_ISP_PREVIEW_ALWAYS = "isp_preview_always"
-        const val KEY_ISP_PREVIEW_MERGE = "isp_preview_during_merge"
         const val KEY_DYNAMIC_EXPOSURE = "dynamic_exposure"
         const val KEY_DYNAMIC_EXPOSURE_BALANCE = "dynamic_exposure_balance"
         const val KEY_DYNAMIC_EXPOSURE_ISO_LIMIT = "dynamic_exposure_iso_limit"
@@ -4594,12 +4653,4 @@ class MainActivity : Activity() {
         const val MAX_RAW_ZSL_FRAMES = 59
         const val DEFAULT_RAW_ZSL_FRAME_COUNT = 16
     }
-
 }
-
-/** Views that show the live preview, in the order the routes use them. */
-private val PREVIEW_SURFACE_IDS = intArrayOf(
-    R.id.viewfinder,
-    R.id.rawViewfinder,
-    R.id.bguViewfinder,
-)
