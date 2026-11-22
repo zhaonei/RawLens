@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // BGU viewfinder: the low-resolution "operator". Evaluates the full VF look on
+// Highlight compression adapted from Khronos PBR Neutral (2024 The Khronos Group, Inc.; Apache-2.0).
 // one low-res quad texel: WB gains + CCM + Reinhard + gamma in RAW mode, or
 // the calibrated camera-to-ACEScg + AgX + gamut + sRGB OETF chain in JPEG mode.
 //
@@ -108,6 +109,8 @@ public:
     Input<float> agxHighlightEv_{"agxHighlightEv"};
     Input<float> agxGamut_{"agxGamut"};
     Input<float> highlightShoulder_{"highlightShoulder"};
+    Input<float> shadowLift_{"shadowLift"};
+    Input<float> highlightRecovery_{"highlightRecovery"};
     Input<int> displayP3_{"displayP3"};
     // Lens geometry: sensor quad origin of low-res texel (0,0), sensor-pixel
     // step per low-res texel, active array, green-row parity, apply flag.
@@ -215,7 +218,10 @@ public:
         Expr balanceT = clamp((peak - 0.18f) / 0.42f, 0.0f, 1.0f);
         Expr balanceFade = 1.0f - balanceT * balanceT * (3.0f - 2.0f * balanceT);
         Expr toe = 0.06f / (0.06f + peak);
-        Expr balanceGain = select(peak >= 0.6f, 1.0f, 1.0f + 3.0f * toe * toe * balanceFade);
+        Expr balanceGain = select(peak >= 0.6f, 1.0f, 1.0f + 3.0f * clamp(shadowLift_, 0.0f, 1.0f) * toe * toe * balanceFade * smoothstepGlsl(0.001f, 0.008f, peak));
+        Expr distance = max(log(max(peak, 0.125f)) / log(2.0f) + 3.0f, 0.0f);
+        Expr depth = distance * distance / (distance + 1.0f);
+        balanceGain *= pow(2.0f, -clamp(highlightRecovery_, 0.0f, 1.0f) * (1.0f - exp(-1.6f * depth)));
         toAces = Vec3{toAces.r * balanceGain, toAces.g * balanceGain, toAces.b * balanceGain};
         Vec3 rec = matVecConst(ACESCG_TO_REC2020, toAces);
         Vec3 scene{max(rec.r, 0.0f), max(rec.g, 0.0f), max(rec.b, 0.0f)};
@@ -305,15 +311,18 @@ public:
         Vec3 basicDisplay{select(displayP3_ != 0, basicP3.r, basicSrgb.r),
                           select(displayP3_ != 0, basicP3.g, basicSrgb.g),
                           select(displayP3_ != 0, basicP3.b, basicSrgb.b)};
+        // Same photographic adaptation as BasicDisplayTransform (no PBR toe).
+        basicDisplay = Vec3{max(basicDisplay.r, 0.0f), max(basicDisplay.g, 0.0f), max(basicDisplay.b, 0.0f)};
         Expr basicPeak = max(basicDisplay.r, max(basicDisplay.g, basicDisplay.b));
-        Expr t = max(basicPeak - 0.6f, 0.0f);
-        Expr basicCompressed = 0.6f + t / (1.0f + t / 0.4f);
-        Expr basicScale = select(basicPeak > 0.6f,
-            lerp(1.0f, basicCompressed / max(basicPeak, 1e-6f), clamp(highlightShoulder_, 0.0f, 1.0f)), 1.0f);
+        Expr knee = 0.76f - 0.16f * clamp(highlightShoulder_, 0.0f, 1.0f);
+        Expr d = 1.0f - knee;
+        Expr mapped = 1.0f - d * (d / (max(basicPeak, knee) + d - knee));
+        Expr scale = mapped / max(basicPeak, 1e-6f);
+        Expr white = 1.0f - 1.0f / (1.0f + 0.15f * (basicPeak - mapped));
         auto basicChannel = [&](Expr srgb, Expr p3) {
-            Expr linear = clamp(select(displayP3_ != 0, p3, srgb) * basicScale, 0.0f, 1.0f);
-            Expr x = pow(srgbOetfCh(linear), 1.0f / 1.1f);
-            return 0.25f * x + 0.75f * x * x * (3.0f - 2.0f * x);
+            Expr linear = max(select(displayP3_ != 0, p3, srgb), 0.0f);
+            Expr compressed = lerp(linear * scale, mapped, white);
+            return srgbOetfCh(clamp(select(basicPeak > knee, compressed, linear), 0.0f, 1.0f));
         };
         enc = Vec3{select(jpeg_ == 3, basicChannel(basicSrgb.r, basicP3.r), enc.r),
                    select(jpeg_ == 3, basicChannel(basicSrgb.g, basicP3.g), enc.g),

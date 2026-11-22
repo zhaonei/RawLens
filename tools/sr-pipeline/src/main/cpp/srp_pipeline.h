@@ -483,23 +483,6 @@ Status SrpCorrDirectGpu(Context* ctx, uint32_t ref_w, uint32_t tile_size,
                         VkBuffer patch_buffer, VkBuffer out_buffer,
                         VkShaderModule shader_module);
 
-// SrpKernelNetCovGpu: PhotonCamera KernelNet (kernelnet.comp) on the full
-// reference frame `raw_buffer` (raw_w*raw_h normalized floats), writing the
-// (s1, s2, rho) map to `map_buffer` (3*map_w*map_h) and Wronski covariances
-// for the crop at (crop_x, crop_y) to `cov_buffer` (cov_w*cov_h vec4).
-// `weights_buffer` holds the six layers' weights+biases as fp32 in .param
-// order (see SrpBridge.kernelNetWeights); `luma/act0/act1` are scratch of
-// luma_w*luma_h and 16*map_w*map_h floats.
-Status SrpKernelNetCovGpu(Context* ctx, uint32_t raw_w, uint32_t raw_h,
-                          float sigma, float sigma_scale, float sigma_cap,
-                          uint32_t crop_x, uint32_t crop_y, uint32_t cov_w,
-                          uint32_t cov_h, VkBuffer raw_buffer,
-                          VkBuffer weights_buffer, VkBuffer luma_buffer,
-                          VkBuffer act0_buffer, VkBuffer act1_buffer,
-                          VkBuffer map_buffer, VkBuffer cov_buffer,
-                          VkShaderModule shader_module, uint32_t flip_x,
-                          uint32_t flip_y, float sigma_floor = 0.90f);
-
 
 // Real GPU paths for robustness estimation (shaders/robustness.comp,
 // Alg.6-9), bayer 3-channel mode only, mirroring the port. Op 7
@@ -555,7 +538,11 @@ Status SrpRobustComputeGpu(Context* ctx, uint32_t width, uint32_t height,
                            uint32_t t_bits, uint32_t ftx, uint32_t fty,
                            VkShaderModule shader_module,
                            VkBuffer hf_buffer = VK_NULL_HANDLE,
-                           uint32_t s1_bits = 0);
+                           uint32_t s1_bits = 0,
+                           // Ghost-mask visibility (noise_correction bit 2):
+                           // float bits of a', b' with merged noise variance
+                           // a' * brightness + b'; both 0 = no visibility gate.
+                           uint32_t ghost_a_bits = 0, uint32_t ghost_b_bits = 0);
 Status SrpSmapGpu(Context* ctx, uint32_t ntx, uint32_t nty,
                   VkBuffer flow_buffer, VkBuffer s_buffer, uint32_t mt_bits,
                   uint32_t s1_bits, uint32_t s2_bits,

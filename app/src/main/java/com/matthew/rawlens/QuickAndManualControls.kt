@@ -64,7 +64,6 @@ import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
-import com.particlesdevs.photoncamera.processing.ml.FlowNetNcnnProcessor
 import com.particlesdevs.photoncamera.processing.ml.RawNindNcnnProcessor
 import java.io.File
 import java.util.Locale
@@ -133,7 +132,7 @@ internal fun MainActivity.refreshFeatureTags(ettrEnabled: Boolean) {
         "HDR+".takeIf { hdrPlusSettings.enabled },
         mfsrSettings.label.takeIf { mfsrSettings.enabled },
         "ETTR".takeIf { ettrEnabled },
-        "HDR".takeIf { hdrEnabled },
+        "BRACKETS".takeIf { hdrEnabled },
         "BURST".takeIf { releaseMode == 1 },
         "${timerSeconds}S".takeIf { timerSeconds > 0 },
     )

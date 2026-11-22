@@ -11,8 +11,7 @@ import com.rawlens.srpipeline.stages.AlignGpu
 import com.rawlens.srpipeline.stages.BurstConfig
 import com.rawlens.srpipeline.stages.DngRead
 import com.rawlens.srpipeline.stages.HotPixels
-import com.rawlens.srpipeline.stages.KernelNet
-import com.rawlens.srpipeline.stages.KernelNetConfig
+import com.rawlens.srpipeline.stages.TwoBandReconstruction
 import com.rawlens.srpipeline.stages.KernelParams
 import com.rawlens.srpipeline.stages.NoiseLutGen
 import com.rawlens.srpipeline.stages.PipelineConfig
@@ -41,7 +40,7 @@ import java.nio.ByteBuffer
  * reference frame, with green from the learned per-device model when trained
  * (switch: MfsrSettings.learnedNoise); never the vendor NoiseProfile. It
  * drives GAT, SNR -> tile/kernel params,
- * the in-app NoiseLutGen robustness LUT and the KernelNet sigma.
+ * the in-app NoiseLutGen robustness LUT.
  * Before the merge: static hot/dead pixels (HotPixels, C18). In the merge:
  * colour-difference accumulation (Z1, MfsrSettings.zipperFix). After it:
  * lens shading on the merged RGB (C19).
@@ -75,7 +74,9 @@ internal object MfsrMerge {
          * overload covers that tail).
          */
         val refResult: android.hardware.camera2.CaptureResult?,
-        val mergeDetails: String = ""
+        val mergeDetails: String = "",
+        /** LK-R HDR bracket: level of the sensor clip in [rgb] (reference units, > 1); 1 = normal merge. */
+        val hdrWhite: Float = 1f
     ) {
         private val released = java.util.concurrent.atomic.AtomicBoolean(false)
 
@@ -110,21 +111,25 @@ internal object MfsrMerge {
         metadataOf: (BufferedRawFrame) -> RawFrameMetadata
     ): List<MfsrFrame>? {
         if (frames.size < MfsrSettings.MIN_MERGE_FRAMES) return null
-        val usable = frames.mapIndexedNotNull { index, frame ->
+        val usable = describe(frames, metadataOf)
+        if (usable.size < MfsrSettings.MIN_MERGE_FRAMES) return null
+        val refOrder = selectSharpest(usable, middleReference, nativeSharpness) ?: return null
+        return refOrder.map { usable[it] }
+    }
+
+    /** Metadata + normalisation per frame, capture order; unusable frames are dropped (logged). */
+    fun describe(frames: List<BufferedRawFrame>, metadataOf: (BufferedRawFrame) -> RawFrameMetadata): List<MfsrFrame> =
+        frames.mapIndexedNotNull { index, frame ->
             try {
                 val metadata = metadataOf(frame)
                 val norm = metadata.normalizationOrNull() ?: return@mapIndexedNotNull null
-                frame.image.planes?.firstOrNull() ?: return@mapIndexedNotNull null
+                frame.view().buffer ?: return@mapIndexedNotNull null
                 MfsrFrame(frame, metadata, norm)
             } catch (failure: Exception) {
                 Log.w(LOG_TAG, "mfsr prepare: frame $index unusable", failure)
                 null
             }
         }
-        if (usable.size < MfsrSettings.MIN_MERGE_FRAMES) return null
-        val refOrder = selectSharpest(usable, middleReference, nativeSharpness) ?: return null
-        return refOrder.map { usable[it] }
-    }
 
     /**
      * HDR+ reference + blur rejection ([BurstSharpness]) over frames in
@@ -135,14 +140,14 @@ internal object MfsrMerge {
     private fun selectSharpest(frames: List<MfsrFrame>, middleReference: Boolean, nativeSharpness: Boolean): List<Int>? {
         return try {
             val sharpness = frames.map { sharp ->
-                val plane = sharp.frame.image.planes[0]
-                val shorts = plane.buffer.duplicate().order(java.nio.ByteOrder.nativeOrder()).asShortBuffer()
+                val plane = sharp.frame.view()
+                val shorts = plane.buffer!!.duplicate().order(java.nio.ByteOrder.nativeOrder()).asShortBuffer()
                 val rowShorts = plane.rowStride / 2
                 val colShorts = plane.pixelStride / 2
                 val pattern = sharp.norm.sensorPattern
                 val norm = sharp.norm
                 if (nativeSharpness && plane.pixelStride == 2) {
-                    val score = LkrBridge.nativeSharpness(plane.buffer.duplicate().also { it.rewind() },
+                    val score = LkrBridge.nativeSharpness(plane.buffer!!.duplicate().also { it.rewind() },
                         sharp.metadata.imageWidth, sharp.metadata.imageHeight, rowShorts,
                         dngCodesFor(pattern), norm.blackLevels.toFloatArray())
                     if (score.isFinite()) return@map score
@@ -239,7 +244,7 @@ internal object MfsrMerge {
     /**
      * Noise model (S, O) per engine plane, in the engine's R, G1, B, G2 order
      * (RGGB-normalised raster from [decodeRows]: R (0,0), G1 (0,1), B (1,1),
-     * G2 (1,0); the order BurstConfig / GAT / NoiseLutGen / KernelNet expect).
+     * G2 (1,0); the order BurstConfig / GAT / NoiseLutGen expect).
      *
      * Camera2 SENSOR_NOISE_PROFILE lists one (S, O) pair per CFA channel "in
      * the same order as channels listed for the CFA layout key"
@@ -302,8 +307,8 @@ internal object MfsrMerge {
      * for HotPixels.confirm before the frame is decoded (no extra full decode).
      */
     private fun liveVerifier(sharp: MfsrFrame, w: Int, h: Int): (Int, Int) -> Float {
-        val plane = sharp.frame.image.planes[0]
-        val shorts = plane.buffer.duplicate().order(java.nio.ByteOrder.nativeOrder()).asShortBuffer()
+        val plane = sharp.frame.view()
+        val shorts = plane.buffer!!.duplicate().order(java.nio.ByteOrder.nativeOrder()).asShortBuffer()
         val rowShorts = plane.rowStride / 2
         val colShorts = plane.pixelStride / 2
         val norm = sharp.norm
@@ -333,7 +338,8 @@ internal object MfsrMerge {
      * when the map is already applied.
      */
     internal fun applyShadingAfterMerge(
-        rgb: java.nio.FloatBuffer, w: Int, h: Int, model: LensShadingModel, scale: Int = 1
+        rgb: java.nio.FloatBuffer, w: Int, h: Int, model: LensShadingModel, scale: Int = 1,
+        highlightWb: FloatArray? = null, white: Float = 1f
     ) {
         if (model.alreadyApplied) return
         ShardWorkers.forEachShard(h) { y0, y1 ->
@@ -343,11 +349,35 @@ internal object MfsrMerge {
                 val sx = x / scale
                 val sy = y / scale
                 val gG = 0.5f * (model.gainAt(sx, sy, CfaColor.GREEN, 0) + model.gainAt(sx, sy, CfaColor.GREEN, 1))
-                rgb.put(i, rgb.get(i) * model.gainAt(sx, sy, CfaColor.RED))
-                rgb.put(i + 1, rgb.get(i + 1) * gG)
-                rgb.put(i + 2, rgb.get(i + 2) * model.gainAt(sx, sy, CfaColor.BLUE))
+                shadePixel(rgb, i, model.gainAt(sx, sy, CfaColor.RED), gG, model.gainAt(sx, sy, CfaColor.BLUE), highlightWb, white)
             }
         }
+    }
+
+    /** Merge's raw clip level (lkrl SolveParams::clip): its highlight neutralise starts at 0.85 of it. */
+    private const val HIGHLIGHT_CLIP = 0.98f
+
+    /**
+     * Shading gains for one interleaved pixel. With [wb] (LK-R), blown highlights stay white: the merge
+     * neutralised them at G = 1, but shading gains above 1 push G over the DNG's [0, 1] clamp, which cuts
+     * G and leaves R / B -> pink (also bright unblown pixels pushed over 1 by the gain). Same rule as
+     * lkrl FinishLook: smoothstep(0.85, 1) of the brightest channel (before shading against the raw clip,
+     * after it against the file's 1.0), blend to neutral at the wb-space luma, capped at min(wb) so the
+     * clamped file stays neutral. [white] = the clip level of an HDR merge (all levels scale with it).
+     */
+    private fun shadePixel(rgb: java.nio.FloatBuffer, i: Int, gR: Float, gG: Float, gB: Float, wb: FloatArray?, white: Float = 1f) {
+        val r0 = rgb.get(i); val g0 = rgb.get(i + 1); val b0 = rgb.get(i + 2)
+        var r = r0 * gR; var g = g0 * gG; var b = b0 * gB
+        if (wb != null) {
+            val v = maxOf(maxOf(r0, g0, b0) / HIGHLIGHT_CLIP, maxOf(r, g, b)) / white
+            var m = ((v - 0.85f) / 0.15f).coerceIn(0f, 1f)
+            m = m * m * (3f - 2f * m)
+            if (m > 0f) {
+                val lum = minOf(0.25f * wb[0] * r + 0.5f * wb[1] * g + 0.25f * wb[2] * b, minOf(wb[0], wb[1], wb[2]) * white)
+                r += m * (lum / wb[0] - r); g += m * (lum / wb[1] - g); b += m * (lum / wb[2] - b)
+            }
+        }
+        rgb.put(i, r); rgb.put(i + 1, g); rgb.put(i + 2, b)
     }
 
     /**
@@ -356,7 +386,7 @@ internal object MfsrMerge {
      */
     internal fun applyShadingMapped(
         rgb: java.nio.FloatBuffer, w: Int, h: Int, model: LensShadingModel,
-        x0: Int, y0: Int, sx: Float, sy: Float
+        x0: Int, y0: Int, sx: Float, sy: Float, highlightWb: FloatArray? = null, white: Float = 1f
     ) {
         if (model.alreadyApplied) return
         ShardWorkers.forEachShard(h) { ya, yb ->
@@ -366,9 +396,7 @@ internal object MfsrMerge {
                     val sxx = (x0 + (x + 0.5f) * sx).toInt()
                     val i = 3 * (y * w + x)
                     val gG = 0.5f * (model.gainAt(sxx, syy, CfaColor.GREEN, 0) + model.gainAt(sxx, syy, CfaColor.GREEN, 1))
-                    rgb.put(i, rgb.get(i) * model.gainAt(sxx, syy, CfaColor.RED))
-                    rgb.put(i + 1, rgb.get(i + 1) * gG)
-                    rgb.put(i + 2, rgb.get(i + 2) * model.gainAt(sxx, syy, CfaColor.BLUE))
+                    shadePixel(rgb, i, model.gainAt(sxx, syy, CfaColor.RED), gG, model.gainAt(sxx, syy, CfaColor.BLUE), highlightWb, white)
                 }
             }
         }
@@ -544,12 +572,12 @@ internal object MfsrMerge {
      * return), never retained across frames.
      */
     fun decodeSharp(sharp: MfsrFrame): Array<FloatArray> {
-        val plane = sharp.frame.image.planes[0]
+        val plane = sharp.frame.view()
         val layout = RawPlaneLayout(
             sharp.metadata.imageWidth, sharp.metadata.imageHeight,
             plane.rowStride, plane.pixelStride, 0, 0
         )
-        val cfa = RawSensorUnpacker.unpackNormalized(plane.buffer.duplicate(), layout, sharp.norm)
+        val cfa = RawSensorUnpacker.unpackNormalized(plane.buffer!!.duplicate(), layout, sharp.norm)
         // C19: lens shading is NOT applied per frame any more. Gains up to
         // 4x+ in the corners scaled noise variance by gain^2 while GAT, SNR
         // and the robustness LUT assumed raw sensor noise (corner frames got
@@ -621,8 +649,12 @@ internal object MfsrMerge {
             // RawTherapee capture sharpening: auto radius from the reference
             // CFA, measured now so the frame need not stay alive (RT measures
             // it on the raw too). Output pixels at 2x are half as large.
-            val captureRadius = runCatching { RtCaptureSharpen.autoRadiusBayer(first) * scale }
-                .getOrDefault(Float.NaN)
+            // Two-band sharpens inside its DCT Wiener (deconvolution of its own
+            // narrow kernel + the optics, at the RT auto radius in sensor px),
+            // so RT runs only on the Wronski path.
+            val twoBand = settings.twoBand && settings.zipperFix
+            val opticsRadius = runCatching { RtCaptureSharpen.autoRadiusBayer(first) }.getOrDefault(Float.NaN)
+            val captureRadius = if (twoBand) Float.NaN else opticsRadius * scale
             // Noise model: never the vendor NoiseProfile (owner rule). Our own
             // estimate from the reference frame (SceneNoise: same-CFA Haar
             // MADs per brightness bin, Poisson-Gaussian fit, all four planes);
@@ -684,31 +716,28 @@ internal object MfsrMerge {
                 // 2x zipper fix: R/B colour differences get a wider kernel than green.
                 chromaScale = tuning.chromaScale(scale.toFloat()),
                 icaIterations = tuning.icaIterations,
-                // KernelNet's continuous motion (regularized flow, smooth
-                // flow/robustness sampling, soft rejection) for Wronski too.
+                // Continuous motion (regularized flow, smooth flow/robustness
+                // sampling, soft rejection).
                 continuousMotion = true,
-                // KernelNet's wide gather, green detail path and green frame
-                // weights for Wronski's per-frame kernels too.
+                // Wide gather, green detail path and green frame weights for
+                // Wronski's per-frame kernels.
                 detailReconstruction = true,
-                // KernelNet (when selected): one kernel map from the reference
-                // frame, which on the device IS the full frame, so no
-                // separate full-frame copy; the net runs in sensor
-                // orientation via the RGGB-normalization flips.
-                kernelNet = if (settings.kernel != MfsrKernel.KERNELNET) null else {
-                    val (fx, fy) = KernelNet.rggbFlips(dngCodesFor(pattern))
-                    KernelNetConfig(
-                        weights = KernelNet.bundledWeights(),
-                        sigma = KernelNet.sigma(
-                            FloatArray(4) { alpha[it].toFloat() }, FloatArray(4) { beta[it].toFloat() }),
-                        sigmaScale = tuning.knSigmaScale,
-                        sigmaCap = tuning.knSigmaCap,
-                        sigmaFloor = tuning.knFloor(scale.toFloat()),
-                        flipX = fx,
-                        flipY = fy
-                    )
-                }
+                // Even noise where motion rejection kept fewer frames.
+                noiseEvening = true,
+                // Lateral CA fitted on the merged image, warped when visible.
+                lateralCa = true,
+                // Ghost mask: drop rejection speckles, grow motion blobs.
+                ghostGrow = true,
+                // Down-weight blurry frames (detail energy vs the reference).
+                blurGamma = 1f,
+                // Subtract a neutral black floor above the metadata black.
+                blackPedestal = true,
+                // Two-band reconstruction (needs colourDiff; ignored without it).
+                twoBand = if (twoBand) TwoBandReconstruction.Params(
+                    opticsSigma = if (opticsRadius.isFinite() && opticsRadius > 0f) minOf(opticsRadius.toDouble(), 0.6) else 0.5)
+                    else null,
             )
-            Log.i(LOG_TAG, "sharp merge ${w}x$h N=$count snr=%.2f tile=%d kernel=%s continuousMotion=on s3=%s zipperFix=%s".format(snr, fin.tileSize, settings.kernel, settings.s3, settings.zipperFix))
+            Log.i(LOG_TAG, "sharp merge ${w}x$h N=$count snr=%.2f tile=%d kernel=wronski continuousMotion=on s3=%s zipperFix=%s twoBand=%s".format(snr, fin.tileSize, settings.s3, settings.zipperFix, twoBand))
             fun asset(name: String): ByteArray =
                 context.assets.open("sr_spv/$name.spv").use { it.readBytes() }
             val fft = asset("fft")
@@ -738,7 +767,14 @@ internal object MfsrMerge {
                     fft = fft, corr = asset("corr"), greyFft = asset("grey_fft"), greyFir = asset("grey_fir"),
                     // Resident grey + GPU moving pyramid (perf 2026-11-14).
                     pyrDown = asset("pyr_down"),
-                    kernelNet = if (settings.kernel == MfsrKernel.KERNELNET) asset("kernelnet") else null
+                    noiseAcc = asset("noise_acc"),
+                    noiseEven = asset("noise_even"),
+                    caWarp = asset("ca_warp"),
+                    mergeTwoBand = asset("merge_twoband"),
+                    twoBandResolve = asset("twoband_resolve"),
+                    twoBandDct = asset("twoband_dct"),
+                    twoBandTensor = asset("twoband_tensor"),
+                    robFeather = asset("rob_feather"),
                 ),
                 output = nativeOut
             )
@@ -758,7 +794,8 @@ internal object MfsrMerge {
             }
             // RawTherapee capture sharpening (defaults: auto radius and
             // contrast, 20 iterations) on the GPU; skipped on any failure.
-            try {
+            // Wronski path only: two-band already applied its matched sharpening.
+            if (!twoBand) try {
                 val wb = zipperWb(neutral)
                 VulkanHub.open().use { vk ->
                     val st = RtCaptureSharpenVulkan.apply(vk, { name -> context.assets.open("spirv/$name").use { it.readBytes() } },
@@ -806,7 +843,8 @@ internal object MfsrMerge {
             "budget ${mb(javaBudget.toDouble())}MB")
         if (systemBudget != null && native > systemBudget) {
             Log.e(LOG_TAG, "sharp merge skipped: ${w}x$h needs ~${mb(native)}MB, " +
-                "only ${mb(systemBudget.toDouble())}MB free above the low-memory threshold")
+                "only ${mb(systemBudget.toDouble())}MB free above the low-memory threshold " +
+                "(${MergeMemoryBudget.describeSystem(context)})")
             return false
         }
         if (java > javaBudget) {

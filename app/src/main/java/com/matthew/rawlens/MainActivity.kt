@@ -46,7 +46,6 @@ import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
-import com.particlesdevs.photoncamera.processing.ml.FlowNetNcnnProcessor
 import com.particlesdevs.photoncamera.processing.ml.RawNindNcnnProcessor
 import java.io.File
 import java.util.Locale
@@ -297,9 +296,7 @@ class MainActivity : Activity() {
                 .putBoolean(KEY_HDR_ENABLED, hdrEnabled)
                 .apply()
         }
-        preloadFlowNetForMergedHdr()
         preloadRawNindIfEnabled()
-        // Future SR hook: KernelNet preload + RawSuperResolutionSettings load here.
         hdrPlusSettings = HdrPlusSettings.fromPreferences(lensPreferences().all)
         captureExposureMode = CaptureExposureMode.entries.getOrElse(
             lensPreferences().getInt(KEY_CAPTURE_EXPOSURE_MODE, CaptureExposureMode.AUTO.ordinal)
@@ -663,6 +660,7 @@ class MainActivity : Activity() {
                 if (!videoRecording) rawExposureOverlay.update(frame)
             } },
             initialFacePriorityEnabled = lensPreferences().getBoolean(KEY_FACE_PRIORITY, false),
+            initialContinuousAfPoint = lensPreferences().getBoolean(KEY_AFC_POINT, false),
             onFaces = { boxes ->
                 runOnUiThread {
                     // Boxes arrive as full-box fractions scaled to box pixels;
@@ -875,6 +873,11 @@ class MainActivity : Activity() {
         hdrPlusQuick.setOnLongClickListener { cycleHdrPlusQuality(); true }
         mfsrQuick.setOnClickListener { toggleSharpMerge(MfsrEngine.MFSR) }
         lkrQuick.setOnClickListener { toggleSharpMerge(MfsrEngine.LKR) }
+        lkrQuick.setOnLongClickListener { tile ->
+            tile.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            cycleLkrHdr()
+            true
+        }
         wireLkrZoomChip()
         ettrQuick.setOnClickListener { toggleEttr() }
         hdrQuick.setOnClickListener { toggleHdrEnabled() }
@@ -1006,17 +1009,17 @@ class MainActivity : Activity() {
             lensPreferences().edit().putBoolean("processing_notifications_asked", true).apply()
             requestPermissions(notificationPermission.toTypedArray(), 4109)
         }
-        if (WelcomeFlow.shouldDeferUpdateConsent(
-                lensPreferences().getBoolean(KEY_LENS_SETUP_COMPLETE, false)
-            )
-        ) {
-            // First run: lens discovery owns the screen, so the
-            // keep-up-to-date ask waits until it is off screen instead of
-            // layering over it (fired from showLensSelection's dismiss
-            // paths and the no-lenses alert below).
-            updateFlow.pendingConsent = true
+        // The keep-up-to-date ask is no longer part of first-run setup: it
+        // waits until the user has come back a few times (FirstUseAsks).
+        val launchCount = lensPreferences().getInt(FirstUseAsks.KEY_LAUNCH_COUNT, 0) + 1
+        lensPreferences().edit().putInt(FirstUseAsks.KEY_LAUNCH_COUNT, launchCount).apply()
+        val askUpdates = FirstUseAsks.shouldAskUpdates(launchCount)
+        if (!lensPreferences().getBoolean(KEY_LENS_SETUP_COMPLETE, false)) {
+            // Lens discovery owns the screen, so a due ask waits until it is
+            // off screen (fired from showLensSelection's dismiss paths).
+            updateFlow.pendingConsent = askUpdates
             showLensDiscovery(firstRun = true)
-        } else {
+        } else if (askUpdates) {
             updateFlow.showConsent()
         }
         viewfinder.addOnLayoutChangeListener { view, left, top, right, bottom,
@@ -1880,6 +1883,60 @@ class MainActivity : Activity() {
     /** Top-right status line: always short, never a file name (see [StatusText]). */
     internal fun setStatus(message: String) {
         if (::status.isInitialized) status.text = StatusText.compact(message)
+        maybeAskOnFirstUse(message)
+    }
+
+    /**
+     * Optional asks fired the first time their feature is used, instead of
+     * during setup (see [FirstUseAsks]). Each shows at most once.
+     */
+    private fun maybeAskOnFirstUse(message: String) {
+        if (isFinishing || isDestroyed) return
+        val prefs = lensPreferences()
+        if (FirstUseAsks.isSidecarBurstSave(message) &&
+            SidecarTreeAccess.needsFirstInstallPrompt(this)
+        ) {
+            SidecarTreeAccess.markFirstInstallPrompted(this)
+            window.decorView.post { showFolderAsk() }
+            return
+        }
+        if (FirstUseAsks.shouldAskLocation(
+                message,
+                asked = prefs.getBoolean(FirstUseAsks.KEY_LOCATION_ASKED, false),
+                gpsOn = gpsEnabled()
+            )
+        ) {
+            prefs.edit().putBoolean(FirstUseAsks.KEY_LOCATION_ASKED, true).apply()
+            window.decorView.post { showLocationAsk() }
+        }
+    }
+
+    private fun showLocationAsk() {
+        if (isFinishing || isDestroyed) return
+        RawLensDialogBuilder(this)
+            .setTitle("Tag photos with location?")
+            .setMessage("Adds GPS to new photos and MP4 videos. Stays on your phone. " +
+                "You can change this anytime in Settings.")
+            .setPositiveButton("Tag location") { _, _ ->
+                if (GpsLocationProvider.permissions().any {
+                        checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+                    }) setGpsEnabled(true)
+                else requestPermissions(GpsLocationProvider.permissions(), LOCATION_PERMISSION)
+            }
+            .setNegativeButton("Not now", null)
+            .show()
+    }
+
+    private fun showFolderAsk() {
+        if (isFinishing || isDestroyed) return
+        RawLensDialogBuilder(this)
+            .setTitle("Keep burst files together?")
+            .setMessage("Bursts also save gyro files used by HDR+ and MFSR merges. " +
+                "Pick your photo folder (DCIM) so they land next to the DNGs. " +
+                "Without it they go to Downloads and still import fine.")
+            .setPositiveButton("Choose folder") { _, _ -> pickSidecarFolder() }
+            .setNegativeButton("Use Downloads", null)
+            .show()
     }
 
     private fun triggerCapture(shutter: View, forceBurst: Boolean) {
@@ -1937,15 +1994,8 @@ class MainActivity : Activity() {
             "Shutter mode=${captureModeLabel(useHdr, useBurst)} forceBurst=$forceBurst"
         )
         when {
-            useHdr && seqTrioEnabled() -> controller.captureSeqTrio(
-                saveEachBracket = lensPreferences().getBoolean(KEY_HDR_SAVE_EACH_BRACKET, false),
-                saveDebugFrames = lensPreferences().getBoolean(KEY_HDR_SAVE_DEBUG_FRAMES, false)
-            )
-            useHdr -> controller.captureHdrBracket(
-                saveEachBracket = lensPreferences().getBoolean(KEY_HDR_SAVE_EACH_BRACKET, false),
-                bracketStops = hdrBracketStops(),
-                saveDebugFrames = lensPreferences().getBoolean(KEY_HDR_SAVE_DEBUG_FRAMES, false)
-            )
+            useHdr && lkrHdrDebugBracket() -> controller.captureLkrHdrBracket()
+            useHdr -> controller.captureHdrBracket(bracketStops = hdrBracketStops())
             useBurst -> controller.captureBurst()
             else -> controller.capture()
         }
@@ -2589,8 +2639,28 @@ class MainActivity : Activity() {
             } catch (failure: Exception) {
                 Log.e(LOG_TAG, "Recording finalization failed at ${destination?.uri}", failure)
             }
+            if (saved != null && destination != null &&
+                lensPreferences().getBoolean(KEY_VIDEO_RAW_GCSV, true)) saveGyroflowLog(destination.name, recorder.gcsvText)
             runOnUiThread { finishVideoStop(stats, saved, rollingVf, rearmPreview, afterStop) }
         }, "VideoStop").start()
+    }
+
+    /** Writes `<stem>.gcsv` (Gyroflow IMU log) next to a saved `.craw`. Stop thread; never throws. */
+    private fun saveGyroflowLog(takeName: String, text: String?) {
+        if (text == null) return
+        val name = takeName.substringBeforeLast('.') + ".gcsv"
+        try {
+            val out = DirectRecordingOutput.create(this, name, "application/octet-stream")
+            val ok = try {
+                java.io.FileOutputStream(out.fileDescriptor).use { it.write(text.toByteArray(Charsets.US_ASCII)) }
+                out.finish(true)
+            } catch (e: Exception) {
+                out.close(); throw e
+            }
+            Log.i(LOG_TAG, "gyroflow log $name ok=$ok bytes=${text.length}")
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "gyroflow log $name failed: ${e.message}")
+        }
     }
 
     private fun stopEncodedVideoRecording(rearmPreview: Boolean = true, afterStop: (() -> Unit)? = null) {
@@ -3274,9 +3344,8 @@ class MainActivity : Activity() {
             val nextMode = HdrShutterExclusivity.modeAfterBracketEnabled(captureExposureMode)
             if (nextMode != captureExposureMode) applyCaptureExposureMode(nextMode)
         }
-        preloadFlowNetForMergedHdr()
         Log.i(LOG_TAG, "HDR enabled=$hdrEnabled")
-        setStatus(if (hdrEnabled) "HDR ON" else "HDR OFF")
+        setStatus(if (hdrEnabled) "BRACKETS ON" else "BRACKETS OFF")
         updateQuickControls()
     }
 
@@ -3287,16 +3356,6 @@ class MainActivity : Activity() {
         lensPreferences().edit().putBoolean(KEY_HDR_ENABLED, false).apply()
         Log.i(LOG_TAG, "HDR enabled=false")
         updateQuickControls()
-    }
-
-    internal fun preloadFlowNetForMergedHdr() {
-        if (hdrEnabled &&
-            (!lensPreferences().getBoolean(KEY_HDR_SAVE_EACH_BRACKET, false) ||
-                lensPreferences().getBoolean(KEY_HDR_SAVE_DEBUG_FRAMES, false))) {
-            // Model loading and Vulkan pipeline creation are asynchronous and can be slow on
-            // first use. Start as soon as HDR is enabled instead of after capture.
-            FlowNetNcnnProcessor.start(applicationContext)
-        }
     }
 
     private fun releaseModeLabel(mode: Int) = when (mode) {
@@ -3397,6 +3456,18 @@ class MainActivity : Activity() {
      * HQ frequency). Works whether HDR+ is on or off; the choice persists
      * for the next capture.
      */
+    /** LK-R quick-tile long-press: HDR Auto -> On -> Off (Settings -> Merge -> LK-R HDR). */
+    private fun cycleLkrHdr() {
+        val next = when (mfsrSettings.lkrHdr) {
+            LkrHdrMode.AUTO -> LkrHdrMode.ON
+            LkrHdrMode.ON -> LkrHdrMode.OFF
+            LkrHdrMode.OFF -> LkrHdrMode.AUTO
+        }
+        if (applyMfsrSettings(mfsrSettings.copy(lkrHdr = next))) {
+            setStatus("LK-R HDR • ${next.label.uppercase()}")
+        }
+    }
+
     private fun cycleHdrPlusQuality() {
         val settings = when {
             hdrPlusSettings.autoQuality ->
@@ -3856,9 +3927,12 @@ class MainActivity : Activity() {
         },
         highlightHeadroom = lensPreferences().getFloat(KEY_JPEG_HIGHLIGHT_HEADROOM, 1f),
         highlightSoftHeadroom = lensPreferences().getFloat(KEY_JPEG_SKY_PROTECTION, 0.85f),
+        shadowLift = lensPreferences().getFloat(CameraToneBalance.KEY_SHADOW_LIFT, CameraToneBalance.DEFAULT_SHADOW_LIFT),
+        highlightRecovery = lensPreferences().getFloat(CameraToneBalance.KEY_HIGHLIGHT_RECOVERY, 0f),
         highlightShoulder = lensPreferences().getFloat(KEY_JPEG_HIGHLIGHT_SHOULDER, 1f),
         hlReconstruction = HighlightReconstructionDefaults.read(lensPreferences()),
-        mono = MonoSettings.read(lensPreferences())
+        mono = MonoSettings.read(lensPreferences()),
+        toneLook = ToneLookSettings.load(lensPreferences())
     ).resolvedForPlatform()
 
     /** JPEG XL container options (darktable parity); defaults resolve to 16-bit lossless. */
@@ -4077,13 +4151,11 @@ class MainActivity : Activity() {
 
     internal fun lensPreferences() = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    /** Debug: HDR shutter captures the LK-R HDR bracket (up to 8 frames: 0 EV frames, 2 x -2, 1 x +1.5 EV). */
+    internal fun lkrHdrDebugBracket(): Boolean = lensPreferences().getBoolean(KEY_LKR_HDR_DEBUG, false)
+
     internal fun hdrBracketStops(): Int =
         if (lensPreferences().getInt(KEY_HDR_BRACKET_STOPS, 2) == 4) 4 else 2
-
-    internal fun seqTrioEnabled(): Boolean =
-        // Temporary default while the standard HDR bracket merge is being repaired.
-        // Keep an explicitly saved choice; this only affects HDR, never HDR+ bursts.
-        lensPreferences().getBoolean(KEY_SEQ_TRIO_ENABLED, true)
 
     internal fun selectedLensIds(): Set<String> =
         lensPreferences().getStringSet(KEY_SELECTED_LENSES, emptySet())?.toSet().orEmpty()
@@ -4391,8 +4463,8 @@ class MainActivity : Activity() {
                 "Hardware AE metering ${aeMeteringMode.label}. Tap to switch; hold to change crop."
             setQuickTileState(aeMetering, aeMeteringMode != AeMeteringMode.AUTO)
         }
-        hdr.text = "HDR\n${if (hdrEnabled) "ON" else "OFF"}"
-        hdr.contentDescription = "HDR bracket ${if (hdrEnabled) "on" else "off"}. Tap to toggle."
+        hdr.text = "BRACKETS\n${if (hdrEnabled) "ON" else "OFF"}"
+        hdr.contentDescription = "Exposure brackets ${if (hdrEnabled) "on" else "off"}. Tap to toggle."
         timer.text = "TIMER\n${if (timerSeconds == 0) "OFF" else "${timerSeconds}S"}"
         release.text = if (dualRawEnabled) "RELEASE\nRAW HDR TEST" else "RELEASE\n${if (releaseMode == 1) "BURST 6" else "SINGLE"}"
         val sharpAvailable = !dualRawEnabled &&
@@ -4529,6 +4601,7 @@ class MainActivity : Activity() {
         const val KEY_VIDEO_BINNING = "video_binning"
         /** RAW Video (.craw) temporal 4x4 DCT denoise on the GPU before encode. Default off. */
         const val KEY_VIDEO_RAW_DCT_DENOISE = "video_raw_dct_denoise"
+        const val KEY_VIDEO_RAW_GCSV = "video_raw_gcsv"
         /** Binning output: [BINNING_RGB] (best quality) or [BINNING_CFA] (cheap half-res Bayer). */
         const val KEY_VIDEO_BINNING_MODE = "video_binning_mode"
         const val BINNING_RGB = "rgb"
@@ -4588,6 +4661,7 @@ class MainActivity : Activity() {
         const val KEY_DYNAMIC_EXPOSURE_AUTO_SHUTTER = "dynamic_exposure_auto_shutter"
         const val KEY_ETTR_ENABLED = "ettr_enabled"
         const val KEY_FACE_PRIORITY = "face_priority"
+        const val KEY_AFC_POINT = "afc_focus_point"
         const val KEY_ETTR_HEADROOM_EV = "ettr_headroom_ev"
         const val KEY_ETTR_ISO_LIMIT = "ettr_iso_limit"
         const val KEY_CAPTURE_EXPOSURE_MODE = "capture_exposure_mode"
@@ -4601,10 +4675,8 @@ class MainActivity : Activity() {
         const val KEY_BURST_CRAW_ENABLED = "burst_craw_enabled"
         const val KEY_RELEASE_MODE = "release_mode"
         const val KEY_HDR_ENABLED = "hdr_enabled"
-        const val KEY_HDR_SAVE_EACH_BRACKET = "hdr_save_each_bracket"
-        const val KEY_HDR_SAVE_DEBUG_FRAMES = "hdr_save_debug_frames"
         const val KEY_HDR_BRACKET_STOPS = "hdr_bracket_stops"
-        const val KEY_SEQ_TRIO_ENABLED = "seq_trio_enabled"
+        const val KEY_LKR_HDR_DEBUG = "lkr_hdr_debug_bracket"
         const val KEY_JPEG_ULTRA_HDR = "jpeg_ultra_hdr"
         const val KEY_JPEG_DISPLAY_P3 = "jpeg_display_p3"
         const val KEY_JPEG_QUALITY = "jpeg_quality"

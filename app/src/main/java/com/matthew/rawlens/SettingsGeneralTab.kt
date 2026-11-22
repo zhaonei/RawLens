@@ -55,7 +55,6 @@ import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
-import com.particlesdevs.photoncamera.processing.ml.FlowNetNcnnProcessor
 import com.particlesdevs.photoncamera.processing.ml.RawNindNcnnProcessor
 import java.io.File
 import java.util.Locale
@@ -175,13 +174,6 @@ internal fun MainActivity.showGeneralSettings(p: SettingsPage) {
             textSize = 11f
         })
         content.addView(sectionTitle("Viewfinder"))
-        content.addView(p.kit.settingsCheck("Pause camera while in Settings", pauseCameraInSettings()).apply {
-            setOnCheckedChangeListener { _, on ->
-                lensPreferences().edit().putBoolean(KEY_PAUSE_CAMERA_IN_SETTINGS, on).apply()
-                if (on) pauseCameraForSettings() else startCameraWhenReady()
-            }
-        })
-        content.addView(sectionDesc("Saves battery by closing the camera while Settings is open. Active recordings continue."))
         content.addView(p.kit.settingsCheck("Always use ISP viewfinder", ispPreviewAlways()).apply {
             setOnCheckedChangeListener { _, checked ->
                 setIspPreviewAlways(checked)
@@ -194,6 +186,13 @@ internal fun MainActivity.showGeneralSettings(p: SettingsPage) {
                 "look. Some phones cannot run a preview stream together with RAW; they stay on " +
                 "the RAW viewfinder."
         ))
+        content.addView(p.kit.settingsCheck("Pause camera while in Settings", pauseCameraInSettings()).apply {
+            setOnCheckedChangeListener { _, on ->
+                lensPreferences().edit().putBoolean(KEY_PAUSE_CAMERA_IN_SETTINGS, on).apply()
+                if (on) pauseCameraForSettings() else startCameraWhenReady()
+            }
+        })
+        content.addView(sectionDesc("Saves battery by closing the camera while Settings is open. Active recordings continue."))
         // GPU VF: selectable superpixel resolution (480/640 full-rate / 960 balanced / 1080 detail).
         content.addView(Button(this).apply {
             text = "Preview resolution: ${vfResolution}px"
@@ -205,12 +204,12 @@ internal fun MainActivity.showGeneralSettings(p: SettingsPage) {
             }
         })
         content.addView(Button(this).apply {
-            text = "Preview: " + vfPreviewModeText().substringAfter("(").removeSuffix(")")
+            text = "Preview: " + vfPreviewModeChoice().let { (mode, label) -> label(mode) }
             setOnClickListener {
                 val (mode, modeLabel) = vfPreviewModeChoice()
                 p.kit.chooseEnum("Preview", mode, modeLabel) { picked ->
                     selectVfPreviewMode(picked)
-                    text = "Preview: " + vfPreviewModeText().substringAfter("(").removeSuffix(")")
+                    text = "Preview: " + vfPreviewModeChoice().let { (mode, label) -> label(mode) }
                 }
             }
         })
@@ -317,6 +316,6 @@ internal fun MainActivity.showGeneralSettings(p: SettingsPage) {
         })
         markActive(generalTab)
         polish()
-        p.kit.collapseSection("Viewfinder", "Viewfinder")
+        // Keep preview switches visible directly on General, without a submenu.
         p.kit.collapseSection("Settings backup", "Backup & restore")
 }

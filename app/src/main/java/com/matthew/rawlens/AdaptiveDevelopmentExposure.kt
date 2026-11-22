@@ -94,7 +94,7 @@ data class AdaptiveExposureTuning(
                 // fixed so rolling off clouds cannot buy more capture/develop exposure.
                 highlightSoftHeadroom = if (resolved.toneMapper == PhotoToneMapper.BASIC)
                     resolved.highlightSoftHeadroom.toDouble() else AgxDisplayTransform.invertScopeCurve(
-                        encodedAnchor, resolved
+                        encodedAnchor, resolved.copy(highlightRecovery = 0f)
                     ).toDouble(),
                 highlightShoulder = if (resolved.toneMapper == PhotoToneMapper.BASIC) 0f else resolved.highlightShoulder,
                 centerWeight = resolved.centerWeight,
@@ -212,7 +212,9 @@ object AdaptiveDevelopmentExposure {
     fun analyze(
         cfa: UnpackedRawCfa,
         workspace: Workspace = Workspace(),
-        tuning: AdaptiveExposureTuning = AdaptiveExposureTuning()
+        tuning: AdaptiveExposureTuning = AdaptiveExposureTuning(),
+        /** One sensor frame: clipped photosites leave the highlight guards. Never for merges. */
+        singleFrame: Boolean = false
     ): AdaptiveExposureResult {
         require(cfa.values.size == cfa.width * cfa.height)
         val stride = bayerSampleStride(cfa.values.size)
@@ -235,7 +237,10 @@ object AdaptiveDevelopmentExposure {
             }
             index += stride
         }
-        return analyzeSamples(samples, count, tuning, weights)
+        val noise = HdrPlusSceneNoise.sampleNormalized(cfa.width, cfa.height, CLIP_LEVEL) { x, y ->
+            cfa.values[y * cfa.width + x]
+        }?.let { HdrPlusSceneNoise.fit(listOf(it)) }
+        return analyzeSamples(samples, count, tuning, weights, excludeClipped = singleFrame, noise = noise)
     }
 
     /**
@@ -290,7 +295,9 @@ object AdaptiveDevelopmentExposure {
         crop: RawCrop,
         lensShading: LensShadingModel?,
         workspace: Workspace = Workspace(),
-        tuning: AdaptiveExposureTuning = AdaptiveExposureTuning()
+        tuning: AdaptiveExposureTuning = AdaptiveExposureTuning(),
+        /** One sensor frame: clipped photosites leave the highlight guards. Never for merges. */
+        singleFrame: Boolean = false
     ): AdaptiveExposureResult {
         require(crop.left + crop.width <= layout.width && crop.top + crop.height <= layout.height)
         val input = source.duplicate().order(ByteOrder.nativeOrder())
@@ -300,11 +307,7 @@ object AdaptiveDevelopmentExposure {
         val samples = workspace.samples
         val bounded = tuning.bounded()
         val weights = if (bounded.centerWeight > 0f) workspace.weights else null
-        var count = 0
-        var index = 0
-        while (index < pixelCount) {
-            val x = index % crop.width
-            val y = index / crop.width
+        fun valueAt(x: Int, y: Int): Float {
             val planeX = crop.left + x
             val planeY = crop.top + y
             val sensorX = layout.sensorOriginX + planeX
@@ -318,6 +321,14 @@ object AdaptiveDevelopmentExposure {
                     sensorX, sensorY, normalization.sensorPattern.colorAt(sensorX, sensorY)
                 )
             }
+            return value
+        }
+        var count = 0
+        var index = 0
+        while (index < pixelCount) {
+            val x = index % crop.width
+            val y = index / crop.width
+            val value = valueAt(x, y)
             if (value.isFinite() && value > SHADOW_FLOOR) {
                 samples[count] = value
                 if (weights != null) {
@@ -330,7 +341,9 @@ object AdaptiveDevelopmentExposure {
             }
             index += stride
         }
-        return analyzeSamples(samples, count, tuning, weights)
+        val noise = HdrPlusSceneNoise.sampleNormalized(crop.width, crop.height, CLIP_LEVEL, ::valueAt)
+            ?.let { HdrPlusSceneNoise.fit(listOf(it)) }
+        return analyzeSamples(samples, count, tuning, weights, excludeClipped = singleFrame, noise = noise)
     }
 
     /**
@@ -451,7 +464,11 @@ object AdaptiveDevelopmentExposure {
         samples: FloatArray,
         count: Int,
         tuning: AdaptiveExposureTuning = AdaptiveExposureTuning(),
-        weights: FloatArray? = null
+        weights: FloatArray? = null,
+        /** Single-frame sensor samples only: merged RGB may carry valid values above 1. */
+        excludeClipped: Boolean = false,
+        /** The frame's own blind noise fit (never a vendor profile); null = histogram gates only. */
+        noise: HdrPlusNoiseModel? = null
     ): AdaptiveExposureResult {
         // AE-1: the log-average takes log2 of every sample between p5 and p95,
         // so a zero there made it -inf (max lift, HDR-scene ceiling) and a
@@ -463,8 +480,15 @@ object AdaptiveDevelopmentExposure {
         }
         // Meter what AgX sees: the scene-linear shoulder compresses above-knee
         // content before the log domain, so apply it before any statistic.
-        applyShoulder(samples, count, tuning.bounded().highlightShoulder)
+        // Sort on raw values first: clipped photosites (>= CLIP_LEVEL) sit at the top and
+        // are counted before the shoulder (monotonic, so it keeps the order) rewrites them.
         sortSamples(samples, weights, count)
+        var guardCount = count
+        while (guardCount > 0 && samples[guardCount - 1] >= CLIP_LEVEL) guardCount--
+        // Already-clipped photosites cannot be recovered by exposure: protecting them only
+        // greys them and darkens the frame. Highlight guards meter the unclipped tail.
+        if (!excludeClipped || guardCount < MIN_SAMPLES) guardCount = count
+        applyShoulder(samples, count, tuning.bounded().highlightShoulder)
         val low = percentile(samples, count, 0.05)
         val highForAverage = percentile(samples, count, 0.95)
         // Center weighting shapes only the brightness placement: guards below
@@ -488,10 +512,10 @@ object AdaptiveDevelopmentExposure {
         // of vetoing the whole frame's lift; scenes with broader bright areas
         // stay capped by the p95 broad guard below.
         val highlight = percentile(samples, count, 0.995).toDouble()
-        val spikeGuardLevel = percentile(samples, count, 0.99).toDouble()
+        val spikeGuardLevel = percentile(samples, guardCount, 0.99).toDouble()
         // Broad-area highlight level (sky, walls): keeps large bright regions
         // from flattening even when the p99 spike itself is still safe.
-        val highlightBroad = percentile(samples, count, 0.95).toDouble()
+        val highlightBroad = percentile(samples, guardCount, 0.95).toDouble()
         val bounded = tuning.bounded()
         var correction = log2(bounded.middleGreyTarget / exp2(logAverage))
         // Do not move the measured upper tail past display-referred white before AgX rolls it off.
@@ -506,12 +530,20 @@ object AdaptiveDevelopmentExposure {
         // backlit interior fires it (dim mids, small bright tail); night
         // streets and uniform LDR content do not.
         val dynamicRangeEv = log2(highlight.coerceAtLeast(1e-6) / midLevel.coerceAtLeast(1e-9))
-        val hdrScene = dynamicRangeEv > HDR_SCENE_RANGE_EV && highlightBroad > LOW_KEY_UPPER
+        // Noise-limited midtones (measured SNR below ISO 12232's "acceptable"
+        // level) mean a night/low-light frame, whatever its histogram says:
+        // lit lamps put p95 above the low-key level, so the HDR detector and
+        // night tier used to fire on night streets and lift the noise floor
+        // up to +1.8 EV. Daytime backlit scenes measure SNR 19-46 at ISO 50.
+        val noiseLimited = noise != null &&
+            midLevel / noise.sigma(midLevel) < ACCEPTABLE_MIDTONE_SNR
+        val hdrScene = !noiseLimited &&
+            dynamicRangeEv > HDR_SCENE_RANGE_EV && highlightBroad > LOW_KEY_UPPER
         val maxPositiveEv = if (hdrScene) HDR_SCENE_MAX_EV else MAX_CORRECTION_EV
 
         val median = percentile(samples, count, 0.50).toDouble()
         val upper = percentile(samples, count, 0.90).toDouble()
-        val lowKey = median < LOW_KEY_MEDIAN && upper < LOW_KEY_UPPER
+        val lowKey = noiseLimited || (median < LOW_KEY_MEDIAN && upper < LOW_KEY_UPPER)
         // A daytime HDR scene is low-key by histogram but must still lift: its
         // broad mass carries the room while only tiny tails clip.
         if (lowKey && correction > 0.0 && !hdrScene) correction *= LOW_KEY_POSITIVE_SCALE
@@ -523,7 +555,7 @@ object AdaptiveDevelopmentExposure {
         // lit instead of crushed black. Uniform streets (sep ~0) and day content
         // never enter the window. This applies to ETTR captures too: sensor
         // headroom does not determine display placement. Non-darkening via max().
-        if (lowKey && !hdrScene && correction > 0.0) {
+        if (lowKey && !noiseLimited && !hdrScene && correction > 0.0) {
             val spikeLevel = spikeGuardLevel.coerceAtLeast(1e-6)
             val broadLevel = highlightBroad.coerceAtLeast(1e-6)
             if (log2(spikeLevel / broadLevel) >= NIGHT_SEP_MIN_EV) {
@@ -638,6 +670,8 @@ object AdaptiveDevelopmentExposure {
 
     private const val MAX_SAMPLES = 65_536
     private const val MIN_SAMPLES = 64
+    /** Normalized sensor level treated as clipped (white level minus a small black/noise margin). */
+    private const val CLIP_LEVEL = 0.97f
     internal const val SHADOW_FLOOR = 1e-4f
     private const val TARGET_MIDDLE = 0.18
     // Defaults for [AdaptiveExposureTuning]; wired from JpegOutputSettings.
@@ -656,6 +690,10 @@ object AdaptiveDevelopmentExposure {
     private const val LOW_KEY_MEDIAN = 0.012
     private const val LOW_KEY_UPPER = 0.05
     private const val LOW_KEY_POSITIVE_SCALE = 0.25
+    // ISO 12232:2019 noise-based speed: midtone SNR 10 = "acceptable" image
+    // quality (40 = "excellent"). Below it the frame is noise-limited and
+    // develops low-key (no HDR-scene or night-tier lift).
+    private const val ACCEPTABLE_MIDTONE_SNR = 10.0
     // Night-tier relief (single frame, e.g. lit platform or bus interior):
     // the p99 spike must stand this far clear of the p95 broad mass before
     // the tier applies, so uniform night and day content stay bit-exact.

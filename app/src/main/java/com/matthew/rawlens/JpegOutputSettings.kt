@@ -39,12 +39,16 @@ data class JpegOutputSettings(
      */
     val highlightSoftHeadroom: Float = 0.85f,
     /**
-     * Highlight shoulder strength: 0 bypasses compression, 1 is full strength.
+     * Highlight shoulder strength: 0..1. AgX: bypass to full strength.
      * AgX uses a per-channel exponential shoulder (knee 0.9, scale 0.8).
-     * Basic uses one RGB scale from a rational shoulder (knee 0.6, white limit 1),
-     * preserving channel ratios before its display curve. Default 1.
+     * Basic Neutral varies the compression knee from 0.76 to 0.6 with a smooth
+     * path to white; compression stays enabled at zero. Default 1.
      */
     val highlightShoulder: Float = 1f,
+    /** Camera shadow lift, with near-black protection; zero bypasses it. */
+    val shadowLift: Float = CameraToneBalance.DEFAULT_SHADOW_LIFT,
+    /** Capped one-stop highlight pull before the selected display mapper. */
+    val highlightRecovery: Float = 0f,
     /**
      * Fixed-center subject weight for the develop meter's brightness
      * placement (log-average only; highlight guards stay global). 0 =
@@ -91,7 +95,9 @@ data class JpegOutputSettings(
      */
     val hlReconstruction: Boolean = true,
     /** B&W photosite mode (after rwmono); OFF keeps the colour develop. */
-    val mono: MonoSettings = MonoSettings()
+    val mono: MonoSettings = MonoSettings(),
+    /** Sigmoid / ACES 2.0 / Basic look controls (neutral defaults). */
+    val toneLook: ToneLookSettings = ToneLookSettings()
 ) {
     /**
      * Expand the existing AgX shadow range to restore middle grey after protection.
@@ -103,9 +109,9 @@ data class JpegOutputSettings(
         if (activeDLighting == ActiveDLighting.OFF) return agxShadowEv
         // Solve the original grey restoration after the camera toe. Its nonlinear
         // lift already compensates part of capture protection; do not add it twice.
-        val grey = .18f * CameraToneBalance.gain(.18f)
+        val grey = .18f * CameraToneBalance.gain(.18f, shadowLift, highlightRecovery)
         val protectedGrey = (.18 * kotlin.math.exp(-activeDLighting.protectionEv * kotlin.math.ln(2.0))).toFloat()
-        val liftedProtected = protectedGrey * CameraToneBalance.gain(protectedGrey)
+        val liftedProtected = protectedGrey * CameraToneBalance.gain(protectedGrey, shadowLift, highlightRecovery)
         val logGrey = kotlin.math.ln((grey / .18f).toDouble()) / kotlin.math.ln(2.0)
         val bias = kotlin.math.ln((grey / liftedProtected).toDouble()) / kotlin.math.ln(2.0)
         val h = agxHighlightEv.coerceAtLeast(3f)
@@ -136,6 +142,9 @@ data class JpegOutputSettings(
             highlightHeadroom = bounded(highlightHeadroom, 0.5f, 1.5f, 1f),
             highlightSoftHeadroom = bounded(highlightSoftHeadroom, 0.6f, 1f, 0.85f),
             highlightShoulder = bounded(highlightShoulder, 0f, 1f, 1f),
+            shadowLift = bounded(shadowLift, 0f, 1f, CameraToneBalance.DEFAULT_SHADOW_LIFT),
+            highlightRecovery = bounded(highlightRecovery, 0f, 1f, 0f),
+            toneLook = toneLook.bounded(),
             centerWeight = bounded(centerWeight, 0f, 3f, 0f),
             gainmapQuality = gainmapQuality.coerceIn(1, 100),
             hdrExposure = bounded(hdrExposure, 1e-6f, 1024f, 1f),

@@ -130,6 +130,8 @@ data class RawFrameMetadata(
     val whiteBalanceFallback: Boolean = false,
     /** Sensor limit used to distinguish analog from digital noise gain. */
     val maxAnalogSensitivityIso: Int? = null,
+    /** Manual ISO past the sensor max ([DigitalGain]); 1 = none. */
+    val digitalGain: Float = 1f,
     /** Verified session-specific geometry; independent of the vendor's stale mode/result tags. */
     val sensorReadoutProfile: String? = null,
     /** Paired physical capture calibration, in pre-correction active-array coordinates. */
@@ -160,6 +162,17 @@ object RawFrameMetadataFactory {
     fun capture(
         cameraId: String,
         image: Image,
+        characteristics: CameraCharacteristics,
+        result: TotalCaptureResult,
+        exifOrientation: Int,
+        levelOverrides: DngMetadataOverrides = DngMetadataOverrides()
+    ): RawFrameMetadata = capture(cameraId, RawImageView.of(image), characteristics, result,
+        exifOrientation, levelOverrides)
+
+    /** [capture] over a live or staged RAW plane ([BufferedRawFrame.view]). */
+    internal fun capture(
+        cameraId: String,
+        image: RawImageView,
         characteristics: CameraCharacteristics,
         result: TotalCaptureResult,
         exifOrientation: Int,
@@ -221,8 +234,8 @@ object RawFrameMetadataFactory {
         // black DNG. Sample the frame's own bytes instead; the tags stay
         // self-consistent with the payload. Sane HALs never sample.
         val sampled = if (DngLevelRepair.needsRepair(reportedBlack, reportedWhite)) {
-            image.planes.singleOrNull()?.let { plane ->
-                DngLevelRepair.sample(plane.buffer, plane.rowStride, plane.pixelStride,
+            image.buffer?.let { buffer ->
+                DngLevelRepair.sample(buffer, image.rowStride, image.pixelStride,
                     image.width, image.height)
             }
         } else null
@@ -240,7 +253,7 @@ object RawFrameMetadataFactory {
 
         val pixelSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
         val imageCrop = image.cropRect.snapshot()!!
-        val plane = image.planes.singleOrNull()
+        val plane = image.buffer?.takeIf { image.planeCount == 1 }
         val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE).snapshot()
         val preCorrection = characteristics
             .get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE).snapshot()
@@ -277,7 +290,7 @@ object RawFrameMetadataFactory {
             cfaValue != null && black != null && white != null && plane != null
         ) {
             runCatching {
-                RawWhiteBalanceFallback.estimate(plane.buffer, plane.rowStride, plane.pixelStride,
+                RawWhiteBalanceFallback.estimate(plane, image.rowStride, image.pixelStride,
                     image.width, image.height, cfaValue, black, white,
                     RawWhiteBalanceFallback.locusFor(characteristics),
                     RawWhiteBalanceFallback.exposureEv100(sensorKey(CaptureResult.SENSOR_EXPOSURE_TIME),
@@ -315,9 +328,9 @@ object RawFrameMetadataFactory {
         val packedFormat = PackedRawFormat.ofInt(image.format)
         val unsupported = when {
             plane == null -> "RAW_SENSOR must expose exactly one image plane"
-            plane.pixelStride < 2 && packedFormat == null ->
+            image.pixelStride < 2 && packedFormat == null ->
                 "RAW_SENSOR pixel stride cannot hold a 16-bit sample"
-            plane.rowStride < (image.width - 1) * plane.pixelStride + 2 ->
+            image.rowStride < (image.width - 1) * image.pixelStride + 2 ->
                 "RAW_SENSOR row stride is shorter than the image width"
             cfaValue == null -> "Camera2 did not report a CFA arrangement"
             cfaResult.isFailure -> cfaResult.exceptionOrNull()?.message
@@ -337,13 +350,15 @@ object RawFrameMetadataFactory {
             imageWidth = image.width,
             imageHeight = image.height,
             imageCrop = imageCrop,
-            rawPlaneCount = image.planes.size,
-            rawPlaneRowStride = plane?.rowStride,
-            rawPlanePixelStride = plane?.pixelStride,
+            rawPlaneCount = image.planeCount,
+            rawPlaneRowStride = plane?.let { image.rowStride },
+            rawPlanePixelStride = plane?.let { image.pixelStride },
             exifOrientation = exifOrientation,
             sensorOrientationDegrees = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
             sensitivityIso = sensorKey(CaptureResult.SENSOR_SENSITIVITY),
             maxAnalogSensitivityIso = characteristics.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY),
+            digitalGain = DigitalGain.gainFor(sensorKey(CaptureResult.SENSOR_SENSITIVITY),
+                characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.upper),
             exposureTimeNanos = sensorKey(CaptureResult.SENSOR_EXPOSURE_TIME),
             frameDurationNanos = sensorKey(CaptureResult.SENSOR_FRAME_DURATION),
             rollingShutterSkewNanos = sensorKey(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW),

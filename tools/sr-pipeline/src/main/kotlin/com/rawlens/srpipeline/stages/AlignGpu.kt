@@ -63,6 +63,8 @@ object AlignGpu {
         val argminWg: ByteArray? = null,
         /** corr_l2_fused.comp: whole-level fused L2, reordered parallel sums (mobile path). */
         val l2Fused: ByteArray? = null,
+        /** flow_pick.comp: alignment v2 candidate pick ([AlignLoopConfig.flowTransfer]). */
+        val flowPick: ByteArray? = null,
     )
 
     /** One coarse-to-fine row, cf. `AlignmentInit` (spectra replaced). */
@@ -130,6 +132,7 @@ object AlignGpu {
         private var keyH = -1
         private var keyW = -1
         private var keyFactors: List<Int>? = null
+        private var keyBinomial = false
         private var levels: MutableList<Array<FloatArray>>? = null
 
         fun moving(
@@ -137,20 +140,22 @@ object AlignGpu {
             padH: Int,
             padW: Int,
             factors: List<Int>,
+            binomial: Boolean = false,
         ): List<Array<FloatArray>> {
             val h = image.size + padH
             val w = image[0].size + padW
             var l = levels
-            if (l == null || keyH != h || keyW != w || keyFactors != factors) {
-                l = Resample.pyramidShapes(h, w, factors)
+            if (l == null || keyH != h || keyW != w || keyFactors != factors || keyBinomial != binomial) {
+                l = Resample.pyramidShapes(h, w, factors, binomial)
                     .map { (lh, lw) -> Array(lh) { FloatArray(lw) } }
                     .toMutableList()
                 levels = l
                 keyH = h
                 keyW = w
                 keyFactors = factors.toList()
+                keyBinomial = binomial
             }
-            Resample.buildGaussianPyramidInto(image, padH, padW, factors, null, l)
+            Resample.buildGaussianPyramidInto(image, padH, padW, factors, null, l, binomial)
             return l
         }
     }
@@ -158,6 +163,25 @@ object AlignGpu {
     class LevelScratch {
         private val floats = HashMap<String, FloatArray>()
         private val directs = HashMap<String, ByteBuffer>()
+        private val residents = HashMap<String, Long>()
+
+        /**
+         * Reusable device resident of exactly `n` floats (allocated once per
+         * run: Mali buffer allocation is ~ms per call). Freed by
+         * [freeResidents] ([freeLevelSpectra]).
+         */
+        fun resident(handle: Long, key: String, n: Long): Long {
+            residents[key]?.let { return it }
+            val r = SrpBridge.createResident(handle, n)
+            require(r != 0L) { "scratch resident alloc of $n floats failed ($key)" }
+            residents[key] = r
+            return r
+        }
+
+        fun freeResidents(handle: Long) {
+            for (r in residents.values) SrpBridge.freeResident(handle, r)
+            residents.clear()
+        }
 
         /** Reusable FloatArray of exactly `n` floats. */
         fun floats(key: String, n: Int): FloatArray {
@@ -262,7 +286,7 @@ object AlignGpu {
             val padH = if (h % config.tileSize == 0) 0 else config.tileSize - h % config.tileSize
             val padW = if (w % config.tileSize == 0) 0 else config.tileSize - w % config.tileSize
             val padded = circularPad(grey, padH, padW)
-            Resample.buildGaussianPyramid(padded, config.factors, config.preprocessing).toTypedArray()
+            Resample.buildGaussianPyramid(padded, config.factors, config.preprocessing, config.binomialPyramid).toTypedArray()
         }
         // Gradient-upload staging reused across levels (fully rewritten
         // per use): the old per-level packImg pair churned 2x level-size
@@ -509,6 +533,7 @@ object AlignGpu {
             if (lvl.gradXRes != 0L) SrpBridge.freeResident(handle, lvl.gradXRes)
             if (lvl.gradYRes != 0L) SrpBridge.freeResident(handle, lvl.gradYRes)
             if (lvl.hessRes != 0L) SrpBridge.freeResident(handle, lvl.hessRes)
+            lvl.scratch.freeResidents(handle)
         }
     }
 
@@ -546,9 +571,9 @@ object AlignGpu {
         // pad/pyramid/tmp garbage per frame. Null keeps the fresh-build
         // path (unit tests, one-shot callers).
         val movingPyramid = ptime("movingPyramid") {
-            pyramidReuse?.moving(movingGrey, padH, padW, config.factors)
+            pyramidReuse?.moving(movingGrey, padH, padW, config.factors, config.binomialPyramid)
                 ?: Resample.buildGaussianPyramid(
-                    circularPad(movingGrey, padH, padW), config.factors)
+                    circularPad(movingGrey, padH, padW), config.factors, binomial = config.binomialPyramid)
         }
         require(movingPyramid.size == n) { "moving pyramid must hold $n levels" }
         var flow: Array<Array<FloatArray>>? = null
@@ -556,19 +581,22 @@ object AlignGpu {
             val c = n - p - 1
             val lvl = init.levels[p]
             val moving = movingPyramid[p]
+            val mov = MovLevel(moving[0].size, moving.size, 0L) { moving }
             flow = if (flow == null) {
                 Array(lvl.nTy) { Array(lvl.nTx) { floatArrayOf(0f, 0f) } }
+            } else if (config.flowTransfer && spirvs.flowPick != null) {
+                ptime("flowTransfer") { transferFlow(flow, lvl, mov, c, config, handle, spirvs.flowPick) }
             } else {
                 ptime("upscaleFlow") { upscaleLvl(flow, intArrayOf(lvl.nTy, lvl.nTx), c, config) }
             }
             val current = flow
-            val mov = MovLevel(moving[0].size, moving.size, 0L) { moving }
             when (config.metrics[c]) {
                 BlockMetric.L1 -> gpuL1(lvl, mov, current, handle, spirvs.align, spirvs.alignWg)
                 BlockMetric.L2 -> gpuL2(lvl, mov, current, handle, spirvs)
             }
             ptime("ica") { gpuIca(lvl, mov, current, config, c, handle, spirvs.ica, spirvs.icaWg) }
             flow = current
+            if (c == 0 && config.flowMedian) flow = ptime("flowMedian") { median3x3(current) }
         }
         return flow ?: error("empty loop")
     }
@@ -597,9 +625,10 @@ object AlignGpu {
         private val padW: Int,
         private val factors: List<Int>,
         private val spirv: ByteArray,
+        private val binomial: Boolean = false,
     ) {
         /** Coarse-first level shapes (rows, cols), as [Resample.pyramidShapes]. */
-        val shapes: List<Pair<Int, Int>> = Resample.pyramidShapes(h + padH, w + padW, factors)
+        val shapes: List<Pair<Int, Int>> = Resample.pyramidShapes(h + padH, w + padW, factors, binomial)
         /** Resident grey (h x w) the caller fills each frame. */
         val grey: Long = alloc(h.toLong() * w)
         /** Persistent scratch for the two-pass FIR grey (h x w). */
@@ -616,9 +645,9 @@ object AlignGpu {
             for ((i, f) in factors.withIndex()) {
                 val (oh, _) = shapes[shapes.size - 1 - i]
                 if (f == 1) { taps.add(null) } else {
-                    val radius = (4 * f * 0.5 + 0.5).toInt()
-                    val k = Resample.gaussianKernel1d(f * 0.5, radius)
+                    val k = Resample.pyramidKernel(f, binomial)
                     val r = k.size / 2
+                    require(r <= 12) { "pyr_down.comp holds at most 13 half taps (factor $f has ${r + 1})" }
                     require(k.size % 2 == 1 && (0 until k.size).all { k[it] == k[k.size - 1 - it] }) {
                         "pyramid kernel for factor $f is not exactly symmetric"
                     }
@@ -687,6 +716,8 @@ object AlignGpu {
             val mov = MovLevel(lw, lh, pyr.levels[p]) { ptime("pyrDownload") { pyr.download(p) } }
             flow = if (flow == null) {
                 Array(lvl.nTy) { Array(lvl.nTx) { floatArrayOf(0f, 0f) } }
+            } else if (config.flowTransfer && spirvs.flowPick != null) {
+                ptime("flowTransfer") { transferFlow(flow, lvl, mov, c, config, handle, spirvs.flowPick) }
             } else {
                 ptime("upscaleFlow") { upscaleLvl(flow, intArrayOf(lvl.nTy, lvl.nTx), c, config) }
             }
@@ -697,8 +728,121 @@ object AlignGpu {
             }
             ptime("ica") { gpuIca(lvl, mov, current, config, c, handle, spirvs.ica, spirvs.icaWg) }
             flow = current
+            if (c == 0 && config.flowMedian) flow = ptime("flowMedian") { median3x3(current) }
         }
         return flow ?: error("empty loop")
+    }
+
+    /**
+     * Runs flow_pick.comp over one level: `cands` holds K flows per tile
+     * (tile-major, (x, y) level px); returns the cheapest per tile.
+     */
+    internal fun pickFlow(
+        lvl: GpuLevelInit, mov: MovLevel, cands: FloatArray, k: Int,
+        win: Int, stride: Int, origin: Int, step: Int, handle: Long, spirv: ByteArray,
+        transfer: IntArray? = null, transferF: FloatArray? = null,
+    ): Array<Array<FloatArray>> {
+        val nT = lvl.nTy * lvl.nTx
+        require((transfer != null || cands.size == nT * k * 2) && k in 1..4) { "pickFlow: ${cands.size} floats for $nT tiles x $k" }
+        require(lvl.refRes != 0L) { "pickFlow needs the pinned reference level" }
+        val n = mov.w.toLong() * mov.h
+        val sc = lvl.scratch
+        var tmpMov = 0L
+        try {
+            val movRes = if (mov.res != 0L) mov.res else SrpBridge.createResident(handle, n).also { r ->
+                require(r != 0L) { "pickFlow: moving alloc failed" }
+                tmpMov = r
+                val b = SrpBridge.directFloats(n.toInt())
+                val fb = b.asFloatBuffer(); for (row in mov.rows) fb.put(row)
+                require(SrpBridge.uploadResident(handle, r, b, n) == 0) { "pickFlow: moving upload failed" }
+            }
+            val candRes = sc.resident(handle, "pickCand$k${if (transfer != null) "t" else ""}", cands.size.toLong())
+            val cb = ptime("pickPack") { sc.direct("pickCand$k${if (transfer != null) "t" else ""}", cands.size).also { it.asFloatBuffer().put(cands) } }
+            require(ptime("pickUpload") { SrpBridge.uploadResident(handle, candRes, cb, cands.size.toLong()) } == 0) { "pickFlow: upload failed" }
+            val outRes = sc.resident(handle, "pickOut", nT * 2L)
+            val push = IntArray(32)
+            push[0] = mov.w; push[1] = mov.h; push[3] = nT
+            push[11] = lvl.nTx; push[12] = k; push[13] = win; push[14] = stride; push[15] = origin; push[16] = step
+            if (transfer != null && transferF != null) {
+                // mode 1: [sx, sy, tc] and [factor, first parent centre, parent spacing].
+                push[17] = 1; push[18] = transfer[0]; push[19] = transfer[1]; push[20] = transfer[2]
+                push[6] = java.lang.Float.floatToRawIntBits(transferF[0])
+                push[7] = java.lang.Float.floatToRawIntBits(transferF[1])
+                push[8] = java.lang.Float.floatToRawIntBits(transferF[2])
+            }
+            val rc = ptime("pickDispatch.L${lvl.nTx}") { SrpBridge.nativeDispatchRes(handle, spirv, longArrayOf(lvl.refRes, movRes, candRes, outRes),
+                longArrayOf(n, n, cands.size.toLong(), nT * 2L), push, 64, minOf(nT, 65535)) }
+            require(rc == 0) { "flow_pick failed with status $rc" }
+            val ob = sc.direct("pickOut", nT * 2)
+            require(ptime("pickDownload") { SrpBridge.downloadResident(handle, outRes, ob, nT * 2L) } == 0) { "pickFlow: download failed" }
+            val fb = ob.asFloatBuffer()
+            return ptime("pickUnpack") {
+                val flat = sc.floats("pickOut", nT * 2).also { fb.get(it) }
+                val nx = lvl.nTx
+                Array(lvl.nTy) { y -> Array(nx) { x -> val i = (y * nx + x) * 2; floatArrayOf(flat[i], flat[i + 1]) } }
+            }
+        } finally {
+            if (tmpMov != 0L) SrpBridge.freeResident(handle, tmpMov)
+        }
+    }
+
+    /**
+     * Alignment v2 hand-off from level c+1 to level c (hmfsr `transfer_flow`):
+     * three candidates per target tile — the parent tile whose centre is
+     * nearest, and the next parent horizontally and vertically on the side
+     * the target centre leans to — scaled by the level factor; picked by L1
+     * cost on the target tile. Parent centres map through the valid
+     * convolution of the pyramid (level c+1 px i sits at f*i + R in level c).
+     */
+    internal fun transferFlow(
+        src: Array<Array<FloatArray>>, lvl: GpuLevelInit, mov: MovLevel, c: Int,
+        config: AlignLoopConfig, handle: Long, spirv: ByteArray,
+    ): Array<Array<FloatArray>> {
+        val f = config.factors[c + 1]
+        val ts = config.tileSizes[c + 1]
+        val tc = config.tileSizes[c]
+        val r = if (f == 1) 0 else Resample.pyramidKernel(f, config.binomialPyramid).size / 2
+        val sy = src.size; val sx = src[0].size
+        val c0 = f * (ts * 0.5 - 0.5) + r + 0.5   // first parent centre, level-c continuous px
+        // Candidates are built in flow_pick.comp (mode 1) from the parent flow.
+        val parent = lvl.scratch.floats("transferParent", sy * sx * 2)
+        ptime("transferCands") {
+            var o = 0
+            for (row in src) for (v in row) { parent[o++] = v[0]; parent[o++] = v[1] }
+        }
+        // Level 0 is the full-res grey, half-band filtered (FIR7): scoring every
+        // 2nd px in each direction gives the same pick for a quarter of the reads.
+        val step = if (c == 0 && tc >= 16) 2 else 1
+        return pickFlow(lvl, mov, parent, 3, tc, tc, 0, step, handle, spirv,
+            intArrayOf(sx, sy, tc), floatArrayOf(f.toFloat(), c0.toFloat(), (f * ts).toFloat()))
+    }
+
+    /** 3x3 median of each flow component separately (repeat edge), cf. hmfsr flow_median.cpp. */
+    fun median3x3(flow: Array<Array<FloatArray>>): Array<Array<FloatArray>> {
+        val ny = flow.size; val nx = flow[0].size
+        val out = Array(ny) { Array(nx) { FloatArray(2) } }
+        java.util.stream.IntStream.range(0, ny).parallel().forEach { y ->
+            val v = FloatArray(9)
+            val r0 = flow[maxOf(y - 1, 0)]; val r1 = flow[y]; val r2 = flow[minOf(y + 1, ny - 1)]
+            for (x in 0 until nx) {
+                val xl = maxOf(x - 1, 0); val xr = minOf(x + 1, nx - 1)
+                for (ch in 0..1) {
+                    v[0] = r0[xl][ch]; v[1] = r0[x][ch]; v[2] = r0[xr][ch]
+                    v[3] = r1[xl][ch]; v[4] = r1[x][ch]; v[5] = r1[xr][ch]
+                    v[6] = r2[xl][ch]; v[7] = r2[x][ch]; v[8] = r2[xr][ch]
+                    out[y][x][ch] = median9(v)
+                }
+            }
+        }
+        return out
+    }
+
+    /** Median of 9 by the classic 19-exchange network (Paeth / Devillard). */
+    private fun median9(p: FloatArray): Float {
+        fun s(a: Int, b: Int) { if (p[a] > p[b]) { val t = p[a]; p[a] = p[b]; p[b] = t } }
+        s(1, 2); s(4, 5); s(7, 8); s(0, 1); s(3, 4); s(6, 7); s(1, 2); s(4, 5); s(7, 8)
+        s(0, 3); s(5, 8); s(4, 7); s(3, 6); s(1, 4); s(2, 5); s(4, 7); s(4, 2); s(6, 4); s(4, 2)
+        return p[4]
     }
 
     internal fun gpuL1(

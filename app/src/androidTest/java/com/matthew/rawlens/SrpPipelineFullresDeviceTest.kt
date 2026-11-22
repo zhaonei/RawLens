@@ -9,8 +9,6 @@ import com.rawlens.srpipeline.SrpBridge
 import com.rawlens.srpipeline.stages.AlignGpu
 import com.rawlens.srpipeline.stages.BurstConfig
 import com.rawlens.srpipeline.stages.DngRead
-import com.rawlens.srpipeline.stages.KernelNet
-import com.rawlens.srpipeline.stages.KernelNetConfig
 import com.rawlens.srpipeline.stages.KernelParams
 import com.rawlens.srpipeline.stages.NoiseLut
 import com.rawlens.srpipeline.stages.NoiseLutGen
@@ -127,11 +125,17 @@ class SrpPipelineFullresDeviceTest {
             val srpScale = args.getString("rawlensSrpScale")?.toFloatOrNull() ?: 1f
             val snr = BurstConfig.estimateSnr(refBox!!, alpha, beta)
             val fin = BurstConfig.finalize(snr)
-            val factors = listOf(1, 2, 4, 4)
-            BurstConfig.sanitize(1f, fin.tileSize, factors, fin.tileSizes, h, w)
+            // -e rawlensSrpAlignV2 true: alignment v2 (binomial pyramid, candidate hand-off, flow median).
+            val alignV2 = args.getString("rawlensSrpAlignV2") == "true"
+            val twoBand = args.getString("rawlensSrpTwoBand") == "true"
+            val levels = if (alignV2) BurstConfig.alignV2Levels(fin.tileSize, h, w)
+                else BurstConfig.AlignLevels(listOf(1, 2, 4, 4), fin.tileSizes, List(4) { if (it == 0) 1 else 4 })
+            val factors = levels.factors
+            BurstConfig.sanitize(1f, fin.tileSize, factors, levels.tileSizes, h, w)
             val config = PipelineConfig(
                 // -e rawlensSrpScale 2: 2x super-resolution output (default 1).
-                scale = srpScale, bayer = true, factors = factors, tileSizes = fin.tileSizes,
+                scale = srpScale, bayer = true, factors = factors, tileSizes = levels.tileSizes,
+                searchRadii = levels.searchRadii, alignV2 = alignV2,
                 // -e rawlensSrpGrey FIR7|FIR11|FIR15 (mobile FIR grey) or FFT (default).
                 greyMethod = args.getString("rawlensSrpGrey") ?: "FFT",
                 kernelParams = KernelParams(
@@ -149,17 +153,9 @@ class SrpPipelineFullresDeviceTest {
                 memoryTight = true,
                 // -e rawlensSrpColourDiff true: the app's default zipper-fix
                 // colour-difference merge (WB 1,1: same cost as the app).
-                colourDiff = if (args.getString("rawlensSrpColourDiff") == "true") floatArrayOf(1f, 1f) else null,
-                // -e rawlensSrpKernel kernelnet|wronski (default wronski);
-                // the merge input IS the full frame here.
-                kernelNet = if (args.getString("rawlensSrpKernel") != "kernelnet") null else {
-                    val (fx, fy) = KernelNet.rggbFlips(refMeta.cfa)
-                    KernelNetConfig(
-                        weights = KernelNet.bundledWeights(),
-                        sigma = KernelNet.sigma(
-                            FloatArray(4) { alpha[it].toFloat() }, FloatArray(4) { beta[it].toFloat() }),
-                        flipX = fx, flipY = fy)
-                },
+                colourDiff = if (twoBand || args.getString("rawlensSrpColourDiff") == "true") floatArrayOf(1f, 1f) else null,
+                // -e rawlensSrpTwoBand true: the app's default two-band reconstruction (implies colourDiff).
+                twoBand = if (twoBand) com.rawlens.srpipeline.stages.TwoBandReconstruction.Params() else null,
             )
             Log.i("SrpFullresDevice", "fullres ${w}x$h snr=%.2f tile=%d".format(snr, fin.tileSize))
             val fft = assetBytes("fft")
@@ -178,7 +174,8 @@ class SrpPipelineFullresDeviceTest {
                     // -e rawlensSrpAlignWg true: workgroup-per-tile L1 search.
                     alignWg = if (args.getString("rawlensSrpAlignWg") == "true") assetBytes("align_wg") else null,
                     argminWg = if (args.getString("rawlensSrpArgminWg") == "true") assetBytes("corr_argmin_wg") else null,
-                    l2Fused = if (args.getString("rawlensSrpL2Fused") == "true") assetBytes("corr_l2_fused") else null),
+                    l2Fused = if (args.getString("rawlensSrpL2Fused") == "true") assetBytes("corr_l2_fused") else null,
+                    flowPick = if (alignV2) assetBytes("flow_pick") else null),
                 VulkanPipeline.Spirvs(
                     gat = assetBytes("gat"), grad = assetBytes("grad"),
                     kernels = assetBytes("kernels"), divide = assetBytes("divide"),
@@ -187,7 +184,11 @@ class SrpPipelineFullresDeviceTest {
                     fft = fft, corr = assetBytes("corr"), greyFft = assetBytes("grey_fft"), greyFir = assetBytes("grey_fir"),
                     // -e rawlensSrpResident true: resident grey + GPU moving pyramid.
                     pyrDown = if (args.getString("rawlensSrpResident") == "true") assetBytes("pyr_down") else null,
-                    kernelNet = if (args.getString("rawlensSrpKernel") == "kernelnet") assetBytes("kernelnet") else null),
+                    mergeTwoBand = if (twoBand) assetBytes("merge_twoband") else null,
+                    twoBandResolve = if (twoBand) assetBytes("twoband_resolve") else null,
+                    twoBandDct = if (twoBand) assetBytes("twoband_dct") else null,
+                    twoBandTensor = if (twoBand) assetBytes("twoband_tensor") else null,
+                    robFeather = if (twoBand) assetBytes("rob_feather") else null),
                 // Native output like MfsrMerge: a 2x frame (600 MB) cannot be a heap direct buffer.
                 output = SrpBridge.nativeFloats((w * srpScale).toInt() * (h * srpScale).toInt() * 3),
             )

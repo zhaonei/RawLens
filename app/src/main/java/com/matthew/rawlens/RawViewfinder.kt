@@ -150,7 +150,10 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         var agxShadowEv: Float
         var agxHighlightEv: Float
         var agxGamut: Float
+        var shadowLift: Float
+        var highlightRecovery: Float
         var highlightShoulder: Float
+        var toneLook: FloatArray
         var rotation: Int
         var mirrored: Boolean
         var timestamp: Long
@@ -212,7 +215,10 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         override var agxShadowEv = 10f
         override var agxHighlightEv = 6.5f
         override var agxGamut = 0f
+        override var shadowLift = CameraToneBalance.DEFAULT_SHADOW_LIFT
+        override var highlightRecovery = 0f
         override var highlightShoulder = 1f
+        override var toneLook: FloatArray = ToneLook.DEFAULT
         override var rotation = 0
         override var mirrored = false
         override var timestamp = 0L
@@ -265,7 +271,10 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         override var agxShadowEv = 10f
         override var agxHighlightEv = 6.5f
         override var agxGamut = 0f
+        override var shadowLift = CameraToneBalance.DEFAULT_SHADOW_LIFT
+        override var highlightRecovery = 0f
         override var highlightShoulder = 1f
+        override var toneLook: FloatArray = ToneLook.DEFAULT
         override var lensGains: FloatArray? = null
         override var lensRows = 1
         override var lensCols = 1
@@ -393,7 +402,10 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
     @Volatile private var agxShadowEv = 10f
     @Volatile private var agxHighlightEv = 6.5f
     @Volatile private var agxGamut = 0f
+    @Volatile private var shadowLift = CameraToneBalance.DEFAULT_SHADOW_LIFT
+    @Volatile private var highlightRecovery = 0f
     @Volatile private var highlightShoulder = 1f
+    @Volatile private var toneLook: FloatArray = ToneLook.DEFAULT
     /** Preview highlight guards (hard p99.5 / soft p95), mirroring the save path. */
     @Volatile private var previewHeadroom = 1f
     @Volatile private var previewSoftHeadroom = 0.85f
@@ -529,6 +541,8 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
     private var gpuUvLoc = -1
     private var gpuJpegLoc = -1
     private val aces2 = Aces2Gl()
+    /** Baked JPEG-preview tone pipeline (one LUT fetch per pixel for every tone mapper). */
+    private val toneLutGl = VfToneLutGl(context.cacheDir)
     private var gpuBasicToneLoc = -1
     private var gpuAgxPunchyLoc = -1
     private var gpuAgxContrastLoc = -1
@@ -570,6 +584,8 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
     private var agxShadowEvLoc = -1
     private var agxHighlightEvLoc = -1
     private var agxGamutLoc = -1
+    private var cameraToneLoc = -1
+    private var gpuCameraToneLoc = -1
     private var highlightShoulderLoc = -1
     private var exposureEvLoc = -1
     private var lensLoc = -1
@@ -906,6 +922,10 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         agxHighlightEv = resolved.agxHighlightEv
         agxGamut = resolved.agxGamutCompression
         highlightShoulder = resolved.highlightShoulder
+        toneLook = ToneLook.values(resolved)
+        toneLutGl.request(resolved)
+        shadowLift = resolved.shadowLift
+        highlightRecovery = resolved.highlightRecovery
         previewHeadroom = resolved.highlightHeadroom
         // Single source of truth with the save-path meter: the broad guard is
         // re-solved under these AgX settings and the shoulder is carried over,
@@ -942,10 +962,13 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         // live preview is enough to attribute growth to the viewfinder in a session log.
         if (now >= memSampleNextMs) {
             memSampleNextMs = now + MemoryLeakDiagnostics.PERIODIC_INTERVAL_MS
-            MemoryLeakDiagnostics.sample(
-                "raw-vf-preview",
-                extra = "vf=${statVfWidth}x${statVfHeight} gpu=$statGpuPath engine=$engineMode"
-            )
+            // Debug.getMemoryInfo takes 30-80 ms: on the camera thread it dropped a VF frame
+            // every 30 s. Sample on a background thread instead.
+            val extra = "vf=${statVfWidth}x${statVfHeight} gpu=$statGpuPath engine=$engineMode"
+            Thread({
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                runCatching { MemoryLeakDiagnostics.sample("raw-vf-preview", extra = extra) }
+            }, "vf-mem-sample").apply { isDaemon = true }.start()
         }
         try {
             val plane = image.planes[0]
@@ -1577,6 +1600,11 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         }
         // B&W photo mode: project every matrix row onto luma so the existing
         // shaders output grey. Zero extra GPU work (no pass, no branch).
+        // Digital gain past the sensor ISO max (manual or PROGRAM AE): show it
+        // in both preview modes so the VF matches the saved still.
+        val digitalGain = DigitalGain.gainFor(result?.get(CaptureResult.SENSOR_SENSITIVITY),
+            c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.upper)
+        if (digitalGain > 1f && !renderJpeg) for (i in out.matrix.indices) out.matrix[i] *= digitalGain
         if (monoPreview) {
             foldLuma(out.matrix, LUMA_709)
             foldLuma(out.camToAces, LUMA_AP1)
@@ -1586,7 +1614,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         out.jpeg = renderJpeg
         out.displayP3 = previewP3
         out.lensGreenRow = VfGpuImport.lensGreenRow(channels)
-        out.exposureEv = previewExposureEv
+        out.exposureEv = previewExposureEv + DigitalGain.ev(digitalGain).toFloat()
         out.basicTone = basicTone
         out.agxPunchy = agxPunchy
         out.agxContrast = agxContrast
@@ -1597,6 +1625,9 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         out.agxHighlightEv = agxHighlightEv
         out.agxGamut = agxGamut
         out.highlightShoulder = highlightShoulder
+        out.toneLook = toneLook
+        out.shadowLift = shadowLift
+        out.highlightRecovery = highlightRecovery
         out.rotation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
         out.mirrored = c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
         expectFrameInterval(maxOf(result?.get(CaptureResult.SENSOR_FRAME_DURATION) ?: 0L,
@@ -1679,10 +1710,12 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         glUniformMatrix3fv(camToAcesLoc, 1, false, state.camToAces, 0)
         glUniform3fv(cameraWhiteLoc, 1, state.camWhite, 0)
         glUniform1i(displayP3Loc, if (state.displayP3) 1 else 0)
-        glUniform1i(jpegLoc, if (state.jpeg) 1 else 0)
+        // JPEG preview needs the baked LUT; until the first bake lands, show the RAW preview.
+        glUniform1i(jpegLoc, if (state.jpeg && toneLutGl.bind(program, TONE_LUT_UNIT, glEs3)) 1 else 0)
         glUniform1f(exposureEvLoc, state.exposureEv)
         glUniform1i(basicToneLoc, state.basicTone)
-        aces2.bind(program, state.basicTone)
+        aces2.bind(program, state.basicTone, state.toneLook)
+        android.opengl.GLES20.glUniform2f(cameraToneLoc, state.shadowLift, state.highlightRecovery)
         glUniform1f(agxPunchyLoc, state.agxPunchy)
         glUniform1f(agxContrastLoc, state.agxContrast)
         glUniform1f(agxSaturationLoc, state.agxSaturation)
@@ -2139,9 +2172,10 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
                     glUniformMatrix3fv(gpuCamToAcesLoc, 1, false, frame.camToAces, 0)
                     glUniform3fv(gpuCameraWhiteLoc, 1, frame.camWhite, 0)
                     glUniform1i(gpuDisplayP3Loc, if (frame.displayP3) 1 else 0)
-                    glUniform1i(gpuJpegLoc, if (frame.jpeg) 1 else 0)
+                    glUniform1i(gpuJpegLoc, if (frame.jpeg && toneLutGl.bind(gpuProgram, TONE_LUT_UNIT, glEs3)) 1 else 0)
                     glUniform1i(gpuBasicToneLoc, frame.basicTone)
-                    aces2.bind(gpuProgram, frame.basicTone)
+                    aces2.bind(gpuProgram, frame.basicTone, frame.toneLook)
+                    android.opengl.GLES20.glUniform2f(gpuCameraToneLoc, frame.shadowLift, frame.highlightRecovery)
                     glUniform1f(gpuAgxPunchyLoc, frame.agxPunchy)
                     glUniform1f(gpuAgxContrastLoc, frame.agxContrast)
                     glUniform1f(gpuAgxSaturationLoc, frame.agxSaturation)
@@ -2709,6 +2743,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         agxShadowEvLoc = glGetUniformLocation(program, "u_agxShadowEv")
         agxHighlightEvLoc = glGetUniformLocation(program, "u_agxHighlightEv")
         agxGamutLoc = glGetUniformLocation(program, "u_agxGamut")
+        cameraToneLoc = glGetUniformLocation(program, "u_camera_tone")
         highlightShoulderLoc = glGetUniformLocation(program, "u_highlightShoulder")
         exposureEvLoc = glGetUniformLocation(program, "u_exposureEv")
         lensLoc = glGetUniformLocation(program, "u_lens")
@@ -2719,11 +2754,10 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         quadBaseLoc = glGetUniformLocation(program, "u_quadBase")
         frameSizeLoc = glGetUniformLocation(program, "u_frameSize")
         stepLoc = glGetUniformLocation(program, "u_step")
+        // Tone uniforms (AgX/ACES/look/display P3) moved into the baked VfToneLut.
         check(gainsLoc >= 0 && colorLoc >= 0 && camToAcesLoc >= 0 && cameraWhiteLoc >= 0 &&
-            displayP3Loc >= 0 && positionLoc >= 0 && uvLoc >= 0 &&
-            jpegLoc >= 0 && agxContrastLoc >= 0 && agxSaturationLoc >= 0 && agxPurityLoc >= 0 &&
-            agxHueLoc >= 0 && agxShadowEvLoc >= 0 && agxHighlightEvLoc >= 0 && agxGamutLoc >= 0 &&
-            highlightShoulderLoc >= 0 &&
+            positionLoc >= 0 && uvLoc >= 0 &&
+            jpegLoc >= 0 &&
             exposureEvLoc >= 0 &&
             lensLoc >= 0 && lensSizeLoc >= 0 && lensActiveLoc >= 0 && applyLensLoc >= 0 &&
             lensGreenRowLoc >= 0 &&
@@ -2814,6 +2848,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
             gpuAgxShadowEvLoc = glGetUniformLocation(id, "u_agxShadowEv")
             gpuAgxHighlightEvLoc = glGetUniformLocation(id, "u_agxHighlightEv")
             gpuAgxGamutLoc = glGetUniformLocation(id, "u_agxGamut")
+            gpuCameraToneLoc = glGetUniformLocation(id, "u_camera_tone")
             gpuHighlightShoulderLoc = glGetUniformLocation(id, "u_highlightShoulder")
             gpuExposureEvLoc = glGetUniformLocation(id, "u_exposureEv")
             gpuBayerLoc = glGetUniformLocation(id, "u_bayer")
@@ -2829,10 +2864,8 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
             gpuApplyLensLoc = glGetUniformLocation(id, "u_applyLens")
             gpuLensGreenRowLoc = glGetUniformLocation(id, "u_lensGreenRow")
             check(gpuGainsLoc >= 0 && gpuColorLoc >= 0 && gpuCamToAcesLoc >= 0 && gpuCameraWhiteLoc >= 0 &&
-                gpuDisplayP3Loc >= 0 && gpuPositionLoc >= 0 && gpuUvLoc >= 0 &&
-                gpuJpegLoc >= 0 && gpuAgxContrastLoc >= 0 && gpuAgxSaturationLoc >= 0 && gpuAgxPurityLoc >= 0 &&
-                gpuAgxHueLoc >= 0 && gpuAgxShadowEvLoc >= 0 && gpuAgxHighlightEvLoc >= 0 && gpuAgxGamutLoc >= 0 &&
-                gpuHighlightShoulderLoc >= 0 &&
+                gpuPositionLoc >= 0 && gpuUvLoc >= 0 &&
+                gpuJpegLoc >= 0 &&
                 gpuExposureEvLoc >= 0 &&
                 gpuBayerLoc >= 0 && gpuQuadBaseLoc >= 0 && gpuFrameSizeLoc >= 0 && gpuStepLoc >= 0 &&
                 gpuChansLoc >= 0 && gpuBlackQLoc >= 0 && gpuDenQLoc >= 0 &&
@@ -2855,6 +2888,7 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
 
     private fun releaseGl() {
         aces2.close()
+        toneLutGl.close()
         // Runs on the GL worker: release native Vulkan imports first, then our refs.
         vfHint.close()
         try {
@@ -2893,6 +2927,8 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
         positionLoc = -1; uvLoc = -1
         jpegLoc = -1; basicToneLoc = -1; agxPunchyLoc = -1; agxContrastLoc = -1; agxSaturationLoc = -1; agxPurityLoc = -1
         agxHueLoc = -1; agxShadowEvLoc = -1; agxHighlightEvLoc = -1; agxGamutLoc = -1
+        cameraToneLoc = -1
+        gpuCameraToneLoc = -1
         highlightShoulderLoc = -1
         exposureEvLoc = -1
         lensLoc = -1; lensSizeLoc = -1; lensActiveLoc = -1; applyLensLoc = -1; lensGreenRowLoc = -1
@@ -2913,6 +2949,8 @@ class RawViewfinder @JvmOverloads constructor(context: Context, attrs: Attribute
     }
 
     companion object {
+        /** Texture unit of the VF tone LUT (0 = frame, 1 = lens shading). */
+        private const val TONE_LUT_UNIT = 2
         // WYSIWYG fragment shaders (CPU ESSL 1.00 + GPU ESSL 3.00) are composed from
         // shared pieces in VfGpuImport so both paths run the identical tonemap tail:
         // u_jpeg == 0 is the raw-clean Reinhard preview (+1 EV) with hardware

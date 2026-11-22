@@ -31,7 +31,6 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import android.view.View
-import com.particlesdevs.photoncamera.processing.ml.FlowNetNcnnProcessor
 import java.nio.ByteOrder
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ArrayBlockingQueue
@@ -186,10 +185,12 @@ class RawCameraController(
     private val bguViewfinder: VfEngine? = null,
     private val onRawExposureAssist: (RawExposureAssistFrame?) -> Unit = {},
     initialFacePriorityEnabled: Boolean = false,
+    initialContinuousAfPoint: Boolean = false,
     private val onFaces: (List<FaceOverlayBox>) -> Unit = { },
     private val vendorKeysByKey: (settingsKey: String?) -> VendorKeyProfile = { VendorKeyProfile() }
 ) {
     private val virtualLensStore = VirtualLensStore(context)
+    private val lensListStore = LensListStore(context)
     @Volatile internal var onPhotoCaptureAccepted: (() -> Unit)? = null
 
     /**
@@ -289,11 +290,11 @@ class RawCameraController(
     private var activeDualRaw = false
     private var activeDcgDualRaw = false
     private val pendingDualRawFrames = ArrayList<PendingHdrFrame>(2)
-    private var activeHdrSaveEachBracket = false
-    private var activeHdrSaveDebugFrames = false
     private var activeHdrStops = 2
     /** Flat per-shutter EV offsets for the in-flight bracket (see [HdrBracketConfig]). */
     private var activeHdrFrameEvs: IntArray = intArrayOf(-2, 0, 2)
+    /** Fractional EV per frame for the LK-R HDR debug bracket (null = use [activeHdrFrameEvs]). */
+    private var activeHdrFrameEvF: FloatArray? = null
     private val pendingHdrFrames = ArrayList<PendingHdrFrame>(3)
     /** Fresh Photo bursts retain exact RAW/result pairs until one merge owns them. */
     private var activePhotoMerge = false
@@ -306,6 +307,8 @@ class RawCameraController(
      * in [topupFrames] via onForwardPair until the remainder is filled.
      */
     private var topupActive = false
+    /** LK-R HDR: the running top-up is the forward bracket tail (count of short / long frames requested). */
+    private var hdrTailCount = 0
     private var topupHoldout: List<BufferedRawFrame> = emptyList()
     private val topupFrames = ArrayList<BufferedRawFrame>()
     /**
@@ -391,6 +394,7 @@ class RawCameraController(
     private var rawCameraIds: List<String> = emptyList()
     private var activePhysicalCameraId: String? = null
     private var selectedIso: Int? = null
+        set(value) { field = value; DigitalGain.requestedIso = value }
     private var selectedExposureNanos: Long? = null
     private var selectedWbKelvin: Int? = null
     @Volatile private var selectedWbPreset: Int = CaptureRequest.CONTROL_AWB_MODE_AUTO
@@ -485,7 +489,7 @@ class RawCameraController(
     private val faces = FaceTracking(FaceTrackingHost(), initialFacePriorityEnabled)
 
     // Camera2 photo continuous AF, tap scan and press-and-hold lock.
-    private val touchFocus = PhotoAutoFocus(PhotoAutoFocusHost())
+    private val touchFocus = PhotoAutoFocus(PhotoAutoFocusHost()).apply { continuousPoint = initialContinuousAfPoint }
     /** Last idle continuous-AF state/mode logged (transition-only trace). */
     /**
      * Idle continuous-AF trace (transitions only), fed every repeating
@@ -707,6 +711,8 @@ class RawCameraController(
                 val openId = resolveOpenCameraId(cameraId)
                 openId != null && openId !in ladder.unopenableOpenIds
             }.sortedWith(compareBy<String> { isFrontCamera(it) }.thenBy { opticalMetric(it) })
+                // Settings → Lenses order wins; lenses it doesn't know keep widest-first.
+                .let { LensListStore.applyOrder(it, lensListStore.order()) }
             val id = selectedCameraId?.takeIf(rawCameraIds::contains)
                 ?: preferredCameraId()?.takeIf(rawCameraIds::contains)
                 ?: rawCameraIds.firstOrNull()
@@ -735,6 +741,7 @@ class RawCameraController(
             val openCameraId = effectiveRoute.openCameraId
             activePhysicalCameraId = effectiveRoute.physicalCameraId
             characteristics = effectiveRoute.characteristics
+            supportsDualRaw() // refresh the cached answer for Settings
             if (id == "0") lapisSessionSpec?.let { LapisRootSession.bind(effectiveRoute.characteristics,it) }
             vendorKeyCharacteristics = if (effectiveRoute.physicalCameraId == null) effectiveRoute.characteristics
                 else runCatching { cameraManager.getCameraCharacteristics(openCameraId) }
@@ -2450,9 +2457,19 @@ class RawCameraController(
     }
 
     /** Uses the current lens and RAW session, including physical-camera outputs. */
-    fun supportsDualRaw(): Boolean =
-        lapisSessionSpec?.dcg == true ||
-            supportsCapability(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
+    /**
+     * Settings pauses the camera by default (characteristics cleared), so the
+     * answer from the last open camera is kept; otherwise the Dual-RAW switch
+     * is always greyed out inside Settings.
+     */
+    @Volatile private var lastDualRawSupport = false
+
+    fun supportsDualRaw(): Boolean {
+        if (characteristics == null && lapisSessionSpec == null) return lastDualRawSupport
+        return (lapisSessionSpec?.dcg == true ||
+            supportsCapability(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR))
+            .also { lastDualRawSupport = it }
+    }
 
     fun captureDualRaw() {
         if (lapisSessionSpec?.dcg == true) {
@@ -2541,70 +2558,68 @@ class RawCameraController(
         }
     }
 
-    /** Captures the default handheld bracket (-2, 0, +2 EV) around the latest metered pair. */
-    fun captureHdrBracket(saveEachBracket: Boolean = false, bracketStops: Int = 2,
-                          saveDebugFrames: Boolean = false) {
-        captureBracket(HdrBracketConfig.classic(bracketStops), saveEachBracket, saveDebugFrames)
+    /** Captures the ±[bracketStops] EV bracket; every frame is saved as its own DNG. */
+    fun captureHdrBracket(bracketStops: Int = 2) {
+        captureBracket(HdrBracketConfig.classic(bracketStops))
     }
 
     /**
-     * Captures the sequential-DCG trio (0, -2, 0 at fixed ISO) around the
-     * latest metered pair: two 0 EV frames for shadow averaging plus one
-     * -2 EV frame for highlight headroom. Merges through [HdrSeqMerge]
-     * (lightweight local alignment + noise-aware rejection), never the
-     * FlowNet/deghost path.
+     * Debug capture for LK-R HDR (Lecouat et al. 2022, HDR+SR from raw bursts): up to 8 frames,
+     * 5 x 0 EV, 2 x -2 EV, 1 x +1.5 EV, shutter only (ISO, focus, AWB frozen), each saved as
+     * its own DNG (F00..F07). F00 is a 0 EV frame (the merge reference); the long frame is
+     * last and capped at [LKR_HDR_LONG_CAP_NS] so a handheld night frame does not blur.
      */
-    fun captureSeqTrio(saveEachBracket: Boolean = false, saveDebugFrames: Boolean = false) {
-        captureBracket(HdrBracketConfig.seqZeroMinusTwoZero(), saveEachBracket, saveDebugFrames)
+    fun captureLkrHdrBracket() {
+        // DNG-only regardless of the user's format: JPEG formats cap in-flight saves at
+        // MAX_IN_FLIGHT_JPEG_SAVES. The RAW reader also keeps RAW_PREVIEW_RESERVED_SLOTS (10) of its
+        // maxImages for the viewfinder stream, so a 16-image reader admits 6 frames: the bracket shrinks
+        // to what fits (fewer 0 EV frames, the -2 / -2 / +1.5 tail is kept).
+        val outputFormat = CaptureFormat.DNG_ONLY
+        val orientationSnapshot = deviceOrientationDegrees
+        postShutter {
+            if (captureInProgress.get() || !hasPreviewMetadata) {
+                onState("BRACKETS WAIT")
+                return@postShutter
+            }
+            if (!supportsCapability(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)) {
+                onState("BRACKETS NEED MANUAL")
+                return@postShutter
+            }
+            val count = (LKR_HDR_DEBUG_EVS.size downTo LKR_HDR_DEBUG_MIN_FRAMES)
+                .firstOrNull { hasProcessingCapacity(it, outputFormat) }
+            if (count == null) {
+                onState("QUEUE FULL")
+                return@postShutter
+            }
+            val evs = lkrHdrDebugEvs(count)
+            activeHdrBracket = true
+            activeHdrStops = 2
+            activeHdrFrameEvs = IntArray(evs.size) { kotlin.math.round(evs[it]).toInt() }
+            activeHdrFrameEvF = evs.copyOf()
+            pendingHdrFrames.ensureCapacity(evs.size)
+            Log.i(LOG_TAG, "LK-R HDR debug bracket evs=${evs.joinToString()}")
+            captureFrames(evs.size, outputFormat = outputFormat,
+                orientationSnapshot = orientationSnapshot)
+        }
     }
 
-    /**
-     * Captures an explicit-stop bracket (e.g. [-3,-2,-1,0,+1]) with one frame
-     * per stop around the latest metered pair. See [HdrBracketConfig].
-     */
-    fun captureBracketStops(stops: IntArray, saveEachBracket: Boolean = false,
-                            saveDebugFrames: Boolean = false) {
-        captureBracket(HdrBracketConfig.plan(stops.copyOf()), saveEachBracket, saveDebugFrames)
-    }
-
-    /**
-     * Captures a dense multi-frame-per-stop burst in the raymerge style (e.g.
-     * stops [-3,-2,-1,0,+1] with 5/3/8/2/6 frames per stop): extra shutters on
-     * the shadows where photon noise dominates. All frames merge through the
-     * HDR path with per-frame alignment + deghost; the JPEG requires every EV
-     * covered (see [HdrBracketConfig.coverageSummary]).
-     */
-    fun captureBracketedBurst(stops: IntArray, framesPerStop: IntArray,
-                              saveEachBracket: Boolean = false,
-                              saveDebugFrames: Boolean = false) {
-        captureBracket(HdrBracketConfig.plan(stops.copyOf(), framesPerStop.copyOf()),
-            saveEachBracket, saveDebugFrames)
-    }
-
-    /** Shared shutter for [captureHdrBracket], [captureBracketStops], and [captureBracketedBurst]. */
-    fun captureBracket(plan: HdrBracketConfig.Plan, saveEachBracket: Boolean = false,
-                       saveDebugFrames: Boolean = false) {
+    private fun captureBracket(plan: HdrBracketConfig.Plan) {
         val outputFormat = captureFormat
         val orientationSnapshot = deviceOrientationDegrees
         postShutter {
             if (captureInProgress.get() || !hasPreviewMetadata) {
-                onState("HDR WAIT")
+                onState("BRACKETS WAIT")
                 return@postShutter
             }
             if (!supportsCapability(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)) {
-                onState("HDR NEEDS MANUAL")
+                onState("BRACKETS NEED MANUAL")
                 return@postShutter
             }
             activeHdrBracket = true
-            activeHdrSaveEachBracket = saveEachBracket && !saveDebugFrames
-            activeHdrSaveDebugFrames = saveDebugFrames
             activeHdrStops = plan.stops.maxOrNull()?.let { kotlin.math.max(it, -plan.stops.minOrNull()!!) } ?: 2
             activeHdrFrameEvs = IntArray(plan.totalFrames) { plan.frames[it].evStops }
+            activeHdrFrameEvF = null
             pendingHdrFrames.ensureCapacity(plan.totalFrames)
-            // Warm-start FlowNet now (process-wide singleton, background init):
-            // first-bracket merges were paying the ~10s model init inside the
-            // align window while runInference blocked on waitReady.
-            runCatching { FlowNetNcnnProcessor.start(context.applicationContext) }
             captureFrames(plan.totalFrames, outputFormat = outputFormat,
                 orientationSnapshot = orientationSnapshot)
         }
@@ -2883,7 +2898,31 @@ class RawCameraController(
     private fun hasMergeCapacity(outputFormat: CaptureFormat): Boolean =
         CaptureQueueCapacity.acceptsMerge(pendingMergeCount.get(), pendingFrameSaveCount.get(),
             zslSelectedFrameCount(outputFormat), rawReaderMaxImages,
-            SessionStreamSelection.RAW_PREVIEW_RESERVED_SLOTS)
+            SessionStreamSelection.RAW_PREVIEW_RESERVED_SLOTS,
+            maxJobs = mergeQueueLimit(zslSelectedFrameCount(outputFormat)))
+
+    /** RAM-derived merge queue depth ([MergeMemoryBudget.mergeQueueLimit]). */
+    private fun mergeQueueLimit(frames: Int): Int {
+        val pending = pendingMergeCount.get()
+        if (pending == 0) return 1 // idle: always admit; skip the memory query
+        val reader = rawReader ?: return MergeMemoryBudget.FALLBACK_MERGE_QUEUE
+        val px = reader.width.toLong() * reader.height
+        // LK-R Full 2x outputs 4x the pixels (LkrMerge: FULL_2X, or full-res at 1x zoom).
+        val outputScale = lkrOutputScale(mfsrSettings)
+        val limit = MergeMemoryBudget.mergeQueueLimit(
+            MergeMemoryBudget.systemHeadroomBytes(context), pending, px, frames, outputScale)
+        if (limit != lastMergeQueueLimit) {
+            lastMergeQueueLimit = limit
+            Log.i(LOG_TAG, "merge queue limit $limit (in flight $pending, ${frames}x${px / 1_000_000}MP, " +
+                MergeMemoryBudget.describeSystem(context) + ")")
+        }
+        return limit
+    }
+    @Volatile private var lastMergeQueueLimit = -1
+
+    private fun lkrOutputScale(settings: MfsrSettings): Int =
+        if (settings.enabled && settings.engine == MfsrEngine.LKR &&
+            (settings.lkrZoom == LkrZoom.FULL_2X || (settings.lkrFullRes && settings.lkrZoom == LkrZoom.X1))) 2 else 1
 
     private fun photoMergeFitsReader(count: Int): Boolean = CaptureQueueCapacity.accepts(
         pendingFrameSaveCount.get(), count, MAX_ZSL_FRAMES,
@@ -3050,7 +3089,8 @@ class RawCameraController(
         // + JPEG out). Mutual exclusivity with HDR+ is enforced at the
         // settings layer; this branch wins when both somehow engage.
         if (activeMfsrSettings.enabled) {
-            return takeFullRingForMerge(cutoff, selectedFrameCount, activeMfsrSettings.label, ::saveMfsrMerge)
+            return takeFullRingForMerge(cutoff, selectedFrameCount, activeMfsrSettings.label, ::saveMfsrMerge,
+                lkrHdr = activeMfsrSettings.engine == MfsrEngine.LKR)
         }
         // HDR+ merges to one artifact: same full-ring discipline as SR.
         if (activeHdrPlusSettings.enabled) {
@@ -3114,7 +3154,8 @@ class RawCameraController(
         cutoff: Long,
         count: Int,
         label: String,
-        save: (List<BufferedRawFrame>) -> Unit
+        save: (List<BufferedRawFrame>) -> Unit,
+        lkrHdr: Boolean = false
     ): Boolean {
         if (!hasProcessingCapacity(1, activeCaptureFormat)) {
             onState("ZSL QUEUED")
@@ -3132,6 +3173,7 @@ class RawCameraController(
                 rawZslCapacity, rawReaderMaxImages, SessionStreamSelection.RAW_PREVIEW_RESERVED_SLOTS)) {
             updateRepeatingRequest(allowRawZsl = false)
         }
+        if (lkrHdr && startLkrHdrIfWanted(selected)) return true
         activeFramesRemaining.set(0)
         onState("$label ×${selected.size} • PREPARING")
         save(selected)
@@ -3218,17 +3260,8 @@ class RawCameraController(
         val saveGeneration = lifecycleGeneration
         pendingMergeCount.incrementAndGet()
         pendingFrameSaveCount.addAndGet(selected.size)
-        val inputsReleased = AtomicBoolean(false)
-        fun releaseInputs() {
-            if (!inputsReleased.compareAndSet(false, true)) return
-            selected.forEach { RawImageOwnership.release(it.image) }
-            cameraHandler.post {
-                pendingFrameSaveCount.addAndGet(-selected.size)
-                closeRetiredRawReaders()
-                refreshCaptureAvailability()
-                resumeRawZslIfIdle()
-            }
-        }
+        val inputs = mergeInputs(selected, keepSourceBurst = settings.keepSourceBurst)
+        fun releaseInputs() = inputs.release()
         beginPendingSave()
         if (outputFormat.includesJpeg) beginJpegProcessing()
         val releasedOwnership = AutoCloseable {
@@ -3237,7 +3270,7 @@ class RawCameraController(
         val job = OwnedCaptureJob(releasedOwnership) {
             try {
                 HdrPlusZslSaveJob(context, zslMergeJobHost(saveGeneration, ::releaseInputs)).run(
-                    selected, settings, c, orientation, cameraId,
+                    inputs.frames(), settings, c, orientation, cameraId,
                     outputFormat, outputSettings, captureDenoiseSettings,
                     captureTimeMillis, captureGps = captureGps, saveSettings = saveSettings
                 )
@@ -3283,8 +3316,51 @@ class RawCameraController(
             override fun hdrPlusProcessor(): HdrPlusMerge = this@RawCameraController.hdrPlusProcessor()
             override fun gyroRunning(): Boolean = motionTracker.isRunning()
             override fun releaseInputs() = releaseInputs.invoke()
+            // The retained AMaZE session holds its EGL context, programs and
+            // ~220 MB of scratch textures between saves; on Adreno the context
+            // also pins ~300 MB of driver pool. Merges are gated on measured
+            // headroom, so free it first (logcat 2026-11-19, Redmi K30 Pro:
+            // idle gfx 33 -> 372 -> 658 MB, HDR+/MFSR refused for headroom).
+            override fun releaseDevelopCaches() {
+                val developer = rawDeveloper ?: return
+                rawDeveloper = null
+                try {
+                    developer.close()
+                } catch (failure: RuntimeException) {
+                    Log.w(LOG_TAG, "Could not release develop caches before merge", failure)
+                }
+                Runtime.getRuntime().gc()
+                Log.i(LOG_TAG, "Released develop caches before merge")
+            }
         }
     }
+
+    /**
+     * Single background thread that copies each merge burst out of the RAW
+     * reader right after the shutter, so the ZSL ring refills and the next
+     * photo can be taken while earlier merges are still queued or running.
+     */
+    private val mergeInputStager: java.util.concurrent.ExecutorService by lazy {
+        java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "RawLensMergeStage").apply { isDaemon = true }
+        }
+    }
+
+    /**
+     * Inputs of one queued merge. Camera buffers come back (and the shutter
+     * re-arms) as soon as staging copies them, or when the merge releases
+     * them if they could not be staged. keepSourceBurst saves the source
+     * DNGs from the live Images, so those bursts are not staged.
+     */
+    private fun mergeInputs(selected: List<BufferedRawFrame>, keepSourceBurst: Boolean, outputScale: Int = 1): MergeInputs =
+        MergeInputs(context, selected, mergeInputStager.takeUnless { keepSourceBurst }, outputScale) {
+            cameraHandler.post {
+                pendingFrameSaveCount.addAndGet(-selected.size)
+                closeRetiredRawReaders()
+                refreshCaptureAvailability()
+                resumeRawZslIfIdle()
+            }
+        }
 
     private fun zslMergeSaveSettings(cameraId: String) = ZslMergeSaveSettings(
         dngBackend = dngWriterBackend(),
@@ -3296,7 +3372,7 @@ class RawCameraController(
         focusView = developFocusView,
     )
 
-    private fun saveMfsrMerge(selected: List<BufferedRawFrame>) {
+    private fun saveMfsrMerge(selected: List<BufferedRawFrame>, hdrTail: Int = 0) {
         val settings = activeMfsrSettings
         val c = characteristics ?: run {
             selected.forEach { RawImageOwnership.release(it.image) }
@@ -3314,17 +3390,9 @@ class RawCameraController(
         val saveGeneration = lifecycleGeneration
         pendingMergeCount.incrementAndGet()
         pendingFrameSaveCount.addAndGet(selected.size)
-        val inputsReleased = AtomicBoolean(false)
-        fun releaseInputs() {
-            if (!inputsReleased.compareAndSet(false, true)) return
-            selected.forEach { RawImageOwnership.release(it.image) }
-            cameraHandler.post {
-                pendingFrameSaveCount.addAndGet(-selected.size)
-                closeRetiredRawReaders()
-                refreshCaptureAvailability()
-                resumeRawZslIfIdle()
-            }
-        }
+        val inputs = mergeInputs(selected, keepSourceBurst = settings.keepSourceBurst,
+            outputScale = lkrOutputScale(settings))
+        fun releaseInputs() = inputs.release()
         beginPendingSave()
         if (outputFormat.includesJpeg) beginJpegProcessing()
         val releasedOwnership = AutoCloseable {
@@ -3333,9 +3401,9 @@ class RawCameraController(
         val job = OwnedCaptureJob(releasedOwnership) {
             try {
                 MfsrZslSaveJob(context, zslMergeJobHost(saveGeneration, ::releaseInputs)).run(
-                    selected, settings, c, orientation, cameraId,
+                    inputs.frames(), settings, c, orientation, cameraId,
                     outputFormat, outputSettings, captureDenoiseSettings,
-                    captureTimeMillis, captureGps = captureGps, saveSettings = saveSettings
+                    captureTimeMillis, captureGps = captureGps, saveSettings = saveSettings, hdrTail = hdrTail
                 )
             } catch (failure: Exception) {
                 Log.e(LOG_TAG, "${settings.label} save failed", failure)
@@ -3425,6 +3493,54 @@ class RawCameraController(
      * mix under one stem. The holdout is already removed from the ring and is
      * owned here until the combined save (or an abort) releases it.
      */
+    /**
+     * LK-R HDR ([LkrHdrDecision]): decides on the press-moment (newest) ring frame. When short / long
+     * frames are wanted, the newest ring frames are kept, as many of the oldest released as the bracket
+     * adds (same total, same merge time), and the bracket is captured forward through the top-up path;
+     * [finishTopupBurst] hands the set to the LK-R merge. False = normal merge of [selected].
+     */
+    private fun startLkrHdrIfWanted(selected: List<BufferedRawFrame>): Boolean {
+        val mode = activeMfsrSettings.lkrHdr
+        if (mode == LkrHdrMode.OFF || selected.size < 3) return false
+        if (!supportsCapability(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)) return false
+        val c = characteristics ?: return false
+        val byTime = selected.sortedByDescending { it.timestampNanos }
+        val press = byTime.first()
+        val view = press.view()
+        val stats = if (mode == LkrHdrMode.AUTO) runCatching {
+            val black = press.result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
+                ?: c.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)?.let { p ->
+                    IntArray(4).also { p.copyTo(it, 0) }.map(Int::toFloat).toFloatArray() }
+            val white = (press.result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)
+                ?: c.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL))?.toFloat()
+            if (black == null || white == null) null else LkrHdrDecision.measure(view, black, white)
+        }.getOrNull() else null
+        val tile = runCatching { LkrBridge.nativeAutoTileSize(view.width, view.height, 1) }.getOrDefault(0)
+        val tileFraction = if (tile > 0) tile.toDouble() * tile / (view.width.toDouble() * view.height) else 1.0
+        val base = press.result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: lastExposureNanos
+        val longFits = base > 0 && base * Math.pow(2.0, LkrHdrDecision.LONG_EV.toDouble()) <= LKR_HDR_LONG_CAP_NS
+        val plan = LkrHdrDecision.decide(mode, stats, tileFraction, longFits, selected.size)
+        Log.i(LOG_TAG, "LK-R HDR $mode: clipped=${stats?.clippedFraction?.let { "%.4f".format(it) }} " +
+            "tile=${"%.4f".format(tileFraction)} median=${stats?.median?.let { "%.3f".format(it) }} " +
+            "p10=${stats?.p10?.let { "%.4f".format(it) }} noise=${stats?.noise?.let { "a=%.3g b=%.3g".format(it.a, it.b) }} " +
+            "longFits=$longFits -> ${plan.evs.joinToString()}")
+        if (!plan.any) return false
+        val keep = selected.size - plan.evs.size
+        byTime.drop(keep).forEach { RawImageOwnership.release(it.image) }
+        val kept = byTime.take(keep).sortedBy { it.timestampNanos }
+        topupActive = true
+        topupHoldout = kept
+        topupFrames.clear()
+        hdrTailCount = plan.evs.size
+        activeHdrBracket = true
+        activeHdrStops = 2
+        activeHdrFrameEvs = IntArray(plan.evs.size) { kotlin.math.round(plan.evs[it]).toInt() }
+        activeHdrFrameEvF = plan.evs.copyOf()
+        onState("LK-R HDR ×${selected.size}")
+        captureFrames(plan.evs.size, captureAlreadyStarted = true)
+        return true
+    }
+
     private fun startTopupBurst(holdout: List<BufferedRawFrame>, need: Int): Boolean {
         val remainder = need - holdout.size
         if (remainder <= 0) return false
@@ -3488,6 +3604,27 @@ class RawCameraController(
         topupActive = false
         topupHoldout = emptyList()
         topupFrames.clear()
+        val hdrTail = hdrTailCount
+        if (hdrTail > 0) {
+            // LK-R HDR: 0 EV ring frames first, then the bracket frames that arrived (exposures are read
+            // from their own results, so a partial tail still merges correctly).
+            hdrTailCount = 0
+            resetHdrBracketState()
+            Log.i(LOG_TAG, "LK-R HDR tail complete ring=${holdout.size} bracket=${fresh.size}/$hdrTail")
+            val set = holdout + fresh
+            if (set.size < MfsrSettings.MIN_MERGE_FRAMES) {
+                set.forEach { RawImageOwnership.release(it.image) }
+                finishCapture("CAPTURE ERROR")
+                resumeRawZslIfIdle()
+                return
+            }
+            activeFramesRemaining.set(0)
+            onState("LK-R HDR ×${set.size} • PREPARING")
+            saveMfsrMerge(set, hdrTail = fresh.size)
+            finishCapture()
+            publishRawZslStatus()
+            return
+        }
         val combined = (holdout + fresh).sortedBy { it.timestampNanos }
         if (combined.isEmpty()) {
             finishCapture("CAPTURE ERROR")
@@ -3507,6 +3644,7 @@ class RawCameraController(
     /** Releases a top-up in flight without saving (session teardown paths). */
     private fun abortTopupFrames() {
         topupActive = false
+        hdrTailCount = 0
         (topupHoldout + topupFrames).forEach { runCatching { RawImageOwnership.release(it.image) } }
         topupHoldout = emptyList()
         topupFrames.clear()
@@ -3805,7 +3943,13 @@ class RawCameraController(
         }
         val base = selectedExposureNanos ?: (if (useEttr) ettr.shutterNanos else null)
             ?: (if (useProgram) program.shutterNanos else null) ?: lastExposureNanos
-        val time = HdrBracketConfig.shutterNanos(base, stops).let { value ->
+        val evF = activeHdrFrameEvF?.getOrNull(frameIndex)
+        val time = (if (evF == null) HdrBracketConfig.shutterNanos(base, stops) else {
+            // LK-R HDR debug bracket: fractional stops; a long frame never exceeds the cap (or the base,
+            // if the base is already longer). The DNG records the real ExposureTime for the merge.
+            val t = (base * Math.pow(2.0, evF.toDouble())).toLong().coerceAtLeast(1L)
+            if (evF > 0f) minOf(t, maxOf(base, LKR_HDR_LONG_CAP_NS)) else t
+        }).let { value ->
             value.coerceIn(timeRange?.lower ?: value, timeRange?.upper ?: value)
         }
         builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
@@ -3814,7 +3958,7 @@ class RawCameraController(
 
         // DSLR-style exposure bracketing changes shutter only. Freeze the last settled focus
         // position and AWB state so focus breathing or per-frame colour adaptation cannot become
-        // false motion/chroma during FlowNet registration and radiance merging.
+        // false motion/chroma between bracket frames.
         val focus = selectedFocusDistanceDiopters
             ?: latestPreviewResult?.get(CaptureResult.LENS_FOCUS_DISTANCE)
         if (focus != null && focus.isFinite()) {
@@ -3826,7 +3970,7 @@ class RawCameraController(
         ) {
             builder.set(CaptureRequest.CONTROL_AWB_LOCK, true)
         }
-        Log.i(LOG_TAG, "HDR bracket frame=${frameIndex + 1}/${activeHdrFrameEvs.size} ev=$stops iso=$iso shutterNs=$time")
+        Log.i(LOG_TAG, "HDR bracket frame=${frameIndex + 1}/${activeHdrFrameEvs.size} ev=${evF ?: stops} iso=$iso shutterNs=$time")
     }
 
     /**
@@ -3985,6 +4129,7 @@ class RawCameraController(
         aeRegion = null
         updateDevelopFocus(null)
         touchFocus.clearAeLock()
+        touchFocus.clearContinuousPoint()
         if (hadTargets) updateRepeatingRequest(preserveRawZslBuffer = true)
         onMeteringReleased()
         onState("AE/AF RESET")
@@ -4065,6 +4210,17 @@ class RawCameraController(
         updateRepeatingRequest(preserveRawZslBuffer = true)
     }
 
+    /** Settings toggle: taps steer continuous AF (AF-C point) instead of a one-shot AF-S lock. */
+    fun setContinuousAfPointEnabled(enabled: Boolean) {
+        if (!isOnCameraThread()) {
+            cameraHandler.post { setContinuousAfPointEnabled(enabled) }
+            return
+        }
+        if (touchFocus.continuousPoint == enabled) return
+        touchFocus.continuousPoint = enabled
+        if (touchFocus.continuousPointActive || touchFocus.active) resetMeteringTargets()
+    }
+
     /** False before the first open, on lenses without face stats, or after a HAL rejection. */
     fun isFaceDetectSupported(): Boolean = faces.isSupported()
 
@@ -4135,7 +4291,7 @@ class RawCameraController(
             return
         }
         val range = characteristics?.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: return
-        val values = ISO_STEPS.filter(range::contains)
+        val values = ISO_STEPS.filter { it >= range.lower && it <= range.upper * DigitalGain.MAX_FACTOR }
         selectedIso = nextValue(selectedIso, values)
         controlsChanged()
     }
@@ -4864,7 +5020,7 @@ class RawCameraController(
         val options=rawCameraIds.map { id ->
             if(extended && id=="0") LensOption(id,"${mainLabel()} · 12.5 MP",id==selectedCameraId && mode==LapisRootProfile.Mode.NORMAL,
                 "normal","Main camera, 12.5 megapixel RAW")
-            else LensOption(id,zoomLabel(id),id==selectedCameraId)
+            else LensOption(id,lensListStore.name(id) ?: zoomLabel(id),id==selectedCameraId)
         }.toMutableList()
         if(extended) {
             val at=options.indexOfFirst { it.cameraId=="0" }+1
@@ -4912,7 +5068,7 @@ class RawCameraController(
 
     /** Advertised vendor keys for the open lens, backing the per-lens key editor. */
     fun vendorKeyDiscovery(): List<DiscoveredVendorKey> {
-        val chars = vendorKeyCharacteristics ?: return emptyList()
+        val chars = settingsVendorCharacteristics() ?: return emptyList()
         return VendorKeyAndroid.discover(chars)
     }
 
@@ -4925,12 +5081,30 @@ class RawCameraController(
     @Volatile private var measuredRawFpsDiagnostic = ""
     fun vendorRawFpsDiagnostic(): String = rawFpsDiagnostic + measuredRawFpsDiagnostic
 
+    /**
+     * Statics for Settings editors. Settings pauses the camera by default, which
+     * nulls the live fields; resolve the selected route from CameraManager then so
+     * editors don't read "not declared" (greyed DNG levels, FPS list without 60).
+     */
+    private fun settingsRoute(): CameraRoute? =
+        selectedCameraId?.let { id -> runCatching { resolveCameraRoute(id) }.getOrNull() }
+
+    private fun settingsCharacteristics(): CameraCharacteristics? =
+        characteristics ?: settingsRoute()?.characteristics
+
+    private fun settingsVendorCharacteristics(): CameraCharacteristics? =
+        vendorKeyCharacteristics ?: settingsRoute()?.let { route ->
+            if (route.physicalCameraId == null) route.characteristics
+            else runCatching { cameraManager.getCameraCharacteristics(route.openCameraId) }
+                .getOrDefault(route.characteristics)
+        }
+
     fun vendorRawPreviewFpsRanges(): List<IntRange> =
-        vendorKeyCharacteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        settingsVendorCharacteristics()?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
             .orEmpty().map { it.lower..it.upper }
 
     fun vendorRawPreviewFpsOptions(): List<Int> {
-        val ranges = vendorKeyCharacteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
+        val ranges = settingsVendorCharacteristics()?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
         return listOf(24, 30, 48, 50, 60).filter { fps -> ranges.any { it.lower <= fps && it.upper == fps } }
     }
 
@@ -5015,7 +5189,7 @@ class RawCameraController(
 
     /** Camera-provided values shown in the guided DNG override editor. */
     fun dngMetadataDefaults(): DngMetadataDefaults {
-        val camera = characteristics
+        val camera = settingsCharacteristics()
         fun transform(key: CameraCharacteristics.Key<ColorSpaceTransform>): List<Double>? =
             camera?.get(key)?.let { transform ->
                 List(9) { index -> transform.getElement(index / 3, index % 3).toDouble() }
@@ -5122,9 +5296,10 @@ class RawCameraController(
             if (!supportsCapability(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)) return null
             val range = characteristics?.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 ?: return null
+            val maxIso = range.upper * DigitalGain.MAX_FACTOR
             ManualControlRange(
-                range.lower.toLong(), range.upper.toLong(),
-                (selectedIso ?: lastIso).coerceIn(range.lower, range.upper).toLong(),
+                range.lower.toLong(), maxIso.toLong(),
+                (selectedIso ?: lastIso).coerceIn(range.lower, maxIso).toLong(),
                 selectedIso == null
             )
         }
@@ -5658,6 +5833,7 @@ class RawCameraController(
             ?.let { builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(it)) }
         logAfRequest(wantedAfMode, afMode, manualFocus, when {
             !afRegionsSupported -> "unsupported"
+            afRegion != null && touchFocus.continuousPointActive -> "tap-afc"
             afRegion != null -> "tap"
             faceRegion != null -> "face"
             else -> "full-frame"
@@ -5692,6 +5868,7 @@ class RawCameraController(
             manualSensorSupported =
                 supportsCapability(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR),
         ))
+        DigitalGain.autoGain = if (sensorExposure?.programDriven == true) program.digitalGain else 1f
         if (sensorExposure != null) {
             builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
             builder.set(CaptureRequest.SENSOR_SENSITIVITY, sensorExposure.iso)
@@ -6483,10 +6660,8 @@ class RawCameraController(
                 saveDualRaw(pair)
             }
             if (activeHdrBracket) {
-                val saveEachBracket = activeHdrSaveEachBracket
-                val saveDebugFrames = activeHdrSaveDebugFrames
                 resetHdrBracketState()
-                saveHdrBracket(pendingHdrFrames.toList(), saveEachBracket, saveDebugFrames)
+                saveHdrBracket(pendingHdrFrames.toList())
                 pendingHdrFrames.clear()
             }
             finishCapture()
@@ -6657,12 +6832,29 @@ class RawCameraController(
         beginPendingSave()
         pendingFrameSaveCount.addAndGet(2)
         val owner = CloseOnceOwner(frames) { RawImageOwnership.release(it.image) }
-        val released = AutoCloseable { try { owner.close() } finally { postSaveCompletion(2) } }
+        // Frames go back right after the GPU merge (before the DNG write); the
+        // ZSL/RAW viewfinder stream cannot restart while they are held.
+        val framesReleased = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun releaseFrames() {
+            if (!framesReleased.compareAndSet(false, true)) return
+            try { owner.close() } finally {
+                cameraHandler.post {
+                    pendingFrameSaveCount.addAndGet(-2)
+                    closeRetiredRawReaders()
+                    if (running && !destroyed) {
+                        refreshCaptureAvailability()
+                        resumeRawZslIfIdle()
+                        publishRawZslStatus()
+                    }
+                }
+            }
+        }
+        val released = AutoCloseable { try { releaseFrames() } finally { postSaveCompletion(0) } }
         val job = OwnedCaptureJob(released) {
             try {
                 DualRawSaver.save(context,c,ordered[0].image,ordered[0].result,
                     ordered[1].image,ordered[1].result,orientation,captureTime,gps,
-                    cameraId)
+                    cameraId, onInputsConsumed = ::releaseFrames)
                 cameraHandler.post { if (isCurrent(generation)) onState("RAW HDR TEST DNG SAVED") }
             } catch (failure: Exception) {
                 Log.e("RawLensDualRaw","Merge/save failed",failure)
@@ -6672,24 +6864,19 @@ class RawCameraController(
                 cameraHandler.post { if (isCurrent(generation)) onState("RAW HDR TEST MEMORY LIMIT") }
             }
         }
-        try { writer.execute(job) } catch (_: RejectedExecutionException) {
+        // DNG-only output: the parallel DNG worker, so the pair never waits
+        // behind a long HDR+/MFSR merge on the serial writer.
+        try { dngWriter.execute(job) } catch (_: RejectedExecutionException) {
             job.cancelBeforeRun(); onState("QUEUE FULL")
         }
     }
 
-    private fun saveHdrBracket(
-        pending: List<PendingHdrFrame>,
-        saveEachBracket: Boolean,
-        saveDebugFrames: Boolean
-    ) {
+    private fun saveHdrBracket(pending: List<PendingHdrFrame>) {
         val c = characteristics ?: return pending.forEach { RawImageOwnership.release(it.image) }
         if (pending.size < 2) return pending.forEach { RawImageOwnership.release(it.image) }
         val ownership = CloseOnceOwner(pending) { RawImageOwnership.release(it.image) }
         val orientation = activeOutputOrientation
         val cameraId = selectedCameraId ?: "unknown"
-        val outputFormat = activeCaptureFormat
-        val outputSettings = activeJpegOutputSettings
-        val denoise = activeDenoiseSettings
         // One identifier for the whole set, independent of serialization/development latency.
         val captureId = System.currentTimeMillis()
         // One fix for the whole set: every bracket shares the same geotag.
@@ -6699,36 +6886,43 @@ class RawCameraController(
         val captureDngBackend = dngWriterBackend()
         val captureDngOverrides = dngMetadataOverrides(cameraId)
         val captureDngCompression = dngCompression()
-        val captureDevelopedFormat = activeDevelopedFormat
-        val captureJxlSettings = activeJxlOutputSettings
-        val captureFocusView = developFocusView
         beginPendingSave()
         pendingFrameSaveCount.addAndGet(pending.size)
-        if (!saveEachBracket && outputFormat.includesJpeg) beginJpegProcessing()
         val saveGeneration = lifecycleGeneration
         fun reportSaveState(message: String) {
             cameraHandler.post { if (isCurrent(saveGeneration)) onState(message) }
         }
-        val releasedOwnership = AutoCloseable {
+        // The job unpacks every bracket into its own buffers first; the camera
+        // frames (and the shutter) are handed back then, not after the merge.
+        val framesReleased = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun releaseFrames() {
+            if (!framesReleased.compareAndSet(false, true)) return
             try { ownership.close() } finally {
-                postSaveCompletion(pending.size)
+                cameraHandler.post {
+                    pendingFrameSaveCount.addAndGet(-pending.size)
+                    closeRetiredRawReaders()
+                    if (running && !destroyed) {
+                        refreshCaptureAvailability()
+                        resumeRawZslIfIdle()
+                        publishRawZslStatus()
+                    }
+                }
             }
+        }
+        val releasedOwnership = AutoCloseable {
+            try { releaseFrames() } finally { postSaveCompletion(0) }
         }
         val input = HdrBracketSaveInput(
             characteristics = c, orientation = orientation, cameraId = cameraId,
-            outputFormat = outputFormat, outputSettings = outputSettings, denoise = denoise,
             captureId = captureId, gps = captureGps,
             dngBackend = captureDngBackend, dngOverrides = captureDngOverrides,
-            dngCompression = captureDngCompression, developedFormat = captureDevelopedFormat,
-            jxl = captureJxlSettings, focusView = captureFocusView,
-            saveEachBracket = saveEachBracket, saveDebugFrames = saveDebugFrames
+            dngCompression = captureDngCompression
         )
         val job = OwnedCaptureJob(releasedOwnership) {
-            HdrBracketSaveJob(context, pending, input, saveJobHost(report = ::reportSaveState)).run()
+            HdrBracketSaveJob(context, pending, input, saveJobHost(::releaseFrames, ::reportSaveState)).run()
         }
         try { writer.execute(job) } catch (_: RejectedExecutionException) {
             job.cancelBeforeRun()
-            if (!saveEachBracket && outputFormat.includesJpeg) endJpegProcessing()
             reportSaveState("QUEUE FULL")
         }
     }
@@ -6989,10 +7183,9 @@ class RawCameraController(
     /** Back to the default (non-bracket) capture: ±2 EV around 0. */
     private fun resetHdrBracketState() {
         activeHdrBracket = false
-        activeHdrSaveEachBracket = false
-        activeHdrSaveDebugFrames = false
         activeHdrStops = 2
         activeHdrFrameEvs = intArrayOf(-2, 0, 2)
+        activeHdrFrameEvF = null
     }
 
     private fun finishCapture(message: String? = null) {
@@ -7559,7 +7752,7 @@ class RawCameraController(
         }
         if (selectedWbKelvin != null && CameraWhiteBalance.setting(c, selectedWbKelvin!!) == null) selectedWbKelvin = null
         c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { range ->
-            selectedIso = selectedIso?.coerceIn(range.lower, range.upper)
+            selectedIso = selectedIso?.coerceIn(range.lower, range.upper * DigitalGain.MAX_FACTOR)
         } ?: run { selectedIso = null }
         c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { range ->
             selectedExposureNanos = selectedExposureNanos?.coerceIn(range.lower, range.upper)
@@ -7584,8 +7777,10 @@ class RawCameraController(
         val lens = zoomLabel(selectedCameraId)
         val flashAvailable = lapisSessionSpec?.dcg!=true && c?.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
         onControls(
-            if(lapisSessionSpec?.dcg==true) "ISO $lastIso · A" else selectedIso?.let { "ISO $it" }
-                ?: if (hasPreviewMetadata) "ISO $lastIso" else "ISO A",
+            if(lapisSessionSpec?.dcg==true) "ISO $lastIso · A" else selectedIso?.let { sel ->
+                val max = characteristics?.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.upper
+                if (max != null && sel > max) DigitalGain.isoLabel(max, sel.toFloat() / max) else "ISO $sel"
+            } ?: if (hasPreviewMetadata) DigitalGain.isoLabel(lastIso, DigitalGain.autoGain) else "ISO A",
             if(lapisSessionSpec?.dcg==true) formatExposure(lastExposureNanos)+" · A" else selectedExposureNanos?.let(::formatExposure)
                 ?: if (hasPreviewMetadata) formatExposure(lastExposureNanos) else "S A",
             whiteBalanceLabel(),
@@ -7989,6 +8184,18 @@ class RawCameraController(
         private const val AWB_VERDICT_SETTLE_MS = 3000L
         private const val OPEN_REJECTION_RETRY_DELAY_MS = 2000L
         private const val LOG_TAG = "RawLensCamera"
+        /** LK-R HDR debug bracket, capture order: 5 x 0 EV (F00 = reference), 2 x -2 EV, 1 x +1.5 EV. */
+        internal val LKR_HDR_DEBUG_EVS = floatArrayOf(0f, 0f, 0f, 0f, 0f, -2f, -2f, 1.5f)
+        /** Smallest debug bracket: 2 x 0 EV (reference + one), 2 x -2 EV, 1 x +1.5 EV. */
+        internal const val LKR_HDR_DEBUG_MIN_FRAMES = 5
+        /** [LKR_HDR_DEBUG_EVS] shrunk to [count] frames by dropping 0 EV frames (reference stays first). */
+        internal fun lkrHdrDebugEvs(count: Int): FloatArray {
+            val tail = LKR_HDR_DEBUG_EVS.filter { it != 0f }
+            val zeros = (count - tail.size).coerceAtLeast(1)
+            return FloatArray(zeros) { 0f } + tail.toFloatArray()
+        }
+        /** Longest shutter the +EV frame may use (1/8 s handheld), unless the base is longer. */
+        private const val LKR_HDR_LONG_CAP_NS = 125_000_000L
         private const val DEBUG_UPDATE_INTERVAL_MS = 200L
         private const val RAW_VF_DEBUG_INTERVAL_MS = 500L
         private const val PREVIEW_METADATA_INTERVAL_MS = 125L
@@ -8004,7 +8211,7 @@ class RawCameraController(
         private const val MIN_WB_KELVIN = 2000
         private const val MAX_WB_KELVIN = 10000
         private const val FOCUS_DISTANCE_SCALE = 1_000f
-        private val ISO_STEPS = listOf(100, 200, 400, 800, 1600, 3200)
+        private val ISO_STEPS = listOf(100, 200, 400, 800, 1600, 3200, 6400)
         private val SHUTTER_STEPS = listOf(
             1_000_000_000L / 1000, 1_000_000_000L / 500, 1_000_000_000L / 250,
             1_000_000_000L / 125, 1_000_000_000L / 60, 1_000_000_000L / 30,

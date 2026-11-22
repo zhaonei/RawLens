@@ -10,14 +10,13 @@ import com.matthew.rawlens.MainActivity.Companion.KEY_DYNAMIC_EXPOSURE_BALANCE
 import com.matthew.rawlens.MainActivity.Companion.KEY_DYNAMIC_EXPOSURE
 
 import com.matthew.rawlens.MainActivity.Companion.KEY_FACE_PRIORITY
+import com.matthew.rawlens.MainActivity.Companion.KEY_AFC_POINT
 
-import com.matthew.rawlens.MainActivity.Companion.KEY_SEQ_TRIO_ENABLED
 
 import com.matthew.rawlens.MainActivity.Companion.KEY_HDR_BRACKET_STOPS
+import com.matthew.rawlens.MainActivity.Companion.KEY_LKR_HDR_DEBUG
 
-import com.matthew.rawlens.MainActivity.Companion.KEY_HDR_SAVE_EACH_BRACKET
 
-import com.matthew.rawlens.MainActivity.Companion.KEY_HDR_SAVE_DEBUG_FRAMES
 
 
 import android.Manifest
@@ -61,7 +60,6 @@ import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
-import com.particlesdevs.photoncamera.processing.ml.FlowNetNcnnProcessor
 import com.particlesdevs.photoncamera.processing.ml.RawNindNcnnProcessor
 import java.io.File
 import java.util.Locale
@@ -202,6 +200,12 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
         })
         val programIsoMinButton = Button(this)
         val programIsoMaxButton = Button(this)
+        val programDigitalGainButton = Button(this)
+        fun digitalGainText(ev: Float) = "Digital gain: " + when {
+            ev <= 0f -> "Off"
+            ev >= ProgramAeProfile.MAX_DIGITAL_GAIN_EV -> "Maximum"
+            else -> "+${ev.toInt()} EV"
+        }
         val programShutterMinButton = Button(this)
         val programShutterMaxButton = Button(this)
         val programLockButton = Button(this)
@@ -227,6 +231,8 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
             programLockButton.isEnabled = manualSensor
             programIsoMinButton.isEnabled = manualSensor
             programIsoMaxButton.isEnabled = manualSensor
+            programDigitalGainButton.text = digitalGainText(programSettings.digitalGainEv)
+            programDigitalGainButton.isEnabled = manualSensor
             programShutterMinButton.isEnabled = manualSensor
             programShutterMaxButton.isEnabled = manualSensor
             programMeteringButton.isEnabled = manualSensor
@@ -242,6 +248,16 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
             p.kit.choose("ISO min", listOf(0, 100, 200, 400, 800), programSettings.isoMin,
                 { programIsoBoundText(it, isMin = true) }) { value ->
                 programSettings = programSettings.copy(isoMin = value)
+                refreshProgramButtons(); applyProgramSettings()
+            }
+        }
+        programDigitalGainButton.setOnClickListener {
+            // rawr-style: brightening past the highest real ISO and shutter, applied after
+            // RAW; DNGs carry it as BaselineExposure.
+            p.kit.choose("Digital gain past max ISO",
+                listOf(0f, 1f, 2f, 3f, 4f, ProgramAeProfile.MAX_DIGITAL_GAIN_EV),
+                programSettings.digitalGainEv, { digitalGainText(it) }) { value ->
+                programSettings = programSettings.copy(digitalGainEv = value)
                 refreshProgramButtons(); applyProgramSettings()
             }
         }
@@ -286,6 +302,7 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
         }
         content.addView(programIsoMinButton)
         content.addView(programIsoMaxButton)
+        content.addView(programDigitalGainButton)
         content.addView(programShutterMinButton)
         content.addView(programShutterMaxButton)
         content.addView(programBiasLabel)
@@ -369,49 +386,30 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
             setTextColor(getColor(R.color.text_secondary))
             textSize = 11f
         })
-        content.addView(sectionTitle("HDR brackets"))
-        content.addView(sectionDesc("Merged HDR saves one DNG by default; optionally keep every bracket. Frame-level debug output lives under the Debug tab."))
+        content.addView(sectionTitle("Exposure brackets"))
+        content.addView(sectionDesc("Brackets captures a 3-frame exposure bracket and saves every frame as its own DNG (IMG_<time>_F00/F01/F02). No merge."))
         content.addView(SettingsSwitch(this).apply {
-            text = "HDR: save all 3 brackets as separate DNGs (do not merge)"
-            setTextColor(getColor(R.color.text_primary))
-            isChecked = lensPreferences().getBoolean(KEY_HDR_SAVE_EACH_BRACKET, false)
-            setOnCheckedChangeListener { _, enabled ->
-                lensPreferences().edit().putBoolean(KEY_HDR_SAVE_EACH_BRACKET, enabled).apply()
-                setStatus(if (lensPreferences().getBoolean(KEY_HDR_SAVE_DEBUG_FRAMES, false))
-                    "HDR DBG ×3"
-                else if (enabled) "HDR ×3 DNG" else "HDR MERGED")
-                preloadFlowNetForMergedHdr()
-                updateQuickControls()
-            }
-        })
-        content.addView(SettingsSwitch(this).apply {
-            text = "HDR bracket range: −4 / 0 / +4 EV"
+            text = "Bracket range: −4 / 0 / +4 EV"
             setTextColor(getColor(R.color.text_primary))
             isChecked = hdrBracketStops() == 4
             setOnCheckedChangeListener { _, enabled ->
                 val stops = if (enabled) 4 else 2
                 lensPreferences().edit().putInt(KEY_HDR_BRACKET_STOPS, stops).apply()
-                setStatus("HDR ±${stops} EV")
+                setStatus("BRACKETS ±${stops} EV")
                 updateQuickControls()
             }
         })
         content.addView(SettingsSwitch(this).apply {
-            text = "Sequential trio 0 / −2 / 0 EV (shadow averaging + highlights)"
+            text = "Debug: LK-R HDR bracket (up to 8 frames: 0 EV frames, 2 × −2, 1 × +1.5 EV)"
             setTextColor(getColor(R.color.text_primary))
-            isChecked = seqTrioEnabled()
+            isChecked = lkrHdrDebugBracket()
             setOnCheckedChangeListener { _, enabled ->
-                lensPreferences().edit().putBoolean(KEY_SEQ_TRIO_ENABLED, enabled).apply()
-                setStatus(if (enabled) "SEQ TRIO 0/−2/0 ON" else "SEQ TRIO OFF")
+                lensPreferences().edit().putBoolean(KEY_LKR_HDR_DEBUG, enabled).apply()
+                setStatus(if (enabled) "HDR DEBUG" else "BRACKETS ±${hdrBracketStops()} EV")
                 updateQuickControls()
             }
         })
-        content.addView(TextView(this).apply {
-            text = "Two 0 EV frames average shadows (~3 dB); the −2 EV frame " +
-                "rescues highlights. Same ISO, lightweight local alignment. " +
-                "Needs the HDR toggle on; overrides the ±2/±4 bracket range."
-            setTextColor(getColor(R.color.text_secondary))
-            textSize = 11f
-        })
+        content.addView(sectionDesc("With the Brackets toggle on, the shutter saves up to 8 DNGs (as many as the RAW queue holds, 6 on most phones: 3 × 0, 2 × −2, 1 × +1.5 EV; F00 = 0 EV reference, long frame last, max 1/8 s) for testing the LK-R HDR merge. Hold still-ish; no merge yet."))
         content.addView(sectionTitle("Face priority"))
         content.addView(sectionDesc("HAL face detection steers AF/AE to the largest face (sand box). Tap targets override faces; manual sensor modes ignore the regions but still show boxes."))
         content.addView(SettingsSwitch(this).apply {
@@ -425,6 +423,18 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
                     if (!enabled) "FACE OFF"
                     else if (controller.isFaceDetectSupported()) "FACE ON" else "FACE N/A"
                 )
+            }
+        })
+        content.addView(sectionTitle("Focus point"))
+        content.addView(sectionDesc("AF-C point: a tap moves the continuous-AF area to that spot and keeps tracking there (no lock, no 10 s timeout) until AE/AF reset or double-tap. Press-and-hold still locks AF-S ∞. Off = tap runs a one-shot AF-S lock. Lenses without AF regions or continuous AF fall back to AF-S."))
+        content.addView(SettingsSwitch(this).apply {
+            text = "AF-C with focus point"
+            setTextColor(getColor(R.color.text_primary))
+            isChecked = lensPreferences().getBoolean(KEY_AFC_POINT, false)
+            setOnCheckedChangeListener { _, enabled ->
+                lensPreferences().edit().putBoolean(KEY_AFC_POINT, enabled).apply()
+                controller.setContinuousAfPointEnabled(enabled)
+                setStatus(if (enabled) "AF-C POINT" else "AF-S TAP")
             }
         })
         markActive(exposureTab)

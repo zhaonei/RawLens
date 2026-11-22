@@ -73,26 +73,59 @@ data class PipelineConfig(
      */
     val memoryTight: Boolean = false,
     /**
-     * Reconstruction kernel source. Null: Wronski's per-frame anisotropic
-     * kernels (supplement S.1, 1:1 with the IPOL reference). Non-null:
-     * PhotonCamera KernelNet from the reference frame ([KernelNetConfig]);
-     * Vulkan bayer path only.
-     */
-    val kernelNet: KernelNetConfig? = null,
-    /**
-     * KernelNet's continuous motion handling for the Wronski kernels too:
-     * regularized finest-grid flow, B-spline flow / strength sampling,
-     * bilinear robustness lookup and soft motion-membership rejection.
-     * Always on with [kernelNet]; false keeps Wronski IPOL-exact.
+     * Continuous motion handling: regularized finest-grid flow, B-spline
+     * flow / strength sampling, bilinear robustness lookup and soft
+     * motion-membership rejection. False keeps Wronski IPOL-exact.
      */
     val continuousMotion: Boolean = false,
     /**
-     * KernelNet's reconstruction details for Wronski's per-frame kernels
-     * (Vulkan bayer path): 7x7 faded gather, separate green detail
-     * reconstruction and green frame weights (with [colourDiff]).
-     * Always on with [kernelNet]; false keeps Wronski IPOL-exact.
+     * Detail reconstruction for Wronski's per-frame kernels (Vulkan bayer
+     * path): 7x7 faded gather, separate green detail reconstruction and
+     * green frame weights (with [colourDiff]). False keeps Wronski IPOL-exact.
      */
     val detailReconstruction: Boolean = false,
+    /**
+     * Even out merged noise where motion rejection left fewer effective
+     * frames (noise_even.comp): green-guided smoothing blended to the noise
+     * of a fully accepted pixel under the same frame weights. Vulkan bayer
+     * path with [colourDiff] only; false = plain merge.
+     */
+    val noiseEvening: Boolean = false,
+    /**
+     * Lateral chromatic aberration: radial R/B scale fitted on the merged
+     * output's edges (LateralCa), corrected by ca_warp.comp when visible.
+     * Vulkan bayer path with [colourDiff] only.
+     */
+    val lateralCa: Boolean = false,
+    /**
+     * Ghost mask: morphological opening of each frame's rejection (drops
+     * isolated false rejections), grown by half a flow tile past the
+     * continuous-motion smoothing, then capping robustness. Fixes the trail
+     * leak continuous motion adds (synthetic trail 53.5 -> ~60 dB). Vulkan
+     * bayer robustness path only.
+     */
+    val ghostGrow: Boolean = false,
+    /**
+     * Blurry-frame weighting: each comparison frame's robustness is scaled by
+     * min(1, E/E_ref)^gamma, E = noise-corrected green detail energy
+     * (FrameSharpness). 0 = off. Vulkan bayer path.
+     */
+    val blurGamma: Float = 0f,
+    /**
+     * Per-burst black pedestal (BlackPedestal): subtract the neutral floor the
+     * reference frame's darkest blocks show above the metadata black, from
+     * the merged output. Vulkan bayer path with [colourDiff].
+     */
+    val blackPedestal: Boolean = false,
+    /**
+     * Alignment v2 (hmfsr b71c534 port): binomial pyramid, parent-candidate
+     * flow hand-off and a 3x3 median of the final flow
+     * ([AlignLoopConfig.binomialPyramid] / flowTransfer / flowMedian). The
+     * caller supplies the v2 levels ([BurstConfig.alignV2Levels]). The hand-off
+     * needs [AlignGpu.Spirvs.flowPick]; without it [upscaleLvl] is used.
+     * SRP_ALIGN2_OFF=binomial,transfer,median drops parts (A/B).
+     */
+    val alignV2: Boolean = false,
     /** Opt-in pooled polynomial green / colour-difference fitting (CPU prototype). */
     val organicReconstruction: Boolean = false,
     /** Mobile separable polynomial equivalent-kernel path; Vulkan only. */
@@ -115,9 +148,20 @@ data class PipelineConfig(
     val chromaScale: Float = 1f,
     /** Reduce luminance averaging uniformly to retain source grain; 0 disables (KernelNet colour differences). */
     val grainRetention: Float = DEFAULT_GRAIN_RETENTION,
+    /**
+     * Vulkan bayer merge: two-band reconstruction (merge_twoband +
+     * twoband_resolve + twoband_dct) instead of per-frame kernels. Needs
+     * colourDiff. [TwoBandReconstruction] is the CPU reference.
+     */
+    val twoBand: TwoBandReconstruction.Params? = null,
 ) {
     companion object {
-        const val DEFAULT_GRAIN_RETENTION = 1f
+        /**
+         * Owner choice 2026-11-20: 0.5 (was 1). Known-truth bench, static,
+         * PSNR 1x clean/iso100/dim: 1 = 47.86/44.27/37.50, 0.5 =
+         * 48.13/44.85/38.30, 0 = 47.75/44.96/38.83; owner A/B on hdrplus 133623.
+         */
+        const val DEFAULT_GRAIN_RETENTION = 0.5f
     }
 }
 
@@ -129,6 +173,9 @@ object EndToEnd {
      * default (`1` finest, `4` elsewhere); metrics default to `L1` finest
      * then `L2`, cf. `config.alignment.block_matching.metrics`.
      */
+    private val align2Off: Set<String> =
+        System.getenv("SRP_ALIGN2_OFF")?.split(',')?.map { it.trim() }?.toSet() ?: emptySet()
+
     fun loopConfig(config: PipelineConfig): AlignLoopConfig {
         val nLevels = config.factors.size
         val radii = config.searchRadii
@@ -145,6 +192,9 @@ object EndToEnd {
             flowUpscaleMode = config.flowUpscaleMode,
             preprocessing = config.alignmentPreprocessing,
             edgeExtendFlow = config.edgeExtendFlow,
+            binomialPyramid = config.alignV2 && "binomial" !in align2Off,
+            flowTransfer = config.alignV2 && "transfer" !in align2Off,
+            flowMedian = config.alignV2 && "median" !in align2Off,
         )
     }
 

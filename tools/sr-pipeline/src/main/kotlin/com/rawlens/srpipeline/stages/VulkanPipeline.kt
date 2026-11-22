@@ -46,6 +46,19 @@ import java.nio.ByteBuffer
  * no 150 MB row copy on top of the download).
  */
 object VulkanPipeline {
+    /** noise_even.comp range kernel width, in merged-noise sigmas. */
+    const val NOISE_EVEN_RANGE = 2f
+
+    /**
+     * Ghost-mask visibility scale K: a frame's rejection seeds mask growth with
+     * weight d / (d + K (a L + b) / N), d = its squared local-mean difference to
+     * the reference. Calibrated on WronskiVsKernelNetBenchTest motion scenes:
+     * K 1 / 10 / 100 -> clean trail 57.8 / 57.7 / 57.0 dB (53.5 ungrown), iso100
+     * 43.6 / 43.7 / 43.9 and dim 35.3 / 35.5 / 36.0 (44.0 / 36.0 ungrown):
+     * at 100 noisy bursts keep their noise while clean ones lose the ghost.
+     */
+    const val GHOST_VISIBILITY = 100f
+
 
     /** Stage modules beyond the align loop's own [AlignGpu.Spirvs]. */
     data class Spirvs(
@@ -60,8 +73,6 @@ object VulkanPipeline {
         val fft: ByteArray,
         /** corr.comp for the resident grey interleave (cf. [SrpBridge.nativeGreyFftRes]). */
         val corr: ByteArray,
-        /** kernelnet.comp, required when [PipelineConfig.kernelNet] is set. */
-        val kernelNet: ByteArray? = null,
         /**
          * grey_fft.comp: mixed-radix FFT grey (true lengths, no Bluestein
          * padding or host staging). Null keeps the Bluestein chain.
@@ -75,10 +86,21 @@ object VulkanPipeline {
          * Null keeps the host pyramid.
          */
         val pyrDown: ByteArray? = null,
+        /** noise_acc.comp + noise_even.comp: required for [PipelineConfig.noiseEvening]. */
+        val noiseAcc: ByteArray? = null,
+        val noiseEven: ByteArray? = null,
+        /** ca_warp.comp: required for [PipelineConfig.lateralCa]. */
+        val caWarp: ByteArray? = null,
+        /** Two-band reconstruction (PipelineConfig.twoBand). */
+        val mergeTwoBand: ByteArray? = null,
+        val twoBandResolve: ByteArray? = null,
+        val twoBandDct: ByteArray? = null,
+        /** twoband_tensor.comp: edge steering field (TwoBandReconstruction.Params.steer). */
+        val twoBandTensor: ByteArray? = null,
+        /** rob_feather.comp: feathered robustness (TwoBandReconstruction.Params.featherRadius). */
+        val robFeather: ByteArray? = null,
     )
 
-    /** Last KernelNet (s1, s2, rho) map of this process, for parity dumps: 3 x mapH x mapW. */
-    @Volatile var lastKernelNetMap: FloatArray? = null
 
     private fun pack(data: FloatArray): ByteBuffer {
         val b = SrpBridge.directFloats(data.size)
@@ -236,7 +258,7 @@ object VulkanPipeline {
     ): ByteBuffer {
         require(handle != 0L) { "VulkanPipeline: null context handle" }
         require(!config.organicReconstruction) { "pooled polynomial reconstruction is currently a CPU prototype" }
-        require(!config.mobilePolynomial || (config.bayer && config.colourDiff != null && config.kernelNet == null && spirvs.mergePolynomial != null)) {
+        require(!config.mobilePolynomial || (config.bayer && config.colourDiff != null && spirvs.mergePolynomial != null)) {
             "mobile polynomial requires Bayer colour differences, Wronski and its dedicated shader"
         }
         val greenFrameWeights = LumaFrameWeights.forBurst(comparisons.size+1, config.grainRetention)
@@ -332,6 +354,26 @@ object VulkanPipeline {
         require(numRes != 0L) { "VulkanPipeline: resident num alloc failed" }
         val denRes = SrpBridge.createResident(handle, total.toLong())
         require(denRes != 0L) { "VulkanPipeline: resident den alloc failed" }
+        // Noise evening (guide grid): per-frame robustness upload + vec4
+        // accumulators (sum g r, sum (g r)^2, sum r, sum r^2).
+        val twoBand = config.twoBand?.takeIf { config.bayer && config.colourDiff != null }
+        if (twoBand != null) require(spirvs.mergeTwoBand != null && spirvs.twoBandResolve != null && spirvs.twoBandDct != null &&
+            (!twoBand.steer || spirvs.twoBandTensor != null) && (twoBand.featherRadius == 0 || spirvs.robFeather != null)) {
+            "VulkanPipeline: two-band needs merge_twoband / twoband_resolve / twoband_dct" }
+        val tbAuxRes = if (twoBand != null) SrpBridge.createResident(handle, 4L * outW * outH) else 0L
+        val tbRobRes = if (twoBand != null) SrpBridge.createResident(handle, (gw * gh).toLong()) else 0L
+        val tbRobTmp = if (twoBand != null && twoBand.featherRadius > 0) SrpBridge.createResident(handle, (gw * gh).toLong()) else 0L
+        var tbFlowRes = 0L
+        if (twoBand != null) require(tbAuxRes != 0L && tbRobRes != 0L) { "VulkanPipeline: two-band alloc failed" }
+        val evening = twoBand == null && config.noiseEvening && config.bayer && config.colourDiff != null &&
+            spirvs.noiseAcc != null && spirvs.noiseEven != null
+        val evenRRes = if (evening) SrpBridge.createResident(handle, (gw * gh).toLong()) else 0L
+        val evenAccRes = if (evening) SrpBridge.createResident(handle, (4L * gw * gh)) else 0L
+        if (evening) require(evenRRes != 0L && evenAccRes != 0L) { "VulkanPipeline: noise evening alloc failed" }
+        var evenFrames = 0
+        var evenSumG = 0.0
+        var evenSumG2 = 0.0
+        var pedestal = 0f
         // Supplement S.3 map (reference guide grid), 0 = off.
         var hfRes = 0L
         // Perf slice (a): upload-once frame + kernels chain scratch,
@@ -344,16 +386,17 @@ object VulkanPipeline {
         // kerngrad, which exact-size residents cannot express).
         val frameRes = SrpBridge.createResident(handle, (w * h).toLong())
         require(frameRes != 0L) { "VulkanPipeline: resident frame alloc failed" }
-        val kernPreRes = if (config.mobilePolynomial) 0L else SrpBridge.createResident(handle, (w * h).toLong())
-        require(config.mobilePolynomial || kernPreRes != 0L) { "VulkanPipeline: resident kernPre alloc failed" }
-        val kernGreyRes = if (config.mobilePolynomial) 0L else SrpBridge.createResident(handle, (gw * gh).toLong())
-        require(config.mobilePolynomial || kernGreyRes != 0L) { "VulkanPipeline: resident kernGrey alloc failed" }
-        val kernGradsRes = if (config.mobilePolynomial) 0L else SrpBridge.createResident(handle, ((gw - 1) * (gh - 1) * 2).toLong())
-        require(config.mobilePolynomial || kernGradsRes != 0L) { "VulkanPipeline: resident kernGrads alloc failed" }
-        val kernCovRes = if (config.mobilePolynomial) 0L else SrpBridge.createResident(handle, (gw * gh * 4).toLong())
-        require(config.mobilePolynomial || kernCovRes != 0L) { "VulkanPipeline: resident kernCov alloc failed" }
-        // KernelNet covariances (one map for the whole burst), 0 = Wronski.
-        var knCovRes = 0L
+        // Two-band computes the kernel covariance once, from the reference
+        // (edge-steered narrow kernel), so it keeps these residents.
+        val noKernels = config.mobilePolynomial
+        val kernPreRes = if (noKernels) 0L else SrpBridge.createResident(handle, (w * h).toLong())
+        require(noKernels || kernPreRes != 0L) { "VulkanPipeline: resident kernPre alloc failed" }
+        val kernGreyRes = if (noKernels) 0L else SrpBridge.createResident(handle, (gw * gh).toLong())
+        require(noKernels || kernGreyRes != 0L) { "VulkanPipeline: resident kernGrey alloc failed" }
+        val kernGradsRes = if (noKernels) 0L else SrpBridge.createResident(handle, ((gw - 1) * (gh - 1) * 2).toLong())
+        require(noKernels || kernGradsRes != 0L) { "VulkanPipeline: resident kernGrads alloc failed" }
+        val kernCovRes = if (noKernels) 0L else SrpBridge.createResident(handle, (gw * gh * 4).toLong())
+        require(noKernels || kernCovRes != 0L) { "VulkanPipeline: resident kernCov alloc failed" }
         val polynomialLutRes = if(config.mobilePolynomial) SrpBridge.createResident(handle,MobilePolynomial.table.size.toLong()).also { r ->
             require(r != 0L) { "polynomial LUT allocation failed" }
             checkRc("polynomial LUT",SrpBridge.uploadResident(handle,r,pack(MobilePolynomial.table),MobilePolynomial.table.size.toLong()))
@@ -588,20 +631,58 @@ object VulkanPipeline {
                     packInto(mergeFlowFlat, mergeFlow), cov, rBuf, numRes, denRes,
                     spirvs.mergeSplat, w, h, outW, outH, tile,
                     config.scale, config.bayer, ftx, fty)) }
+            } else if (twoBand != null) {
+                // Edge steering: the reference frame's Wronski covariance (frameRes
+                // still holds the raw frame here), kept in kernCovRes for every frame.
+                if (reference && twoBand.steer) {
+                    frameKernelsGpuRes()   // GAT grey + gradients (kernGradsRes); cov unused
+                    val tp = IntArray(32)
+                    tp[2] = gw * gh; tp[7] = java.lang.Float.floatToRawIntBits(twoBand.maxStretch.toFloat())
+                    tp[12] = gw - 1; tp[13] = gh - 1; tp[14] = gw
+                    timed("tbTensor") { checkRc("tbTensor", SrpBridge.dispatchRes(handle, spirvs.twoBandTensor!!,
+                        longArrayOf(kernGradsRes, kernCovRes), longArrayOf(2L * (gw - 1) * (gh - 1), 4L * gw * gh),
+                        tp, (gw * gh).toLong())) }
+                }
+                timed("colourDiffUpload") { checkRc("colourDiffUpload", SrpBridge.uploadResident(handle, frameRes,
+                    ColourDiff.packInto(frame, frameBuf, config.colourDiff!![0], config.colourDiff[1]), (w * h).toLong())) }
+                frameObserver?.invoke(frameBuf, flow, rBuf)
+                if (tbFlowRes == 0L) tbFlowRes = SrpBridge.createResident(handle, 2L * ftx * fty).also {
+                    require(it != 0L) { "VulkanPipeline: two-band flow alloc failed" } }
+                checkRc("tbFlow", SrpBridge.uploadResident(handle, tbFlowRes, packInto(mergeFlowFlat, mergeFlow), 2L * ftx * fty))
+                rBuf.rewind()
+                checkRc("tbRob", SrpBridge.uploadResident(handle, tbRobRes, rBuf, (gw * gh).toLong()))
+                if (twoBand.featherRadius > 0 && !reference) timed("tbFeather") {
+                    // min x -> tmp, min y -> rob, mean x -> tmp, mean y -> rob.
+                    val n = (gw * gh).toLong()
+                    for ((k, op) in listOf(0 to 0, 0 to 1, 1 to 0, 1 to 1).withIndex()) {
+                        val fp = IntArray(32)
+                        fp[2] = gw * gh; fp[11] = op.first; fp[12] = op.second; fp[13] = gw; fp[14] = gh; fp[15] = twoBand.featherRadius
+                        val (src, dst) = if (k % 2 == 0) tbRobRes to tbRobTmp else tbRobTmp to tbRobRes
+                        checkRc("tbFeather$k", SrpBridge.dispatchRes(handle, spirvs.robFeather!!, longArrayOf(src, dst), longArrayOf(n, n), fp, n))
+                    }
+                }
+                val push = IntArray(32)
+                push[0] = w; push[1] = h; push[2] = outW * outH; push[5] = tile
+                push[6] = java.lang.Float.floatToRawIntBits(config.scale)
+                push[7] = java.lang.Float.floatToRawIntBits(twoBand.sigmaHigh.toFloat())
+                push[8] = java.lang.Float.floatToRawIntBits(twoBand.sigmaLow.toFloat())
+                push[12] = ftx; push[13] = outW; push[14] = fty
+                push[15] = if (twoBand.steer) gw else 0
+                timed("mergeTwoBand") { checkRc("mergeTwoBand", SrpBridge.dispatchRes(handle, spirvs.mergeTwoBand!!,
+                    longArrayOf(frameRes, tbFlowRes, tbRobRes, numRes, denRes, tbAuxRes, kernCovRes),
+                    longArrayOf((w * h).toLong(), 2L * ftx * fty, (gw * gh).toLong(), total.toLong(), total.toLong(), 4L * outW * outH,
+                        4L * gw * gh),
+                    push, (outW * outH).toLong())) }
             } else {
-                // KernelNet: the one reference map (computed below, before
-                // the ref merge) replaces the per-frame kernel chain; mode
-                // bit 1 makes the merge read it on the reference grid.
-                val covRes = if(config.mobilePolynomial) polynomialLutRes else if (knCovRes != 0L) knCovRes else frameKernelsGpuRes()
+                val covRes = if(config.mobilePolynomial) polynomialLutRes else frameKernelsGpuRes()
                 // Mode bits: 1 = grey, 2 = reference kernels, 4 = reference
                 // frame, 8 = detail reconstruction, 16 = continuous motion
                 // (B-spline flow + bilinear robustness). Keep legacy Wronski mode.
                 // Separate green detail is safe when R/B are colour
                 // differences. Independent raw channels retain legacy widths.
-                val mergeMode = if(config.mobilePolynomial) 16 else if (knCovRes != 0L)
-                    2 or (if (reference) 4 else 0) or (if (config.colourDiff != null) 8 else 0) or 16
+                val mergeMode = if(config.mobilePolynomial) 16
                     else (if (config.continuousMotion) 16 else 0) or
-                        // 32: Wronski kernels with KernelNet's wide gather + detail green.
+                        // 32: Wronski kernels with the wide gather + detail green.
                         (if (config.detailReconstruction) 32 or (if (reference) 4 else 0) or
                             (if (config.colourDiff != null) 8 else 0) else 0)
                 // Z1: kernels and robustness above read the original frame;
@@ -611,13 +692,28 @@ object VulkanPipeline {
                         ColourDiff.packInto(frame, frameBuf, cd[0], cd[1]), (w * h).toLong())) }
                 }
                 frameObserver?.invoke(frameBuf, flow, rBuf)
+                val greenW = if ((config.mobilePolynomial || config.detailReconstruction) && config.colourDiff != null)
+                    greenFrameWeights[mergeFrameIndex++] else 1f
                 timed("mergeSplat") { checkRc("mergeSplat", SrpBridge.nativeMergeSplatFrameRes(handle, frameRes,
                     packInto(mergeFlowFlat, mergeFlow), covRes, rBuf, numRes, denRes,
                     (if(config.mobilePolynomial) spirvs.mergePolynomial!! else spirvs.mergeSplat), w, h, outW, outH, (if(config.mobilePolynomial) MobilePolynomial.table.size else gw * gh * 4), gw * gh, tile,
                     config.scale, mergeMode, ftx, fty,
                     if(config.mobilePolynomial) config.kernelAlpha.average().toFloat() else if (config.colourDiff != null) config.chromaScale else 1f,
-                    if ((knCovRes != 0L || config.mobilePolynomial || config.detailReconstruction) && config.colourDiff != null) greenFrameWeights[mergeFrameIndex++] else 1f,
+                    greenW,
                     if(config.mobilePolynomial) config.kernelBeta.average().toFloat() else config.frameEqualize)) }
+                if (evening) {
+                    // Same r and green weight the splat just used, on the guide grid.
+                    rBuf.rewind()
+                    checkRc("noiseAccUpload", SrpBridge.uploadResident(handle, evenRRes, rBuf, (gw * gh).toLong()))
+                    rBuf.rewind()
+                    val push = IntArray(32)
+                    push[2] = gw * gh
+                    push[8] = java.lang.Float.floatToRawIntBits(greenW)
+                    push[10] = if (evenFrames == 0) 1 else 0
+                    timed("noiseAcc") { checkRc("noiseAcc", SrpBridge.dispatchRes(handle, spirvs.noiseAcc!!,
+                        longArrayOf(evenRRes, evenAccRes), longArrayOf((gw * gh).toLong(), 4L * gw * gh), push, (gw * gh).toLong())) }
+                    evenFrames++; evenSumG += greenW; evenSumG2 += greenW.toDouble() * greenW
+                }
             }
         }
 
@@ -627,7 +723,12 @@ object VulkanPipeline {
         // the frame from its resident, so upload it once here (the
         // loop frames upload in the grey leg instead).
         val finest = pinnedInit.levels.last()
-        val continuousMotion = config.kernelNet != null || config.continuousMotion || config.mobilePolynomial
+        val continuousMotion = config.continuousMotion || config.mobilePolynomial
+        // Ghost-mask visibility: merged noise variance (a L + b) / N of the
+        // green-ish guide, scaled by GHOST_VISIBILITY (see the constant).
+        val ghostFrames = greenFrameWeights.size.coerceAtLeast(1)
+        val ghostA = if (config.ghostGrow) GHOST_VISIBILITY * (config.kernelAlpha[1] + config.kernelAlpha[3]) / 2f / ghostFrames else 0f
+        val ghostB = if (config.ghostGrow) GHOST_VISIBILITY * (config.kernelBeta[1] + config.kernelBeta[3]) / 2f / ghostFrames else 0f
         val motionField = if (continuousMotion) {
             val count = finest.nTx * finest.nTy * 4
             val packed = FloatArray(count)
@@ -645,40 +746,16 @@ object VulkanPipeline {
             timed("refUpload") { checkRc("refUpload", SrpBridge.uploadResident(handle, frameRes,
                 packImageInto(refBox!!, frameBuf), (w * h).toLong())) }
         }
-        config.kernelNet?.let { kn ->
-            require(config.bayer) { "KernelNet kernels need the bayer path" }
-            val knSpirv = requireNotNull(spirvs.kernelNet) { "KernelNet enabled without kernelnet.spv" }
-            val full = kn.fullReference
-            val rawW = full?.get(0)?.size ?: w
-            val rawH = full?.size ?: h
-            val (mw, mh) = KernelNet.mapSize(rawW, rawH)
-            val temps = ArrayList<Long>()
-            fun res(n: Int): Long = SrpBridge.createResident(handle, n.toLong()).also {
-                require(it != 0L) { "VulkanPipeline: KernelNet resident alloc failed" }
-                temps.add(it)
-            }
-            try {
-                val rawRes = if (full == null) frameRes else res(rawW * rawH).also { r ->
-                    val b = scratch.floats(rawW * rawH)
-                    val fb = b.asFloatBuffer(); for (row in full) fb.put(row)
-                    checkRc("kernelNet upload", SrpBridge.uploadResident(handle, r, b.apply { rewind() }, (rawW * rawH).toLong()))
-                }
-                val wRes = res(kn.weights.size)
-                checkRc("kernelNet weights", SrpBridge.uploadResident(handle, wRes, pack(kn.weights), kn.weights.size.toLong()))
-                val mapRes = res(3 * mw * mh)
-                knCovRes = SrpBridge.createResident(handle, (gw * gh * 4).toLong())
-                require(knCovRes != 0L) { "VulkanPipeline: KernelNet cov alloc failed" }
-                timed("kernelNet") { checkRc("kernelNet", SrpBridge.nativeKernelNetCovRes(handle, rawRes, wRes,
-                    kn.weights.size, knSpirv, rawW, rawH, kn.sigma, kn.sigmaScale, kn.sigmaCap,
-                    kn.cropX, kn.cropY, gw, gh, knCovRes, mapRes,
-                    if (kn.flipX) 1 else 0, if (kn.flipY) 1 else 0, kn.sigmaFloor)) }
-                val mapOut = SrpBridge.directFloats(3 * mw * mh)
-                checkRc("kernelNet map", SrpBridge.downloadResident(handle, mapRes, mapOut, (3 * mw * mh).toLong()))
-                lastKernelNetMap = FloatArray(3 * mw * mh).also { mapOut.asFloatBuffer().get(it) }
-            } finally {
-                for (t in temps) SrpBridge.freeResident(handle, t)
-            }
-        }
+        // Blurry-frame weighting: reference detail energy (green noise model).
+        val sharpA = (config.kernelAlpha[1] + config.kernelAlpha[3]) / 2f
+        val sharpB = (config.kernelBeta[1] + config.kernelBeta[3]) / 2f
+        pedestal = if (config.blackPedestal && config.bayer && config.colourDiff != null)
+            timed("blackPedestal") { BlackPedestal.estimate(refBox!!, config.kernelAlpha, config.kernelBeta) }.also {
+                println("sr-pipeline black pedestal %.5f (R %.5f G %.5f B %.5f, se %.6f, %d blocks, neutral %b)".format(
+                    it.pedestal, it.r, it.g, it.b, it.sigma, it.blocks, it.neutral))
+            }.pedestal else 0f
+        val refEnergy = if (config.blurGamma > 0f && config.bayer)
+            timed("sharpness") { FrameSharpness.energy(refBox!!, sharpA, sharpB) } else 0.0
         mergeFrame(refBox!!, zeroFlow, packInto(onesR, mergeRDirect), reference = true)
         refBox = null
         // Memory-tight: the ref phase's garbage (ref CFA, init pack
@@ -707,7 +784,7 @@ object VulkanPipeline {
                 val ts = loop.tileSize
                 AlignGpu.ResidentPyramid(handle, h, w,
                     if (h % ts == 0) 0 else ts - h % ts, if (w % ts == 0) 0 else ts - w % ts,
-                    loop.factors, spirvs.pyrDown)
+                    loop.factors, spirvs.pyrDown, loop.binomialPyramid)
             } else null
         var frameNo = 0
         // One frame end to end (own scope): the decoded frame, pyramid,
@@ -770,10 +847,13 @@ object VulkanPipeline {
                         packInto(mergeFlowFlat, mergeFlow), lutBuf.apply { rewind() }, sRes, mergeRDirect.apply { rewind() },
                         spirvs.robust, w, h, tile, lutN,
                         // Bit 0: noise correction; bit 1: use the same continuous
-                        // motion field as KernelNet reconstruction (Wronski: off).
-                        (if (config.robustnessParams.noiseCorrection) 1 else 0) or (if (continuousMotion) 2 else 0),
+                        // motion field as the reconstruction (continuous motion).
+                        (if (config.robustnessParams.noiseCorrection) 1 else 0) or (if (continuousMotion) 2 else 0) or
+                            // Bit 2: ghost mask (opening + growth past the motion smoothing).
+                            (if (config.ghostGrow) 4 else 0),
                         java.lang.Float.floatToIntBits(config.robustnessParams.t), ftx, fty,
-                        hfRes, java.lang.Float.floatToIntBits(rp.s1))) }
+                        hfRes, java.lang.Float.floatToIntBits(rp.s1),
+                        java.lang.Float.floatToRawIntBits(ghostA), java.lang.Float.floatToRawIntBits(ghostB))) }
                 }
                 mergeRDirect
             } else {
@@ -793,6 +873,15 @@ object VulkanPipeline {
                     .writeBytes(java.nio.ByteBuffer.allocate(ftx * fty * 2 * 4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
                         .also { b -> mergeFlowFlat.forEach { b.putFloat(it) } }.array())
                 System.err.println("SRP_R frame $idx mean ${"%.3f".format(r.average())} rejected(<0.1) ${"%.1f".format(100.0 * r.count { it < 0.1f } / n)}%")
+            }
+            if (refEnergy > 0.0) {
+                val e = timed("sharpness") { FrameSharpness.energy(frame, sharpA, sharpB) }
+                val wBlur = FrameSharpness.weight(e, refEnergy, config.blurGamma)
+                println("sr-pipeline frame sharpness %.3f of reference -> weight %.3f".format(e / refEnergy, wBlur))
+                if (wBlur < 1f) {
+                    val fb = rBuf.duplicate().order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer()
+                    for (i in 0 until rSize0) fb.put(i, fb.get(i) * wBlur)
+                }
             }
             mergeFrame(frame, flow, rBuf)
         }
@@ -821,16 +910,97 @@ object VulkanPipeline {
         // it even with free bytes to spare (observed on-device).
         AlignGpu.freeLevelScratch(pinnedInit)
         System.gc()
+        if (twoBand != null) timed("twoBandResolve") {
+            val res = longArrayOf(numRes, denRes, tbAuxRes)
+            val sizes = longArrayOf(total.toLong(), total.toLong(), 4L * outW * outH)
+            fun push(pass: Int) = IntArray(32).also {
+                it[2] = outW * outH; it[6] = java.lang.Float.floatToRawIntBits(config.scale)
+                it[7] = java.lang.Float.floatToRawIntBits(twoBand.confK.toFloat())
+                it[8] = java.lang.Float.floatToRawIntBits((config.kernelAlpha[1] + config.kernelAlpha[3]) / 2f)
+                it[9] = java.lang.Float.floatToRawIntBits((config.kernelBeta[1] + config.kernelBeta[3]) / 2f)
+                it[11] = pass; it[13] = outW; it[14] = outH
+            }
+            checkRc("tbResolve0", SrpBridge.dispatchRes(handle, spirvs.twoBandResolve!!, res, sizes, push(0), (outW * outH).toLong()))
+            checkRc("tbResolve1", SrpBridge.dispatchRes(handle, spirvs.twoBandResolve, res, sizes, push(1), (outW * outH).toLong()))
+            if (twoBand.phaseInvariant) {
+                checkRc("tbResolve3", SrpBridge.dispatchRes(handle, spirvs.twoBandResolve, res, sizes, push(3), (outW * outH).toLong()))
+                checkRc("tbResolve4", SrpBridge.dispatchRes(handle, spirvs.twoBandResolve, res, sizes, push(4), (outW * outH).toLong()))
+            }
+            if (twoBand.denoise) for ((ox, oy) in listOf(0 to 0, 4 to 0, 0 to 4, 4 to 4)) {
+                val bpr = (outW - ox) / 8; val bpc = (outH - oy) / 8
+                if (bpr <= 0 || bpc <= 0) continue
+                val p = IntArray(32)
+                p[11] = ox; p[12] = oy; p[13] = outW; p[14] = outH; p[15] = bpr
+                p[7] = java.lang.Float.floatToRawIntBits(twoBand.grainFloor.toFloat())
+                p[8] = java.lang.Float.floatToRawIntBits(kotlin.math.sqrt(twoBand.deconvStrength.coerceAtLeast(0.0) *
+                    twoBand.sigmaHigh * twoBand.sigmaHigh + twoBand.opticsSigma * twoBand.opticsSigma).toFloat())
+                p[9] = java.lang.Float.floatToRawIntBits(config.scale)
+                p[16] = java.lang.Float.floatToRawIntBits(twoBand.gainCap.toFloat())
+                // One workgroup per block; > 65535 blocks run as several row bands.
+                var first = 0
+                while (first < bpc) {
+                    val rows = minOf(bpc - first, maxOf(1, 65535 / bpr))
+                    p[12] = oy + 8 * first
+                    checkRc("tbDct", SrpBridge.nativeDispatchRes(handle, spirvs.twoBandDct!!, longArrayOf(denRes, tbAuxRes),
+                        longArrayOf(total.toLong(), 4L * outW * outH), p, 64, rows * bpr))
+                    first += rows
+                }
+            }
+            checkRc("tbResolve2", SrpBridge.dispatchRes(handle, spirvs.twoBandResolve, res, sizes, push(2), (outW * outH).toLong()))
+        } else
         timed("divide") { checkRc("divide", SrpBridge.divideRes(handle, numRes, denRes, spirvs.divide, total)) }
+        // Noise evening: num (divided) -> den (free after the divide).
+        val evenRes = if (evening && evenFrames > 1 && evenSumG2 > 0.0) {
+            val push = IntArray(32)
+            push[0] = outW; push[1] = outH; push[2] = outW * outH
+            push[6] = java.lang.Float.floatToRawIntBits(config.scale)
+            push[11] = gw; push[12] = gh
+            push[13] = java.lang.Float.floatToRawIntBits((evenSumG * evenSumG / evenSumG2).toFloat())
+            push[14] = java.lang.Float.floatToRawIntBits(evenFrames.toFloat())
+            push[15] = java.lang.Float.floatToRawIntBits((config.kernelAlpha[1] + config.kernelAlpha[3]) / 2f)
+            push[16] = java.lang.Float.floatToRawIntBits((config.kernelBeta[1] + config.kernelBeta[3]) / 2f)
+            push[17] = kotlin.math.round(2f * config.scale).toInt().coerceIn(2, 6)
+            push[18] = java.lang.Float.floatToRawIntBits(NOISE_EVEN_RANGE)
+            timed("noiseEven") { checkRc("noiseEven", SrpBridge.dispatchRes(handle, spirvs.noiseEven!!,
+                longArrayOf(numRes, denRes, evenAccRes), longArrayOf(total.toLong(), total.toLong(), 4L * gw * gh),
+                push, (outW * outH).toLong())) }
+            denRes
+        } else numRes
         val outBuf = output?.also {
             require(it.capacity() >= total * java.lang.Float.BYTES) { "VulkanPipeline: output buffer too small" }
             it.clear()
         } ?: SrpBridge.directFloats(total)
-        timed("downloadRes") { checkRc("downloadRes", SrpBridge.downloadResident(handle, numRes, outBuf, total.toLong())) }
+        timed("downloadRes") { checkRc("downloadRes", SrpBridge.downloadResident(handle, evenRes, outBuf, total.toLong())) }
         outBuf.rewind()
+        // Lateral CA: fit on the merged (co-sited) colour-difference output;
+        // warp on the GPU copy and download again only when it is visible.
+        if (config.lateralCa && config.bayer && config.colourDiff != null && spirvs.caWarp != null) {
+            val ca = timed("lateralCaFit") { LateralCa.estimate(outBuf.asFloatBuffer(), outW, outH, config.scale) }
+            val shift = ca.cornerShift(outW, outH)
+            println("sr-pipeline lateralCa kR=%.6f kB=%.6f nccR=%.3f nccB=%.3f points=%d cornerShift=%.2fpx".format(
+                ca.kR, ca.kB, ca.nccR, ca.nccB, ca.points, shift))
+            if (shift >= LateralCa.MIN_CORNER_SHIFT_PX) {
+            val dst = if (evenRes == numRes) denRes else numRes
+            val push = IntArray(32)
+            push[0] = outW; push[1] = outH; push[2] = outW * outH
+            push[6] = java.lang.Float.floatToRawIntBits(config.scale)
+            push[7] = java.lang.Float.floatToRawIntBits(ca.kR)
+            push[8] = java.lang.Float.floatToRawIntBits(ca.kB)
+            push[11] = w; push[12] = h
+            timed("caWarp") { checkRc("caWarp", SrpBridge.dispatchRes(handle, spirvs.caWarp!!,
+                longArrayOf(evenRes, dst), longArrayOf(total.toLong(), total.toLong()), push, (outW * outH).toLong())) }
+            outBuf.clear()
+            timed("downloadRes") { checkRc("downloadRes", SrpBridge.downloadResident(handle, dst, outBuf, total.toLong())) }
+            outBuf.rewind()
+            }
+        }
         config.colourDiff?.takeIf { config.bayer }?.let { cd ->
             timed("colourDiffReconstruct") { ColourDiff.reconstruct(outBuf.asFloatBuffer(), total / 3, cd[0], cd[1]) }
             outBuf.rewind()
+            if (pedestal > 0f) {
+                timed("blackPedestal") { BlackPedestal.apply(outBuf.asFloatBuffer(), total, pedestal) }
+                outBuf.rewind()
+            }
         }
         dumpClock()
         return outBuf
@@ -840,12 +1010,17 @@ object VulkanPipeline {
             SrpBridge.freeResident(handle, varsRes)
             SrpBridge.freeResident(handle, numRes)
             SrpBridge.freeResident(handle, denRes)
+            if (evenRRes != 0L) SrpBridge.freeResident(handle, evenRRes)
+            if (tbAuxRes != 0L) SrpBridge.freeResident(handle, tbAuxRes)
+            if (tbRobRes != 0L) SrpBridge.freeResident(handle, tbRobRes)
+            if (tbRobTmp != 0L) SrpBridge.freeResident(handle, tbRobTmp)
+            if (tbFlowRes != 0L) SrpBridge.freeResident(handle, tbFlowRes)
+            if (evenAccRes != 0L) SrpBridge.freeResident(handle, evenAccRes)
             SrpBridge.freeResident(handle, frameRes)
-            SrpBridge.freeResident(handle, kernPreRes)
-            SrpBridge.freeResident(handle, kernGreyRes)
-            SrpBridge.freeResident(handle, kernGradsRes)
-            SrpBridge.freeResident(handle, kernCovRes)
-            if (knCovRes != 0L) SrpBridge.freeResident(handle, knCovRes)
+            if (kernPreRes != 0L) SrpBridge.freeResident(handle, kernPreRes)
+            if (kernGreyRes != 0L) SrpBridge.freeResident(handle, kernGreyRes)
+            if (kernGradsRes != 0L) SrpBridge.freeResident(handle, kernGradsRes)
+            if (kernCovRes != 0L) SrpBridge.freeResident(handle, kernCovRes)
             if (polynomialLutRes != 0L) SrpBridge.freeResident(handle, polynomialLutRes)
             if (hfRes != 0L) SrpBridge.freeResident(handle, hfRes)
             SrpBridge.freeResident(handle, sRes)

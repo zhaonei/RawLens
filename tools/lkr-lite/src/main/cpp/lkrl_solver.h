@@ -20,9 +20,9 @@ struct LiteParams {
   // 36.7 -> 38.4; IMG_20210228_133623 2x 52.31 -> 52.46) and save 2 jac / jacblk passes + round trips.
   std::string debug_prefix; // optional per-tile stage audit, supplied by MergeFull
   std::string schedule;   // G = motion step + weight refresh, J = merge step; leading G align to the reference-only image
-  float kernelnet_denoise = -1.0f;   // explicit per-merge strength, negative = CLI environment (default on)
   float noise_a = 0, noise_b = 0;     // our own fit: var = a y + b (normalised raw units)
   float clip = 0.98f;
+  std::vector<float> exposure;   // HDR: per-frame exposure / reference's (SolveParams::exposure); empty = equal
   float robust_k = 3.0f, robust_pow = 1.0f, robust_tau = 0.1f;
   int robust_spread = 3;
   // Reference-guide confidence (LK-R --guide): > 0 = strength (LK-R default 2). Needs even h, w.
@@ -47,6 +47,8 @@ struct LiteParams {
   float dct_luma_cap = 1.0f;     // with dct_grain: most share of luma noise variance removed anywhere   // with dct_grain: least share of luma noise variance removed everywhere
   bool dct_chroma_all = false;   // colour passes use the total merged noise everywhere (not only lost frames)   // see lkrl_api.h; push slot = grain^2 (dct_x.glsl)
   float dct_luma = 1.0f, dct_chroma = 2.0f;   // thresholds, multiples of the noise level
+  float dct_grain_rel = 0.0f, dct_grain_rho = 0.15f, dct_grain_tilt = 0.0f, dct_grain_sub = 0.0f;   // night grain mode (lkrl_api.h SolveParams)
+  bool dct_chroma_norm = false;
   float dct_dark_level = 0.02f, dct_dark_cap = 8.0f, dct_dark_luma = 0.25f;
   float wb[3] = {1.0f, 1.0f, 1.0f};
   bool robust = true;
@@ -83,6 +85,7 @@ struct LiteParams {
 struct LiteStats {
   double ms_total = 0, ms_gpu = 0, ms_host = 0, ms_prior = 0;
   int submits = 0, prior_calls = 0;
+  size_t nonfinite = 0;   // output pixels the NaN safety net replaced (0 in a healthy merge)
   std::string profile;
 };
 
@@ -102,7 +105,7 @@ class LiteSolver {
              std::vector<float>* weights_out = nullptr, std::vector<float>* x_out = nullptr);
   // FinishLook default path on the GPU (fin.comp): notch, luma notch where frames were lost, clip
   // halo, grain, highlight desaturation. x in/out (3 H W planar camera RGB).
-  struct FinishArgs { float wb[3]; float clip, grain, eq_strength; bool notch, desat; };
+  struct FinishArgs { float wb[3]; float clip, grain, eq_strength; bool notch, desat; float hl_ratio[3]; bool hl_rec; int hl_radius; };
   bool finish(const float* z, std::vector<float>* x, int H, int W, const FinishArgs& fa,
               const std::vector<float>* noise_scale, std::string* err);   // final residual vs z (K x h x w, 0 = invalid), final weights
 
@@ -113,7 +116,7 @@ class LiteSolver {
   Gpu* gpu_;
   bool ok_ = false;
   Pipeline resid_, werr_, wavg_, wminh_, wminv_, adj_, adj_s1_, adj_s2_, zupd_, jac_, jacblk_, solveblk_, gstats_, wguide_, wvalid_,
-      kresid_, ktdet_, kth_, kt_, ktv_, ktd_, kguide_, kminh_, kmin_, kdy_, kdu_, kdv_, kdyuv_, kdyo_, kduo_, kdvo_, knconv_, kndn_, hyb_, adjwg_, fin_, edgeshift_, cdupd_, le_tensor_, le_blur_, le_apply_, prior_conv_;
+      kresid_, ktdet_, kth_, kt_, ktv_, ktd_, kguide_, kminh_, kmin_, kdy_, kdu_, kdv_, kdyuv_, kdyo_, kduo_, kdvo_, hyb_, adjwg_, fin_, edgeshift_, cdupd_, le_tensor_, le_blur_, le_apply_, dln_apply_, axn_apply_, gcf_apply_, canc_apply_, rcd_start_, prior_conv_;
 };
 
 }  // namespace lkrl

@@ -164,6 +164,26 @@ object SrpBridge {
     external fun nativeFreeResident(handle: Long, resident: Long): Int
 
     /**
+     * Generic resident dispatch: binds `res[i]` (validated for >= `minFloats[i]`
+     * floats) at bindings 0..n-1, pushes the 32-word HmsrPush block `push`
+     * (bit patterns; floats via [java.lang.Float.floatToRawIntBits]) and runs
+     * `groups` groups of `localSize`. Returns the `srp::Status` ordinal.
+     */
+    @JvmStatic
+    external fun nativeDispatchRes(
+        handle: Long, spirv: ByteArray, res: LongArray, minFloats: LongArray,
+        push: IntArray, localSize: Int, groups: Int,
+    ): Int
+
+    /** [nativeDispatchRes] with a grid-stride group count for `items` invocations (cap 65535). */
+    fun dispatchRes(handle: Long, spirv: ByteArray, res: LongArray, minFloats: LongArray,
+                    push: IntArray, items: Long, localSize: Int = 256): Int {
+        require(res.size == minFloats.size && push.size == 32 && items > 0)
+        val groups = minOf(65535L, (items + localSize - 1) / localSize).toInt()
+        return nativeDispatchRes(handle, spirv, res, minFloats, push, localSize, groups)
+    }
+
+    /**
      * Downloads `count` floats from a resident buffer into `outBuffer`.
      * Returns the `srp::Status` ordinal (0 = ok).
      */
@@ -474,38 +494,6 @@ object SrpBridge {
     ): Int
 
     /**
-     * PhotonCamera KernelNet (kernelnet.comp) on the FULL reference frame
-     * `rawRes` (`rawW*rawH` normalized floats) -> Wronski covariances for
-     * the crop at (`cropX`, `cropY`) into `covRes` (`covW*covH*4` floats).
-     * `weightsRes` holds [KernelNet.weights] (`weightCount` floats);
-     * `mapRes` receives the (s1, s2, rho) map, `3*mapW*mapH` floats with
-     * map = ((rawW/2 - 1)/2 + 1) x ((rawH/2 - 1)/2 + 1).
-     */
-    @JvmStatic
-    external fun nativeKernelNetCovRes(
-        handle: Long,
-        rawRes: Long,
-        weightsRes: Long,
-        weightCount: Int,
-        spirv: ByteArray,
-        rawW: Int,
-        rawH: Int,
-        sigma: Float,
-        sigmaScale: Float,
-        sigmaCap: Float,
-        cropX: Int,
-        cropY: Int,
-        covW: Int,
-        covH: Int,
-        covRes: Long,
-        mapRes: Long,
-        flipX: Int,
-        flipY: Int,
-        /** Minimum kernel width (px), [KernelNetConfig.sigmaFloor]. */
-        sigmaFloor: Float = com.rawlens.srpipeline.stages.KernelNet.DEFAULT_SIGMA_FLOOR,
-    ): Int
-
-    /**
      * compute_s (op 6) writing a resident spread map. `flowBuffer`
      * stages `ntx*nty*2` floats; `sRes` receives `ntx*nty` floats and
      * stays on-device for the robust leg. Bit-identical to nativeSmap.
@@ -554,6 +542,12 @@ object SrpBridge {
         hfRes: Long,
         /** Float bits of s1 (the M > Mt strength the S map holds there). */
         s1Bits: Int,
+        /**
+         * Ghost-mask visibility (noiseCorrection bit 2): float bits of a', b'
+         * with merged noise variance a' * brightness + b'; 0, 0 = no gate.
+         */
+        ghostABits: Int,
+        ghostBBits: Int,
     ): Int
 
     /**

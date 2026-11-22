@@ -10,13 +10,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MfsrSettingsTest {
-    @Test fun lkrKernelNetDefaultsOnAndPreservesExplicitChoice() {
-        assertTrue(MfsrSettings().lkrKernelNetDenoise)
-        assertTrue(MfsrSettings.fromPreferences(emptyMap<String, Any>()).lkrKernelNetDenoise)
-        for (enabled in listOf(false, true)) {
-            val settings = MfsrSettings(lkrKernelNetDenoise = enabled)
-            assertEquals(settings, MfsrSettings.fromPreferences(settings.toPreferences()))
-        }
+    @Test fun removedLkrKernelNetSwitchIsIgnored() {
+        // KernelNet was removed from LK-R (2026-11-20); a saved choice must not change anything.
+        assertEquals(MfsrSettings(), MfsrSettings.fromPreferences(mapOf("lkr_kernelnet_denoise" to false)))
     }
 
     @Test fun preferencesSurviveReload() {
@@ -46,7 +42,7 @@ class MfsrSettingsTest {
         val settings = MfsrSettings(enabled = true, engine = MfsrEngine.LKR)
         for (count in 2..59) assertEquals(count, settings.activeFrameCount(count))
         assertEquals(59, settings.activeFrameCount(80))
-        assertEquals("LK-R\n×40", settings.quickText(MfsrEngine.LKR, 40, 40, true, false))
+        assertEquals("LK-R\nAUTO HDR ×40", settings.quickText(MfsrEngine.LKR, 40, 40, true, false))
         for (z in listOf(LkrZoom.X1_5, LkrZoom.X2, LkrZoom.FULL_2X))
             assertEquals(30, settings.copy(lkrZoom = z).activeFrameCount(40))
     }
@@ -103,7 +99,10 @@ class MfsrSettingsTest {
 
     @Test fun eachEngineHasItsOwnTile() {
         val lkr = MfsrSettings(enabled = true, engine = MfsrEngine.LKR)
-        assertEquals("LK-R\n×12", lkr.quickText(MfsrEngine.LKR, 12, 12, true, false))
+        assertEquals("LK-R\nAUTO HDR ×12", lkr.quickText(MfsrEngine.LKR, 12, 12, true, false))
+        assertEquals("LK-R\nHDR ×12", lkr.copy(lkrHdr = LkrHdrMode.ON).quickText(MfsrEngine.LKR, 12, 12, true, false))
+        assertEquals("LK-R\n×12", lkr.copy(lkrHdr = LkrHdrMode.OFF).quickText(MfsrEngine.LKR, 12, 12, true, false))
+        assertEquals("MFSR\n×12", lkr.copy(engine = MfsrEngine.MFSR).quickText(MfsrEngine.MFSR, 12, 12, true, false))
         assertEquals("MFSR\nOFF", lkr.quickText(MfsrEngine.MFSR, 12, 12, true, false))
         assertTrue(lkr.isOn(MfsrEngine.LKR))
         assertFalse(lkr.isOn(MfsrEngine.MFSR))
@@ -111,16 +110,14 @@ class MfsrSettingsTest {
         assertEquals("LK-R\nOFF", MfsrSettings().quickText(MfsrEngine.LKR, 12, 12, true, false))
     }
 
-    @Test fun kernelAndS3SurviveReload() {
-        for (kernel in MfsrKernel.entries) for (s3 in listOf(false, true)) {
-            val original = MfsrSettings(kernel = kernel, s3 = s3)
+    @Test fun s3SurvivesReload() {
+        for (s3 in listOf(false, true)) {
+            val original = MfsrSettings(s3 = s3)
             assertEquals(original, MfsrSettings.fromPreferences(original.toPreferences()))
         }
+        // KernelNet was removed from MFSR (2026-11-20): a saved kernel choice is ignored.
+        assertEquals(MfsrSettings(), MfsrSettings.fromPreferences(mapOf("mfsr_kernel" to "KERNELNET")))
         // Corrupt values heal to the defaults, like the frame count.
-        assertEquals(
-            MfsrKernel.KERNELNET,
-            MfsrSettings.fromPreferences(mapOf("mfsr_kernel" to "junk")).kernel
-        )
         assertEquals(
             true,
             MfsrSettings.fromPreferences(mapOf("mfsr_s3" to "junk")).s3
@@ -132,7 +129,6 @@ class MfsrSettingsTest {
         assertEquals(MfsrSettings(), fresh)
         assertEquals(false, fresh.enabled)
         assertEquals(false, fresh.keepSourceBurst)
-        assertEquals(MfsrKernel.KERNELNET, fresh.kernel)
         assertEquals(true, fresh.s3)
     }
 

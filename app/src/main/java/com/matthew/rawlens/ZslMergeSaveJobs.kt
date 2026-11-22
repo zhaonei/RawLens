@@ -35,6 +35,13 @@ internal class HdrPlusZslSaveJob(private val context: Context, private val host:
         fun releaseInputs()
         /** Gyro tracker running: per-frame gyro is reported only then. */
         fun gyroRunning(): Boolean
+        /**
+         * Frees the shared developer's idle GPU session (AMaZE EGL context,
+         * retained scratch textures, merged-develop context) before a merge
+         * measures its memory headroom. Writer thread only; the developer is
+         * recreated lazily for the save tail.
+         */
+        fun releaseDevelopCaches() {}
     }
 
     private data class HdrPlusFrameInput(
@@ -72,6 +79,8 @@ internal class HdrPlusZslSaveJob(private val context: Context, private val host:
             val saver = DngSaver(context)
             val backend = saveSettings.dngBackend
             val overrides = saveSettings.dngOverrides
+            // Source DNGs need the live Images: the controller never stages these bursts.
+            check(selected.none { it.staged != null }) { "keepSourceBurst needs camera Images" }
             selected.forEachIndexed { index, frame ->
                 val metadata = RawFrameMetadataFactory.capture(
                     cameraId, frame.image, c, frame.result, orientation, levelOverrides = saveSettings.dngOverrides
@@ -94,13 +103,13 @@ internal class HdrPlusZslSaveJob(private val context: Context, private val host:
             }
         }
         val inputs = selected.map { frame ->
-            val metadata = RawFrameMetadataFactory.capture(cameraId, frame.image, c, frame.result, orientation, levelOverrides = saveSettings.dngOverrides)
+            val metadata = RawFrameMetadataFactory.capture(cameraId, frame.view(), c, frame.result, orientation, levelOverrides = saveSettings.dngOverrides)
             val geometry = metadata.bufferGeometry as? RawBufferGeometry.Supported
                 ?: throw UnsupportedOperationException("HDR+ RAW geometry is not supported")
             val normalization = metadata.normalizationOrNull()
                 ?: throw UnsupportedOperationException("HDR+ normalization metadata is missing")
             metadata.rawDevelopmentUnsupportedReason?.let { error(it) }
-            val plane = frame.image.planes.single()
+            val plane = frame.view()
             HdrPlusFrameInput(
                 frame = frame, metadata = metadata, result = frame.result,
                 layout = RawPlaneLayout(metadata.imageWidth, metadata.imageHeight,
@@ -110,16 +119,18 @@ internal class HdrPlusZslSaveJob(private val context: Context, private val host:
             )
         }
         val referenceIndex = inputs.size / 2
+        host.releaseDevelopCaches()
         host.reportSaveState("HDR+ MERGING")
         val tMerge0 = SystemClock.elapsedRealtime()
         val mergedRaw = try {
             host.hdrPlusProcessor().merge(
                 inputs.map {
                     HdrPlusMerge.FrameInput(
-                        it.frame.image, it.layout, it.crop, it.normalization,
+                        it.frame.image.takeIf { _ -> it.frame.staged == null }, it.layout, it.crop, it.normalization,
                         timestampNanos = it.frame.timestampNanos,
                         gyroRadiansPerSecond = it.frame.motionRadiansPerSecond,
-                        sensitivityIso = it.metadata.sensitivityIso ?: 0
+                        sensitivityIso = it.metadata.sensitivityIso ?: 0,
+                        pixels = it.frame.staged?.buffer?.duplicate()?.also { b -> b.rewind() }
                     )
                 },
                 referenceIndex, settings,
@@ -315,7 +326,9 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
         denoise: DenoiseSettings,
         captureTimeMillis: Long,
         captureGps: GpsLocation?,
-        saveSettings: ZslMergeSaveSettings
+        saveSettings: ZslMergeSaveSettings,
+        /** LK-R HDR: the last [hdrTail] frames of [selected] are the short / long bracket frames. */
+        hdrTail: Int = 0
     ) {
         val developedFormat = saveSettings.developedFormat
         val jxlSettings = saveSettings.jxl
@@ -323,6 +336,8 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
             val saver = DngSaver(context)
             val backend = saveSettings.dngBackend
             val overrides = saveSettings.dngOverrides
+            // Source DNGs need the live Images: the controller never stages these bursts.
+            check(selected.none { it.staged != null }) { "keepSourceBurst needs camera Images" }
             selected.forEachIndexed { index, frame ->
                 val metadata = RawFrameMetadataFactory.capture(
                     cameraId, frame.image, c, frame.result, orientation, levelOverrides = saveSettings.dngOverrides
@@ -346,14 +361,20 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
         }
         host.reportSaveState("${settings.label} MERGING")
         val tMerge0 = android.os.SystemClock.elapsedRealtime()
-        val ordered = try {
-            MfsrMerge.prepare(selected, settings.engine == MfsrEngine.LKR && settings.lkrMiddleReference,
-                nativeSharpness = settings.engine == MfsrEngine.LKR) { frame ->
-                RawFrameMetadataFactory.capture(cameraId, frame.image, c, frame.result, orientation, levelOverrides = saveSettings.dngOverrides)
-            }
-        } finally {
-            // Images stay open for the just-in-time decode inside merge.
+        val metadataOf = { frame: BufferedRawFrame ->
+            RawFrameMetadataFactory.capture(cameraId, frame.view(), c, frame.result, orientation, levelOverrides = saveSettings.dngOverrides)
         }
+        val hdr = hdrTail > 0 && settings.engine == MfsrEngine.LKR && selected.size - hdrTail >= 1
+        // HDR: reference + blur rejection over the 0 EV frames only (a short frame is never the
+        // reference); the bracket frames follow in capture order. Images stay open for the merge.
+        val ordered = if (hdr) {
+            val zero = selected.dropLast(hdrTail)
+            val head = if (zero.size >= MfsrSettings.MIN_MERGE_FRAMES)
+                MfsrMerge.prepare(zero, settings.lkrMiddleReference, nativeSharpness = true, metadataOf = metadataOf)
+            else MfsrMerge.describe(zero, metadataOf)
+            head?.let { it + MfsrMerge.describe(selected.takeLast(hdrTail), metadataOf) }
+        } else MfsrMerge.prepare(selected, settings.engine == MfsrEngine.LKR && settings.lkrMiddleReference,
+            nativeSharpness = settings.engine == MfsrEngine.LKR, metadataOf = metadataOf)
         if (settings.engine == MfsrEngine.LKR) Log.i(LOG_TAG,
             "LK-R selection=${android.os.SystemClock.elapsedRealtime() - tMerge0}ms frames=${selected.size}")
         if (ordered.isNullOrEmpty()) {
@@ -362,12 +383,13 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
             host.releaseInputs()
             return
         }
+        host.releaseDevelopCaches()
         val merged = try {
             // Same shutter / ZSL / save tail for both engines; only the merge differs.
             if (settings.engine == MfsrEngine.LKR)
                 MergeGpuQuiet.during { LkrMerge.mergeLive(context, ordered,
-                    LkrMerge.Settings(kernelNetDenoise = settings.lkrKernelNetDenoise, network = settings.lkrNetwork, dctPrior = settings.lkrDctPrior, tuning = LkrTuning.overrides(context),
-                        zoom = settings.lkrZoom, fullRes = settings.lkrFullRes),
+                    LkrMerge.Settings(network = settings.lkrNetwork, dctPrior = settings.lkrDctPrior, tuning = LkrTuning.overrides(context),
+                        zoom = settings.lkrZoom, fullRes = settings.lkrFullRes, hdrBracket = hdr),
                     releaseInputs = host::releaseInputs) }
             else MfsrMerge.merge(context, ordered, settings)
         } finally {
@@ -404,7 +426,7 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
                 if (developedFormat == DevelopedFormat.JXL) {
                     val developed = developer.developMfsrJxl(merged.rgb, merged.width, merged.height,
                         merged.refMetadata, development,
-                        look = outputSettings, jxl = jxlSettings)
+                        look = outputSettings, jxl = jxlSettings, hdrWhite = merged.hdrWhite)
                     JxlSaver(context).save(developed, merged.refMetadata, merged.refResult,
                         captureTimeMillis = captureTimeMillis,
                         typeSuffix = settings.mergeFileSuffix(), gps = captureGps)
@@ -412,7 +434,7 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
                     host.reportSaveState(if (referenceDng != null) "${settings.label} MERGED+DNG • JXL" else "${settings.label} MERGED • JXL")
                 } else {
                     val developed = developer.developMfsrJpeg(merged.rgb, merged.width, merged.height,
-                        merged.refMetadata, development, outputSettings)
+                        merged.refMetadata, development, outputSettings, hdrWhite = merged.hdrWhite)
                     try {
                         JpegSaver(context).save(developed, merged.refMetadata,
                             merged.refResult, captureTimeMillis = captureTimeMillis,
@@ -445,7 +467,8 @@ internal class MfsrZslSaveJob(private val context: Context, private val host: Hd
         // C11: striped from the native merge buffer (no 150 MB heap copy)
         return LinearRgbDngSaver(context).saveLinearRgbStriped(
             merged.width, merged.height, merged.rgb.asFloatBuffer(),
-            merged.refMetadata, provenance, captureId = captureTimeMillis, gps = captureGps
+            merged.refMetadata, provenance, captureId = captureTimeMillis, gps = captureGps,
+            white = merged.hdrWhite
         )
     }
 

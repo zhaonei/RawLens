@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "srp_context.h"
+#include "srp_dispatch.h"
 #include "srp_dng.h"
 #include "srp_pipeline.h"
 
@@ -2349,7 +2350,8 @@ JNIEXPORT jint JNICALL Java_com_rawlens_srpipeline_SrpBridge_nativeRobustCompute
     jlong means_res, jlong vars_res, jobject flow_buffer,
     jobject lut_buffer, jlong s_res, jobject out_buffer, jbyteArray spirv,
     jint width, jint height, jint tile_size, jint lut_n, jint noise_correction,
-    jint t_bits, jint ftx, jint fty, jlong hf_res, jint s1_bits) {
+    jint t_bits, jint ftx, jint fty, jlong hf_res, jint s1_bits,
+    jint ghost_a_bits, jint ghost_b_bits) {
   VkDevice device = VK_NULL_HANDLE;
   VkPhysicalDevice physical = VK_NULL_HANDLE;
   srp::Context* ctx = CorrContext(handle, &device, &physical);
@@ -2427,7 +2429,8 @@ JNIEXPORT jint JNICALL Java_com_rawlens_srpipeline_SrpBridge_nativeRobustCompute
         static_cast<uint32_t>(noise_correction),
         static_cast<uint32_t>(t_bits), static_cast<uint32_t>(ftx),
         static_cast<uint32_t>(fty), module,
-        hf_vk, static_cast<uint32_t>(s1_bits));
+        hf_vk, static_cast<uint32_t>(s1_bits),
+        static_cast<uint32_t>(ghost_a_bits), static_cast<uint32_t>(ghost_b_bits));
     if (status == srp::Status::kOk) {
       void* mapped = nullptr;
       if (vkMapMemory(device, mems[2], 0, static_cast<VkDeviceSize>(n) * 4, 0,
@@ -3052,62 +3055,6 @@ JNIEXPORT jint JNICALL Java_com_rawlens_srpipeline_SrpBridge_nativeDngNormalized
 
 }  // extern "C"
 
-// KernelNet (PhotonCamera kernelnet_aniso_v2_2) -> Wronski covariances.
-// `raw_res` holds the FULL reference frame (raw_w*raw_h normalized floats),
-// `weights_res` the six layers' fp32 weights+biases in .param order,
-// `cov_res` receives cov_w*cov_h vec4 for the crop at (crop_x, crop_y);
-// `map_res` (3*map_w*map_h floats) keeps the parameter map for parity
-// dumps. Scratch is allocated and freed here.
-extern "C" JNIEXPORT jint JNICALL Java_com_rawlens_srpipeline_SrpBridge_nativeKernelNetCovRes(
-    JNIEnv* env, jclass /*cls*/, jlong handle, jlong raw_res, jlong weights_res,
-    jint weight_count, jbyteArray spirv, jint raw_w, jint raw_h, jfloat sigma,
-    jfloat sigma_scale, jfloat sigma_cap, jint crop_x, jint crop_y, jint cov_w,
-    jint cov_h, jlong cov_res, jlong map_res, jint flip_x, jint flip_y, jfloat sigma_floor) {
-  VkDevice device = VK_NULL_HANDLE;
-  VkPhysicalDevice physical = VK_NULL_HANDLE;
-  srp::Context* ctx = CorrContext(handle, &device, &physical);
-  if (ctx == nullptr || spirv == nullptr || raw_w < 4 || raw_h < 4 ||
-      cov_w <= 0 || cov_h <= 0 || weight_count <= 0 || crop_x < 0 || crop_y < 0) {
-    return static_cast<jint>(srp::Status::kInitFailed);
-  }
-  const size_t lw = static_cast<size_t>(raw_w) / 2, lh = static_cast<size_t>(raw_h) / 2;
-  const size_t mw = (lw - 1) / 2 + 1, mh = (lh - 1) / 2 + 1;
-  VkBuffer raw_vk = VK_NULL_HANDLE, w_vk = VK_NULL_HANDLE, cov_vk = VK_NULL_HANDLE,
-           map_vk = VK_NULL_HANDLE;
-  if (srp::SrpResidentBuffer(ctx, raw_res, static_cast<size_t>(raw_w) * raw_h, &raw_vk) != srp::Status::kOk ||
-      srp::SrpResidentBuffer(ctx, weights_res, static_cast<size_t>(weight_count), &w_vk) != srp::Status::kOk ||
-      srp::SrpResidentBuffer(ctx, cov_res, static_cast<size_t>(cov_w) * cov_h * 4, &cov_vk) != srp::Status::kOk ||
-      srp::SrpResidentBuffer(ctx, map_res, 3 * mw * mh, &map_vk) != srp::Status::kOk) {
-    return static_cast<jint>(srp::Status::kInitFailed);
-  }
-  const jsize spirv_len = env->GetArrayLength(spirv);
-  if (spirv_len <= 0 || spirv_len % 4 != 0) return static_cast<jint>(srp::Status::kInitFailed);
-  std::vector<uint8_t> spirv_bytes(static_cast<size_t>(spirv_len));
-  env->GetByteArrayRegion(spirv, 0, spirv_len, reinterpret_cast<jbyte*>(spirv_bytes.data()));
-  if (env->ExceptionCheck() == JNI_TRUE) return static_cast<jint>(srp::Status::kInitFailed);
-  VkShaderModule module = srp::SrpInternModule(ctx, spirv_bytes.data(), spirv_bytes.size());
-  if (module == VK_NULL_HANDLE) return static_cast<jint>(srp::Status::kDispatchFailed);
-  const int64_t luma = srp::SrpCreateResident(ctx, lw * lh);
-  const int64_t act0 = srp::SrpCreateResident(ctx, 16 * mw * mh);
-  const int64_t act1 = srp::SrpCreateResident(ctx, 16 * mw * mh);
-  srp::Status status = srp::Status::kInitFailed;
-  VkBuffer luma_vk = VK_NULL_HANDLE, a0_vk = VK_NULL_HANDLE, a1_vk = VK_NULL_HANDLE;
-  if (luma != 0 && act0 != 0 && act1 != 0 &&
-      srp::SrpResidentBuffer(ctx, luma, lw * lh, &luma_vk) == srp::Status::kOk &&
-      srp::SrpResidentBuffer(ctx, act0, 16 * mw * mh, &a0_vk) == srp::Status::kOk &&
-      srp::SrpResidentBuffer(ctx, act1, 16 * mw * mh, &a1_vk) == srp::Status::kOk) {
-    status = srp::SrpKernelNetCovGpu(
-        ctx, static_cast<uint32_t>(raw_w), static_cast<uint32_t>(raw_h), sigma,
-        sigma_scale, sigma_cap, static_cast<uint32_t>(crop_x),
-        static_cast<uint32_t>(crop_y), static_cast<uint32_t>(cov_w),
-        static_cast<uint32_t>(cov_h), raw_vk, w_vk, luma_vk, a0_vk, a1_vk,
-        map_vk, cov_vk, module, flip_x != 0 ? 1u : 0u, flip_y != 0 ? 1u : 0u, sigma_floor);
-  }
-  if (luma != 0) srp::SrpFreeResident(ctx, luma);
-  if (act0 != 0) srp::SrpFreeResident(ctx, act0);
-  if (act1 != 0) srp::SrpFreeResident(ctx, act1);
-  return static_cast<jint>(status);
-}
 
 // Mixed-radix FFT grey (grey_fft.comp) from a resident frame into `out`
 // (w*h floats). Returns kInitFailed (3) when the size needs the Bluestein
@@ -3341,4 +3288,46 @@ extern "C" JNIEXPORT void JNICALL Java_com_rawlens_srpipeline_SrpBridge_nativeFr
     JNIEnv* env, jclass /*cls*/, jobject buffer) {
   if (buffer == nullptr) return;
   std::free(env->GetDirectBufferAddress(buffer));
+}
+
+// Generic resident dispatch for small stages (noise evening, CA, ghost,
+// deconvolution): binds `res[i]` (each validated for >= `min_floats[i]`
+// floats) at bindings 0..n-1, pushes the 32-word HmsrPush block `push`, and
+// dispatches `groups` groups of `local_size`. The shader grid-strides.
+extern "C" JNIEXPORT jint JNICALL Java_com_rawlens_srpipeline_SrpBridge_nativeDispatchRes(
+    JNIEnv* env, jclass /*cls*/, jlong handle, jbyteArray spirv, jlongArray res,
+    jlongArray min_floats, jintArray push, jint local_size, jint groups) {
+  VkDevice device = VK_NULL_HANDLE;
+  VkPhysicalDevice physical = VK_NULL_HANDLE;
+  srp::Context* ctx = CorrContext(handle, &device, &physical);
+  if (ctx == nullptr || spirv == nullptr || res == nullptr || min_floats == nullptr ||
+      push == nullptr || local_size <= 0 || groups <= 0 || groups > 65535) {
+    return static_cast<jint>(srp::Status::kInitFailed);
+  }
+  const jsize n = env->GetArrayLength(res);
+  if (n <= 0 || n > static_cast<jsize>(srp::kMaxStorageBuffers) ||
+      env->GetArrayLength(min_floats) != n || env->GetArrayLength(push) != 32) {
+    return static_cast<jint>(srp::Status::kInitFailed);
+  }
+  std::vector<jlong> handles(static_cast<size_t>(n)), mins(static_cast<size_t>(n));
+  env->GetLongArrayRegion(res, 0, n, handles.data());
+  env->GetLongArrayRegion(min_floats, 0, n, mins.data());
+  std::vector<VkBuffer> bufs(static_cast<size_t>(n), VK_NULL_HANDLE);
+  for (jsize i = 0; i < n; ++i) {
+    if (mins[i] < 0 || srp::SrpResidentBuffer(ctx, handles[i], static_cast<size_t>(mins[i]),
+                                              &bufs[static_cast<size_t>(i)]) != srp::Status::kOk) {
+      return static_cast<jint>(srp::Status::kInitFailed);
+    }
+  }
+  jint words[32];
+  env->GetIntArrayRegion(push, 0, 32, words);
+  const jsize len = env->GetArrayLength(spirv);
+  if (len <= 0 || len % 4 != 0) return static_cast<jint>(srp::Status::kInitFailed);
+  std::vector<uint8_t> bytes(static_cast<size_t>(len));
+  env->GetByteArrayRegion(spirv, 0, len, reinterpret_cast<jbyte*>(bytes.data()));
+  if (env->ExceptionCheck() == JNI_TRUE) return static_cast<jint>(srp::Status::kInitFailed);
+  VkShaderModule module = srp::SrpInternModule(ctx, bytes.data(), bytes.size());
+  if (module == VK_NULL_HANDLE) return static_cast<jint>(srp::Status::kDispatchFailed);
+  return static_cast<jint>(srp::SrpDispatchGroups(ctx, bufs.data(), static_cast<uint32_t>(n),
+      words, sizeof(words), static_cast<uint32_t>(local_size), static_cast<uint32_t>(groups), module));
 }

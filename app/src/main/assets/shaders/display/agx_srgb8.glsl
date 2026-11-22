@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 RawLens contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Highlight compression adapted from Khronos PBR Neutral (2024 The Khronos Group, Inc.; Apache-2.0).
 
 #ifndef RAPIDRAW_OUTPUT_FUSED
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -169,16 +170,19 @@ highp vec3 srgb_oetf(highp vec3 linear) {
 
 // SIGMOID_FUNCTIONS
 
-// Basic RAW display curve with an optional ratio-preserving highlight shoulder.
+// Photographic neutral: Khronos highlight compression, without the PBR shadow offset.
 highp vec3 basic_encoded(highp vec3 scene) {
+    scene = max(scene, vec3(0.0));
     highp float peak = max(scene.r, max(scene.g, scene.b));
-    if (peak > 0.6 && u_highlight_shoulder > 0.0) {
-        highp float t = peak - 0.6;
-        highp float compressed = 0.6 + t / (1.0 + t / 0.4);
-        scene *= mix(1.0, compressed / peak, clamp(u_highlight_shoulder, 0.0, 1.0));
+    highp float knee = 0.76 - 0.16 * clamp(u_highlight_shoulder, 0.0, 1.0);
+    if (peak > knee) {
+        highp float d = 1.0 - knee;
+        highp float mapped = 1.0 - d * (d / (peak + d - knee));
+        scene *= mapped / peak;
+        highp float white = 1.0 - 1.0 / (1.0 + 0.15 * (peak - mapped));
+        scene = mix(scene, vec3(mapped), white);
     }
-    highp vec3 x = pow(srgb_oetf(clamp(scene, 0.0, 1.0)), vec3(1.0 / 1.1));
-    return 0.25 * x + 0.75 * x * x * (3.0 - 2.0 * x);
+    return srgb_oetf(clamp(scene, 0.0, 1.0));
 }
 highp vec3 basic_decode(highp vec3 encoded) {
     return mix(pow((encoded + 0.055) / 1.055, vec3(2.4)),
@@ -187,7 +191,8 @@ highp vec3 basic_decode(highp vec3 encoded) {
 
 // ST2084 (PQ) opto-electronic transfer, SMPTE ST 2084: absolute nits in
 // [0, 10000] map to codes in [0, 1]. HDR stills treat graded linear 1.0
-// (SDR white) as 100 nits; brighter scene highlights extend above it.
+// (SDR white) as 203 nits (ITU-R BT.2408 reference white, what Chrome,
+// Windows and Lightroom use); brighter scene highlights extend above it.
 highp vec3 pq_oetf(highp vec3 nits) {
     highp vec3 y = clamp(nits / vec3(10000.0), vec3(0.0), vec3(1.0));
     highp vec3 ym1 = pow(y, vec3(0.15930176));
@@ -240,10 +245,11 @@ void main() {
     highp mat3 outputMatrix = u_display_p3 != 0 ? REC2020_TO_DISPLAY_P3 : REC2020_TO_SRGB;
     highp vec3 outputLinear;
     highp vec3 basicEncoded = vec3(0.0);
-    if (u_basic == 3) outputLinear = aces2_output(balancedAcescg, u_display_p3);
+    if (u_basic == 3) outputLinear = aces2_output(tl_aces_pre(balancedAcescg), u_display_p3);
+    else if (u_basic == 4) outputLinear = odrt(ACESCG_TO_REC2020_D65 * balancedAcescg, u_display_p3);
     else if (u_basic == 2) outputLinear = outputMatrix * dt_sigmoid(ACESCG_TO_REC2020_D65 * balancedAcescg);
     else if (EFFECTIVE_BASIC == 1) {
-        highp vec3 sceneOutput = outputMatrix * (ACESCG_TO_REC2020_D65 * balancedAcescg);
+        highp vec3 sceneOutput = outputMatrix * tl_basic_pre(ACESCG_TO_REC2020_D65 * balancedAcescg);
         basicEncoded = basic_encoded(sceneOutput);
         outputLinear = vec3(0.0);
         // Ordinary SDR goes straight to encoded output, skipping decode/re-encode.
@@ -254,10 +260,10 @@ void main() {
 
     // The sole deliberate final display-gamut mapping/clipping boundary.
     // SDR clamps to white and encodes sRGB; HDR keeps highlight energy and
-    // encodes ST2084 (graded linear 1.0 = 100 nits, see pq_oetf).
+    // encodes ST2084 (graded linear 1.0 = 203 nits, see pq_oetf).
     highp vec3 baseLinear = (EFFECTIVE_HDR_PQ != 0) ? max(outputLinear, vec3(0.0))
                                            : clamp(outputLinear, 0.0, 1.0);
-    highp vec3 encoded = (EFFECTIVE_HDR_PQ != 0) ? pq_oetf(baseLinear * vec3(100.0))
+    highp vec3 encoded = (EFFECTIVE_HDR_PQ != 0) ? pq_oetf(baseLinear * vec3(203.0))
                                          : ((EFFECTIVE_BASIC == 1) ? basicEncoded : srgb_oetf(baseLinear));
     if (EFFECTIVE_GAINMAP_ONLY == 0 && EFFECTIVE_GRAIN_AMOUNT > 0.0) {
         // Neutral, zero-mean display grain replaces sensor residual retention. Combining an

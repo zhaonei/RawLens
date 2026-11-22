@@ -417,6 +417,7 @@ class Gles31AmazeProcessor(
                             }, cameraWhiteNormalized[0], cameraWhiteNormalized[1], cameraWhiteNormalized[2]
                         )
                         GLES31.glUniform2f(GLES31.glGetUniformLocation(program, "u_white_window"), whiteWindow[0], whiteWindow[1])
+                        GLES31.glUniform1f(GLES31.glGetUniformLocation(program, "u_white_scale"), 1f)
                         GLES31.glUniform1i(
                             GLES31.glGetUniformLocation(program, "u_camera_linear").also {
                                 check(it >= 0) { "rcd_final uniform 'u_camera_linear' is missing" }
@@ -470,6 +471,8 @@ class Gles31AmazeProcessor(
         cameraToAcescgColumnMajor: FloatArray,
         cameraWhiteNormalized: FloatArray,
         cameraLinear: Boolean = false,
+        /** LK-R HDR merge: level of the sensor clip in [rgb] (> 1); 1 for normal merges. */
+        whiteScale: Float = 1f,
         consume: (AmazeGpuOutput) -> T
     ): T {
         require(width >= 2 && height >= 2) { "Sharp RGB needs positive dimensions" }
@@ -532,6 +535,7 @@ class Gles31AmazeProcessor(
                         }, cameraWhiteNormalized[0], cameraWhiteNormalized[1], cameraWhiteNormalized[2]
                     )
                     GLES31.glUniform2f(GLES31.glGetUniformLocation(program, "u_white_window"), 0.70f, 0.99f)
+                    GLES31.glUniform1f(GLES31.glGetUniformLocation(program, "u_white_scale"), whiteScale)
                     GLES31.glUniform1i(
                         GLES31.glGetUniformLocation(program, "u_camera_linear").also {
                             check(it >= 0) { "rcd_final uniform 'u_camera_linear' is missing" }
@@ -1228,6 +1232,7 @@ class Gles31AmazeProcessor(
                 finalProgram.ivec2("u_output_size", input.width, input.height)
                 finalProgram.integer("u_display_p3", if (settings.displayP3) 1 else 0)
                 finalProgram.integer("u_basic", settings.toneMapper.shaderMode)
+                finalProgram.toneLook = ToneLook.values(settings)
                 finalProgram.float("u_agx_purity_boost", settings.agxPurityBoost)
                 finalProgram.integer("u_agx_punchy", if (settings.agxLook == AgxLook.PUNCHY) 1 else 0)
                 finalProgram.float("u_agx_contrast", settings.agxContrast)
@@ -1237,6 +1242,7 @@ class Gles31AmazeProcessor(
                 finalProgram.float("u_agx_highlight_ev", settings.agxHighlightEv)
                 finalProgram.float("u_agx_gamut_compression", settings.agxGamutCompression)
                 finalProgram.float("u_highlight_shoulder", settings.resolvedForPlatform().highlightShoulder)
+                finalProgram.vec2("u_camera_tone", floatArrayOf(settings.shadowLift, settings.highlightRecovery))
                 // RAWR-parity gain-map encode (declarations arrive via the
                 // agx_output import slice of agx_srgb8.glsl).
                 val resolvedFused = settings.resolvedForPlatform()
@@ -1300,6 +1306,7 @@ class Gles31AmazeProcessor(
 
         private inner class BoundProgram(private val id: Int) {
             private var toneMode: Int? = null
+            var toneLook: FloatArray = ToneLook.DEFAULT
             private val pendingSamplers = ArrayList<Pair<String, GlTexture>>(4)
 
             init {
@@ -1353,7 +1360,7 @@ class Gles31AmazeProcessor(
                     GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, texture.id)
                     GLES31.glUniform1i(location(name), unit)
                 }
-                toneMode?.let { programs.bindAces2(id, it) }
+                toneMode?.let { programs.bindAces2(id, it, toneLook) }
                 GLES31.glDispatchCompute(
                     ceilDiv(width, AmazePipelineContract.LOCAL_SIZE_X),
                     ceilDiv(height, AmazePipelineContract.LOCAL_SIZE_Y),
@@ -1374,7 +1381,7 @@ class Gles31AmazeProcessor(
 
     internal class ProgramCache(private val context: Context, private val slicedDispatch: Boolean = false) : Closeable {
         private val aces2 = Aces2Gl()
-        fun bindAces2(id: Int, mode: Int) = aces2.bind(id, mode)
+        fun bindAces2(id: Int, mode: Int, look: FloatArray) = aces2.bind(id, mode, look)
         private val programs = LinkedHashMap<String, Int>()
         private val common by lazy { read("shaders/utils/import_amaze.glsl") }
         private val cleanupCommon by lazy { read("shaders/amaze/cleanup.glsl") }

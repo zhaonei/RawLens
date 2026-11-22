@@ -25,26 +25,10 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
         content.addView(sectionTitle("MFSR · Multi-Frame Super-Resolution"))
         content.addView(sectionDesc(
             "Auto, Program and Manual capture a fresh burst; ZSL merges buffered frames. " +
-                "Reconstruction kernel and Wronski supplement S.3 high-frequency " +
-                "artefact rejection for the sharp merge (live tile and offline " +
-                "merges). KernelNet predicts one kernel map from the reference " +
-                "frame; Wronski uses the paper's per-frame anisotropic kernels. " +
-                "S.3 off gives 1:1 parity with the IPOL reference, which has no S.3."
+                "Wronski supplement S.3 high-frequency artefact rejection for the " +
+                "sharp merge (live tile and offline merges). S.3 off gives 1:1 " +
+                "parity with the IPOL reference, which has no S.3."
         ))
-        fun mfsrKernelText(kernel: MfsrKernel): String = when (kernel) {
-            MfsrKernel.KERNELNET -> "Kernel: KernelNet"
-            MfsrKernel.WRONSKI -> "Kernel: Wronski (paper S.1)"
-        }
-        content.addView(settingsButton(mfsrKernelText(mfsrSettings.kernel)).apply {
-            setOnClickListener {
-                p.kit.chooseEnum("Kernel", mfsrSettings.kernel, { mfsrKernelText(it) }) { next ->
-                    if (applyMfsrSettings(mfsrSettings.copy(kernel = next))) {
-                        text = mfsrKernelText(next)
-                        setStatus("MFSR ${mfsrKernelText(next).uppercase(Locale.US)}")
-                    }
-                }
-            }
-        })
         content.addView(settingsCheck("S.3 artefact rejection", mfsrSettings.s3).apply {
             setOnCheckedChangeListener { _, checked ->
                 if (checked != mfsrSettings.s3) {
@@ -63,6 +47,17 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
                         setStatus(if (checked) "MFSR ZIPPER FIX • ON" else "MFSR ZIPPER FIX • OFF")
                     } else {
                         isChecked = mfsrSettings.zipperFix
+                    }
+                }
+            }
+        })
+        content.addView(settingsCheck("Two-band reconstruction", mfsrSettings.twoBand).apply {
+            setOnCheckedChangeListener { _, checked ->
+                if (checked != mfsrSettings.twoBand) {
+                    if (applyMfsrSettings(mfsrSettings.copy(twoBand = checked))) {
+                        setStatus(if (checked) "MFSR TWO-BAND • ON" else "MFSR TWO-BAND • OFF")
+                    } else {
+                        isChecked = mfsrSettings.twoBand
                     }
                 }
             }
@@ -112,18 +107,6 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
                 "RawLens improvements: DSLR look, motion and water rejection, local motion, " +
                 "shadow cleanup. Own quick tile; same shutter, ZSL and save path as MFSR."
         ))
-        content.addView(settingsCheck("LK-R denoise: automatic KernelNet", mfsrSettings.lkrKernelNetDenoise).apply {
-            setOnCheckedChangeListener { _, checked ->
-                if (checked != mfsrSettings.lkrKernelNetDenoise &&
-                    !applyMfsrSettings(mfsrSettings.copy(lkrKernelNetDenoise = checked))) {
-                    isChecked = mfsrSettings.lkrKernelNetDenoise
-                }
-            }
-        })
-        content.addView(sectionDesc(
-            "On by default. PhotonCamera-based KernelNet denoising increases in noisy, " +
-                "low-light scenes. Low-noise scenes skip it."
-        ))
         content.addView(settingsCheck("LK-R: Network", mfsrSettings.lkrNetwork).apply {
             setOnCheckedChangeListener { _, checked ->
                 if (checked != mfsrSettings.lkrNetwork &&
@@ -148,7 +131,23 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
         content.addView(sectionDesc(
             "Colour noise is always removed, following the measured noise, without colour bleeding. " +
                 "On: also cleans luma noise in shadows down to a fine, even grain; mid-tones and highlights " +
-                "are left untouched. Off: luma is not touched. KernelNet denoise is controlled separately."
+                "are left untouched. Off: luma is not touched."
+        ))
+        content.addView(settingsButton("LK-R HDR").apply {
+            fun refresh() { text = "LK-R HDR: ${mfsrSettings.lkrHdr.label}" }
+            refresh()
+            setOnClickListener {
+                p.kit.chooseEnum("LK-R HDR", mfsrSettings.lkrHdr, { it.label }) { picked ->
+                    applyMfsrSettings(mfsrSettings.copy(lkrHdr = picked))
+                    refresh()
+                }
+            }
+        })
+        content.addView(sectionDesc(
+            "Auto: when the moment you press shows blown highlights, the last frames of the burst are " +
+                "taken 2 EV darker (and one 1.5 EV brighter when the shadows need it) and merged with " +
+                "the ZSL frames: highlights keep detail, the JPEG / Ultra HDR is tone-mapped. On: always. " +
+                "Off: a normal burst. Same frame count, same merge time."
         ))
         content.addView(settingsCheck("LK-R reference: middle of the burst", mfsrSettings.lkrMiddleReference).apply {
             setOnCheckedChangeListener { _, checked ->

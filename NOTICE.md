@@ -58,19 +58,6 @@ static libraries, and `assets/models/flownet_flat.ncnn.{param,bin}`. The vendore
 is recorded in `app/src/main/cpp/flownet/UPSTREAM.md`. RawLens supplies its own
 normalized-CFA input renderer and CFA-parity-preserving warp.
 
-RawLens's SR anisotropic weights vendor PhotonCamera's KernelNet parameter model
-from the same commit `9efb24a44119b04223b4a2eef50c7837ad643970`: the JNI tiling
-runtime in `app/src/main/cpp/ncnnMl.cpp` (`KernelNetCtx`), the Java wrapper
-`app/src/main/java/com/particlesdevs/photoncamera/processing/ml/KernelNetNcnnProcessor.java`,
-and `assets/models/kernelnet_aniso_v2_2_params.ncnn.{param,bin}`. Deliberate
-divergences from upstream: the native side emits channel-major float32
-`[s1][s2][rho]` planes instead of upstream's RGBA-interleaved fp16 halves, and
-the Kotlin bridge (`RawSrKernelNetAniso`) converts the raw model output straight
-to the SR precision field as `P = 2*M(s)` per quad (the `mergeCombineWeight`
-convention, `s1`=y / `s2`=x, no transpose, no extra rescale, no width cap, no
-area floor, no narrow-axis clamp — the direct upstream law). Unusable triples
-(non-positive or non-finite axes) fall back to the analytic kernel.
-
 ## Google Filament AgX
 
 RawLens's SDR display transform is a Kotlin/GLSL adaptation of the AgX Base implementation in
@@ -401,3 +388,10 @@ smoothing and margin easing with a whole-take L1 path optimization
 (`StabPathSolver.kt`, after Grundmann, Kwatra & Essa, CVPR 2011) and adds
 self-calibration (`StabCalib.kt`, after Karpenko et al., 2011). No VidUltra source
 file is copied. Reviewed at commit `25674ef`.
+
+## Basic Neutral v2
+
+Highlight compression adapted from KhronosGroup/ToneMapping, copyright 2024 The
+Khronos Group, Inc., Apache-2.0. Reference and modifications are documented in
+`docs/rendering/basic-neutral-replacement.md`; bundled notice and license in
+`app/src/main/assets/licenses/khronos-neutral-NOTICE.txt` and `Apache-2.0.txt`.

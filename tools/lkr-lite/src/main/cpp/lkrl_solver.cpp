@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "lkrl_solver.h"
 #include "lkrl_prior.h"
-#include "lkrl_kernelnet.h"
 
 #include <algorithm>
 #include <chrono>
@@ -58,6 +57,21 @@ static const uint32_t le_blur[] = {
 static const uint32_t le_apply[] = {
 #include "le_apply.inc"
 };
+static const uint32_t dln_apply[] = {
+#include "dln_apply.inc"
+};
+static const uint32_t axn_apply[] = {
+#include "axn_apply.inc"
+};
+static const uint32_t gcf_apply[] = {
+#include "gcf_apply.inc"
+};
+static const uint32_t canc_apply[] = {
+#include "canc_apply.inc"
+};
+static const uint32_t rcd_start[] = {
+#include "rcd_start.inc"
+};
 static const uint32_t prior_conv[] = {
 #include "prior_conv.inc"
 };
@@ -105,12 +119,6 @@ static const uint32_t adj_wg[] = {
 };
 static const uint32_t hyb[] = {
 #include "hyb.inc"
-};
-static const uint32_t kn_conv[] = {
-#include "kn_conv.inc"
-};
-static const uint32_t kn_dn[] = {
-#include "kn_dn.inc"
 };
 static const uint32_t kresid[] = {
 #include "lkr_resid.inc"
@@ -170,6 +178,10 @@ struct DctPush {   // = lkr_solver.cpp DctPush
   float aperture_scale, aperture_strength;
   float coherence_sigma2;
   float correlated_error;
+  float grain_rel2, grain_rho;   // dct_x.glsl luma grain mode (> 0): kept relative grain^2, min kept share
+  float chroma_norm;             // 1: colour thresholds in the colour channel's own noise units
+  float grain_tilt;              // grain mode: coarse-vs-fine threshold tilt (log units)
+  float grain_sub;               // grain mode: > 0 = detail-keeping subtraction gain, beta (dct_x.glsl)
 };
 
 // float -> IEEE half, round to nearest even (frames: normalised raw, |x| < 65504).
@@ -194,6 +206,66 @@ uint16_t ToHalf(float f) {
   if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
   return uint16_t(h);
 }
+// HDR bracket start image: the reference mosaic with its clipped samples (>= clip) filled from the
+// other frames at the same scene point (inverse tile affine, same-parity Bayer sub-grid, bilinear),
+// each in reference units already, weighted by its inverse noise variance a y / e + b / e^2.
+// Samples no frame sees unclipped stay clipped. Only the start (demosaic) uses it; the data term
+// keeps the reference's own samples.
+static std::vector<float> HdrFillReference(const float* frames, int K, int h, int w, const std::vector<float>& p,
+                                           const std::vector<float>& e, float clip, float na, float nb,
+                                           std::vector<uint8_t>* unfilled) {
+  std::vector<float> out(frames, frames + size_t(h) * w);
+  // Lower bound: the reference is clipped here, so the scene is at least the reference's clip level
+  // (clip x the shortest exposure, reference units). A darker sample from another frame is not this
+  // scene: lamp flicker caught off by a short frame (IMG_20261120_151412_514: an LED tube at ~1 % of
+  // its normal-frame level at 1/400 s) or motion. Such samples do not fill (3 sigma below 0.9 x that).
+  float emin = 1.0f;
+  for (float v : e) emin = std::min(emin, std::max(v, 1e-3f));
+  const double ref_clip = double(clip) * emin;
+  for (int i = 0; i < h; ++i)
+    for (int j = 0; j < w; ++j) {
+      const size_t o = size_t(i) * w + j;
+      if (out[o] < clip) continue;
+      const bool self_clip = out[o] >= 1.015f * clip;   // clipped itself (not only the colour ring)
+      double sw = 0.0, sv = 0.0;
+      for (int k = 1; k < K; ++k) {
+        const float* A = p.data() + size_t(k) * 6;
+        const double det = double(A[0]) * A[4] - double(A[1]) * A[3];
+        if (std::fabs(det) < 1e-9) continue;
+        const double rx = j + 0.5 - A[2], ry = i + 0.5 - A[5];   // reference point minus translation
+        const double ux = (A[4] * rx - A[1] * ry) / det - 0.5, uy = (-A[3] * rx + A[0] * ry) / det - 0.5;
+        const double fx = (ux - (j & 1)) * 0.5, fy = (uy - (i & 1)) * 0.5;   // same-parity sub-grid
+        const int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
+        const int sw2 = (w - (j & 1) + 1) / 2, sh2 = (h - (i & 1) + 1) / 2;
+        if (x0 < 0 || y0 < 0 || x0 + 1 >= sw2 || y0 + 1 >= sh2) continue;
+        const double ax = fx - x0, ay = fy - y0;
+        const float* fk = frames + size_t(k) * h * w;
+        double v = 0.0;
+        bool ok = true;
+        for (int dy = 0; dy < 2 && ok; ++dy)
+          for (int dx = 0; dx < 2; ++dx) {
+            const float t = fk[size_t(2 * (y0 + dy) + (i & 1)) * w + 2 * (x0 + dx) + (j & 1)];
+            if (!(t < clip)) { ok = false; break; }
+            v += t * (dx ? ax : 1.0 - ax) * (dy ? ay : 1.0 - ay);
+          }
+        if (!ok) continue;
+        const double ek = std::max(double(e[size_t(k)]), 1e-3), yy = std::max(v, 0.0);
+        if (self_clip && v < 0.9 * ref_clip - 3.0 * std::sqrt(std::max(na * yy / ek + nb / (ek * ek), 0.0))) continue;
+        const double wk = (na * yy + nb) / std::max(na * yy / ek + nb / (ek * ek), 1e-20);
+        sw += wk; sv += wk * v;
+      }
+      if (sw > 0.0) out[o] = float(sv / sw);
+      else if (self_clip) {
+        // No frame saw it unclipped: start from the lower bound (the reference's clip level), as a normal
+        // burst would. The clipped mark (~4x that) made the RCD start ring next to it (R -0.8 beside a
+        // lamp tube, red / blue edges). The solver marks these white after the solve (unfilled mask).
+        out[o] = float(ref_clip);
+        if (unfilled) (*unfilled)[o] = 1;
+      }
+    }
+  return out;
+}
+
 float HalfRound(float f) {   // value of ToHalf(f) as float (clip level as the fp16 frames see it)
   const uint16_t h = ToHalf(f);
   const uint32_t sign = uint32_t(h & 0x8000u) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
@@ -235,10 +307,10 @@ bool solve6(double A[6][6], double b[6], double x[6]) {   // Gaussian eliminatio
 
 LiteSolver::LiteSolver(Gpu* gpu) : gpu_(gpu) {
   if (!gpu_ || !gpu_->ok()) return;
-  LKRL_PIPE(resid, 6); LKRL_PIPE(werr, 3); LKRL_PIPE(wavg, 2); LKRL_PIPE(wminh, 3); LKRL_PIPE(wminv, 3);
-  LKRL_PIPE(adj, 7); LKRL_PIPE(adj_s1, 7); LKRL_PIPE(adj_s2, 7); LKRL_PIPE(edgeshift, 3); LKRL_PIPE(cdupd, 4); LKRL_PIPE(le_tensor, 2); LKRL_PIPE(le_blur, 2); LKRL_PIPE(le_apply, 3); LKRL_PIPE(prior_conv, 4); LKRL_PIPE(zupd, 4); LKRL_PIPE(jac, 6); LKRL_PIPE(jacblk, 6); LKRL_PIPE(solveblk, 3); LKRL_PIPE(gstats, 3); LKRL_PIPE(wguide, 5); LKRL_PIPE(wvalid, 3);
+  LKRL_PIPE(resid, 6); LKRL_PIPE(werr, 3); LKRL_PIPE(wavg, 2); LKRL_PIPE(wminh, 3); LKRL_PIPE(wminv, 5);
+  LKRL_PIPE(adj, 7); LKRL_PIPE(adj_s1, 7); LKRL_PIPE(adj_s2, 7); LKRL_PIPE(edgeshift, 3); LKRL_PIPE(cdupd, 4); LKRL_PIPE(le_tensor, 2); LKRL_PIPE(le_blur, 2); LKRL_PIPE(le_apply, 3); LKRL_PIPE(dln_apply, 3); LKRL_PIPE(axn_apply, 3); LKRL_PIPE(gcf_apply, 3); LKRL_PIPE(canc_apply, 5); LKRL_PIPE(rcd_start, 4); LKRL_PIPE(prior_conv, 4); LKRL_PIPE(zupd, 4); LKRL_PIPE(jac, 6); LKRL_PIPE(jacblk, 6); LKRL_PIPE(solveblk, 3); LKRL_PIPE(gstats, 3); LKRL_PIPE(wguide, 5); LKRL_PIPE(wvalid, 5);
 #define LKRL_KPIPE(name, nb) name##_ = gpu_->pipeline(spv::name, sizeof(spv::name), nb, sizeof(KPush))
-  LKRL_KPIPE(kresid, 5); LKRL_KPIPE(ktdet, 3); LKRL_KPIPE(kth, 5); LKRL_KPIPE(kt, 6); LKRL_KPIPE(ktv, 8);
+  LKRL_KPIPE(kresid, 5); LKRL_KPIPE(ktdet, 4); LKRL_KPIPE(kth, 5); LKRL_KPIPE(kt, 6); LKRL_KPIPE(ktv, 8);
   LKRL_KPIPE(ktd, 8); LKRL_KPIPE(kguide, 6); LKRL_KPIPE(kminh, 3); LKRL_KPIPE(kmin, 5);
   kdy_ = gpu_->pipeline(spv::kdy, sizeof(spv::kdy), 5, sizeof(DctPush));
   kdu_ = gpu_->pipeline(spv::kdu, sizeof(spv::kdu), 5, sizeof(DctPush));
@@ -247,13 +319,11 @@ LiteSolver::LiteSolver(Gpu* gpu) : gpu_(gpu) {
   kduo_ = gpu_->pipeline(spv::kduo, sizeof(spv::kduo), 5, sizeof(DctPush));
   kdvo_ = gpu_->pipeline(spv::kdvo, sizeof(spv::kdvo), 5, sizeof(DctPush));
   kdyuv_ = gpu_->pipeline(spv::kdyuv, sizeof(spv::kdyuv), 1, sizeof(DctPush));
-  knconv_ = gpu_->pipeline(spv::kn_conv, sizeof(spv::kn_conv), 3, 48);
-  kndn_ = gpu_->pipeline(spv::kn_dn, sizeof(spv::kn_dn), 4, 48);
   hyb_ = gpu_->pipeline(spv::hyb, sizeof(spv::hyb), 4, 48);
   adjwg_ = gpu_->pipeline(spv::adj_wg, sizeof(spv::adj_wg), 7, sizeof(Push));
-  fin_ = gpu_->pipeline(spv::fin, sizeof(spv::fin), 7, 64);
+  fin_ = gpu_->pipeline(spv::fin, sizeof(spv::fin), 7, 80);
   ok_ = true;
-  for (Pipeline* q : {&resid_, &werr_, &wavg_, &wminh_, &wminv_, &adj_, &adj_s1_, &adj_s2_, &zupd_, &jac_, &jacblk_, &solveblk_, &gstats_, &wguide_, &wvalid_, &kresid_, &ktdet_, &kth_, &kt_, &ktv_, &ktd_, &kguide_, &kminh_, &kmin_, &kdy_, &kdu_, &kdv_, &kdyuv_, &kdyo_, &kduo_, &kdvo_, &knconv_, &kndn_, &hyb_, &adjwg_, &fin_, &edgeshift_, &cdupd_, &le_tensor_, &le_blur_, &le_apply_, &prior_conv_})
+  for (Pipeline* q : {&resid_, &werr_, &wavg_, &wminh_, &wminv_, &adj_, &adj_s1_, &adj_s2_, &zupd_, &jac_, &jacblk_, &solveblk_, &gstats_, &wguide_, &wvalid_, &kresid_, &ktdet_, &kth_, &kt_, &ktv_, &ktd_, &kguide_, &kminh_, &kmin_, &kdy_, &kdu_, &kdv_, &kdyuv_, &kdyo_, &kduo_, &kdvo_, &hyb_, &adjwg_, &fin_, &edgeshift_, &cdupd_, &le_tensor_, &le_blur_, &le_apply_, &dln_apply_, &axn_apply_, &gcf_apply_, &canc_apply_, &rcd_start_, &prior_conv_})
     ok_ = ok_ && q->pipe != VK_NULL_HANDLE;
 }
 
@@ -266,8 +336,8 @@ std::string LiteSolver::profileNames() const {
       {&gstats_, "gstats"}, {&wguide_, "wguide"}, {&wvalid_, "wvalid"}, {&kresid_, "lkr_resid"},
       {&ktdet_, "lkr_weight_tdet"}, {&kth_, "lkr_weight_th"}, {&kt_, "lkr_weight_t"}, {&ktv_, "lkr_weight_tv"},
       {&ktd_, "lkr_weight_td"}, {&kguide_, "lkr_weight_guide"}, {&kminh_, "lkr_weight_minh"}, {&kmin_, "lkr_weight_min"},
-      {&kdy_, "dct_y"}, {&kdu_, "dct_u"}, {&kdv_, "dct_v"}, {&kdyo_, "dct_y_old"}, {&kduo_, "dct_u_old"}, {&kdvo_, "dct_v_old"}, {&kdyuv_, "dct_yuv"}, {&knconv_, "kn_conv"},
-      {&kndn_, "kn_dn"}, {&hyb_, "hyb"}, {&adjwg_, "adj_wg"}, {&fin_, "fin"}, {&edgeshift_, "edgeshift"}, {&cdupd_, "cdupd"}, {&le_tensor_, "le_tensor"}, {&le_blur_, "le_blur"}, {&le_apply_, "le_apply"}, {&prior_conv_, "prior_conv"}};
+      {&kdy_, "dct_y"}, {&kdu_, "dct_u"}, {&kdv_, "dct_v"}, {&kdyo_, "dct_y_old"}, {&kduo_, "dct_u_old"}, {&kdvo_, "dct_v_old"}, {&kdyuv_, "dct_yuv"},
+      {&hyb_, "hyb"}, {&adjwg_, "adj_wg"}, {&fin_, "fin"}, {&edgeshift_, "edgeshift"}, {&cdupd_, "cdupd"}, {&le_tensor_, "le_tensor"}, {&le_blur_, "le_blur"}, {&le_apply_, "le_apply"}, {&dln_apply_, "dln_apply"}, {&axn_apply_, "axn_apply"}, {&gcf_apply_, "gcf_apply"}, {&canc_apply_, "canc_apply"}, {&rcd_start_, "rcd_start"}, {&prior_conv_, "prior_conv"}};
   for (const auto& n : names) {
     std::snprintf(b, sizeof(b), "%s%s=%p", out.empty() ? "" : " ", n.second, static_cast<const void*>(n.first));
     out += b;
@@ -279,7 +349,7 @@ LiteSolver::~LiteSolver() {
   if (!gpu_ || !gpu_->ok()) return;
   for (Entry& e : cache_) gpu_->free(e.buf);
   for (Entry& e : fcache_) gpu_->free(e.buf);
-  for (Pipeline* q : {&resid_, &werr_, &wavg_, &wminh_, &wminv_, &adj_, &adj_s1_, &adj_s2_, &zupd_, &jac_, &jacblk_, &solveblk_, &gstats_, &wguide_, &wvalid_, &kresid_, &ktdet_, &kth_, &kt_, &ktv_, &ktd_, &kguide_, &kminh_, &kmin_, &kdy_, &kdu_, &kdv_, &kdyuv_, &kdyo_, &kduo_, &kdvo_, &knconv_, &kndn_, &hyb_, &adjwg_, &fin_, &edgeshift_, &cdupd_, &le_tensor_, &le_blur_, &le_apply_, &prior_conv_}) gpu_->destroy(*q);
+  for (Pipeline* q : {&resid_, &werr_, &wavg_, &wminh_, &wminv_, &adj_, &adj_s1_, &adj_s2_, &zupd_, &jac_, &jacblk_, &solveblk_, &gstats_, &wguide_, &wvalid_, &kresid_, &ktdet_, &kth_, &kt_, &ktv_, &ktd_, &kguide_, &kminh_, &kmin_, &kdy_, &kdu_, &kdv_, &kdyuv_, &kdyo_, &kduo_, &kdvo_, &hyb_, &adjwg_, &fin_, &edgeshift_, &cdupd_, &le_tensor_, &le_blur_, &le_apply_, &dln_apply_, &axn_apply_, &gcf_apply_, &canc_apply_, &rcd_start_, &prior_conv_}) gpu_->destroy(*q);
 }
 
 bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<float>& p, std::vector<float>& dloc,
@@ -363,26 +433,128 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
     if (!cache_[i].buf.map) return fail("buffer allocation");
   struct Reset { Gpu* g; ~Reset() { g->resetSets(); } } reset_sets{gpu_};
 
-  const float mhc_mix = prm.mhc_mix >= 0.0f ? prm.mhc_mix : (s == 1 ? 0.75f : 1.0f);
+  // Start image (2026-11-19): RCD at 1x and 2x by default (user: everything for the 2x zipper on 1x too).
+  static const int rcd_env = std::getenv("LKRL_RCD") ? std::atoi(std::getenv("LKRL_RCD")) : 2;
+  const int rcd_mode = prm.start_notch > 0 ? (rcd_env > 0 ? 1 : 0) : rcd_env;   // the notch is host-side
+  const float mhc_mix = rcd_mode > 0 ? 1.0f : (prm.mhc_mix >= 0.0f ? prm.mhc_mix : (s == 1 ? 0.75f : 1.0f));
   const float jacobi_damp = prm.jacobi_damp >= 0.0f ? prm.jacobi_damp : 0.0f;
+  // HDR bracket, physical lower bound (2026-11-20, real bracket IMG_20261120_151412_514): where the
+  // reference is clipped the scene is at least its clip level (reference units: clip x the shortest
+  // exposure). A frame's sample there that is darker (3 sigma below 0.9 x that) is not this scene: lamp
+  // flicker caught off by a 1/400 s frame (LED tube at ~1 % of its normal level) or motion. Frame k's LR
+  // point u maps to the reference at A u + t.
+  std::vector<float> frames_lb;
+  if (int(prm.exposure.size()) == K && std::any_of(prm.exposure.begin(), prm.exposure.end(), [](float v) { return std::fabs(v - 1.0f) > 1e-3f; })) {
+    const float cl = HalfRound(prm.clip);
+    float emin = 1.0f;
+    for (float v : prm.exposure) emin = std::min(emin, std::max(v, 1e-3f));
+    const double ref_clip = double(cl) * emin;
+    frames_lb.assign(frames, frames + nLR);
+    std::vector<uint8_t> rc(size_t(h) * w);   // reference sample clipped itself
+    for (size_t o = 0; o < rc.size(); ++o) rc[o] = frames[o] >= 1.015f * cl;
+    // Pass 1: per clipped reference sample, how many bracket samples of its colour land there and how many
+    // are impossibly dark. Flicker contradicts nearly all of them over the lamp; sub-pixel misalignment at
+    // the edge of a clipped sky with branches only a few (real bracket HDR 3 window: dropping on any single
+    // contradiction blew out recovered sky detail). Contradicted = > half of those in the 5 x 5 window.
+    std::vector<uint16_t> n_all(size_t(h) * w, 0), n_con(size_t(h) * w, 0);
+    // The reference sample of the SAME CFA colour nearest to where frame k's sample (i, j) lands: the
+    // bound holds per colour (near the sun the reference's blue clips while red is legitimately darker).
+    auto refPos = [&](int k, int i, int j, int* ii, int* jj) {
+      const float* A = p.data() + size_t(k) * 6;
+      const double x = A[0] * (j + 0.5) + A[1] * (i + 0.5) + A[2], yv = A[3] * (j + 0.5) + A[4] * (i + 0.5) + A[5];
+      const int pi = i & 1, pj = j & 1;   // same parity = same colour (RGGB; the two greens count as one)
+      *ii = 2 * int(std::floor((yv - 0.5 - pi) * 0.5 + 0.5)) + pi;
+      *jj = 2 * int(std::floor((x - 0.5 - pj) * 0.5 + 0.5)) + pj;
+      return *ii >= 0 && *jj >= 0 && *ii < h && *jj < w;
+    };
+    for (int k = 1; k < K; ++k) {
+      if (std::fabs(prm.exposure[size_t(k)] - 1.0f) <= 1e-3f) continue;
+      const double ek = std::max(double(prm.exposure[size_t(k)]), 1e-3);
+      const float* fk = frames + size_t(k) * h * w;
+      for (int i = 0; i < h; ++i)
+        for (int j = 0; j < w; ++j) {
+          const float v = fk[size_t(i) * w + j];
+          int ii, jj;
+          if (v >= cl || !refPos(k, i, j, &ii, &jj) || !rc[size_t(ii) * w + jj]) continue;
+          const size_t o = size_t(ii) * w + jj;
+          ++n_all[o];
+          const double yy = std::max(double(v), 0.0);
+          if (v < 0.9 * ref_clip - 3.0 * std::sqrt(std::max(prm.noise_a * yy / ek + prm.noise_b / (ek * ek), 0.0)))
+            ++n_con[o];
+        }
+    }
+    std::vector<uint8_t> con(size_t(h) * w, 0);
+    for (int i = 0; i < h; ++i)
+      for (int j = 0; j < w; ++j) {
+        if (!n_con[size_t(i) * w + j]) continue;
+        int a = 0, c = 0;
+        for (int di = -2; di <= 2; ++di)
+          for (int dj = -2; dj <= 2; ++dj) {
+            const int ii = i + di, jj = j + dj;
+            if (ii < 0 || jj < 0 || ii >= h || jj >= w) continue;
+            a += n_all[size_t(ii) * w + jj]; c += n_con[size_t(ii) * w + jj];
+          }
+        con[size_t(i) * w + j] = 2 * c > a;
+      }
+    // Pass 2: there and 2 px around, the bracket frames (exposure != 1) are dropped: the area merges
+    // like a normal burst (the reference's clipped samples become white in the finish), no mixed
+    // sources, no colour from the frames that saw another scene.
+    std::vector<uint8_t> drop(size_t(h) * w, 0);
+    for (int i = 0; i < h; ++i)
+      for (int j = 0; j < w; ++j)
+        if (con[size_t(i) * w + j])
+          for (int di = -2; di <= 2; ++di)
+            for (int dj = -2; dj <= 2; ++dj) {
+              const int ii = i + di, jj = j + dj;
+              if (ii >= 0 && jj >= 0 && ii < h && jj < w) drop[size_t(ii) * w + jj] = 1;
+            }
+    for (int k = 1; k < K; ++k) {
+      if (std::fabs(prm.exposure[size_t(k)] - 1.0f) <= 1e-3f) continue;
+      float* fk = frames_lb.data() + size_t(k) * h * w;
+      for (int i = 0; i < h; ++i)
+        for (int j = 0; j < w; ++j) {
+          int ii, jj;
+          if (refPos(k, i, j, &ii, &jj) && drop[size_t(ii) * w + jj] && fk[size_t(i) * w + j] < cl)
+            fk[size_t(i) * w + j] = 1.01f * cl;   // invalid, not "clipped itself" (no white fill from it)
+        }
+    }
+    frames = frames_lb.data();
+  }
   PackHalf(frames, nLR, y.as<uint32_t>());   // fp16 frames, two per uint (shaders: yv())
   std::memcpy(pb.map, p.data(), p.size() * 4);
   std::memcpy(db.map, dloc.data(), dloc.size() * 4);
+  // HDR bracket: the start images demosaic the reference with its clipped samples filled from the
+  // other frames (the data term still excludes them). frames stays the reference elsewhere.
+  std::vector<float> ref_fused;
+  std::vector<uint8_t> hdr_unfilled;   // reference samples clipped in every frame (white after the solve)
+  const float* ref_start = frames;
+  if (int(prm.exposure.size()) == K && std::any_of(prm.exposure.begin(), prm.exposure.end(), [](float v) { return std::fabs(v - 1.0f) > 1e-3f; })) {
+    hdr_unfilled.assign(size_t(h) * w, 0);
+    ref_fused = HdrFillReference(frames, K, h, w, p, prm.exposure, HalfRound(prm.clip), prm.noise_a, prm.noise_b, &hdr_unfilled);
+    ref_start = ref_fused.data();
+    trace("hdr-reference.f32", ref_start, size_t(h) * w * 4);
+  }
+  Buffer& yref = buf(ref_fused.empty() ? 16 : (size_t(h) * w + 1) / 2 * 4, true);
+  if (!ref_fused.empty()) PackHalf(ref_start, size_t(h) * w, yref.as<uint32_t>());
   {
     std::vector<float> rgb(size_t(3) * h * w), up(nHR);
-    if (mhc_mix > 0.0f) MhcCoherentRggb(frames, h, w, rgb.data());
+    // Edge-directed start at 2x (RcdRggb, 2026-11-19): with the luma-guided chroma it removes the blue
+    // trunk fringe; luma detail equal (+0.5..1 %). LKRL_RCD=0 = MHC, =1 also at 1x.
+    // LKRL_RCD: 2 (default) = GPU RCD (rcd_start.comp, the app's vf_rcd), 1 = CPU RcdRggb, 0 = MHC.
+    if (rcd_mode == 0 && mhc_mix > 0.0f) MhcCoherentRggb(ref_start, h, w, rgb.data());
+    if (rcd_mode == 1) RcdRggb(ref_start, h, w, rgb.data());
     // z0 (weights / first motion steps) = LK-R's own start, pure MHC; only the merge starts from
     // the MHC + bilinear mix. Mixed z0 lowered chrome glints (IMG_20261107) vs LK-R.
     static const int z0_mhc = std::getenv("LKRL_Z0MHC") ? std::atoi(std::getenv("LKRL_Z0MHC")) : 1;
     if (z0_mhc && mhc_mix < 1.0f) {
       std::vector<float> m(rgb.size()), u0(nHR);
-      if (mhc_mix > 0.0f) m = rgb; else MhcCoherentRggb(frames, h, w, m.data());
+      if (mhc_mix > 0.0f) m = rgb; else MhcCoherentRggb(ref_start, h, w, m.data());
       UpsampleBilinear(m.data(), 3, h, w, s, u0.data());
       std::memcpy(z0.map, u0.data(), nHR * 4);
     }
     if (mhc_mix < 1.0f) {
       std::vector<float> bil(rgb.size());
-      DemosaicBilinear(frames, h, w, bil.data());
+      DemosaicBilinear(ref_start, h, w, bil.data());
       const float a = mhc_mix;
       for (size_t o = 0; o < rgb.size(); ++o) rgb[o] = a > 0.0f ? a * rgb[o] + (1.0f - a) * bil[o] : bil[o];
     }
@@ -418,18 +590,24 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
           }
       }
     }
+    if (rcd_mode != 2) {
     UpsampleBilinear(rgb.data(), 3, h, w, s, up.data());
     std::memcpy(z.map, up.data(), nHR * 4);
     if (cavg >= 2) std::memcpy(zstart.map, up.data(), nHR * 4);
     if (!(z0_mhc && mhc_mix < 1.0f)) std::memcpy(z0.map, up.data(), nHR * 4);
     trace("seed.f32",up.data(),nHR*4);
     trace("reference.f32",z0.map,nHR*4);
+    }
   }
   Push q{};
   q.h = h; q.w = w; q.s = s; q.K = K; q.H = H; q.W = W; q.LB = LB; q.mode = 0;
   q.a = prm.noise_a; q.b = prm.noise_b; q.clip = HalfRound(prm.clip); q.robk = prm.robust_k;
   q.tau = prm.robust_tau; q.rpow = std::max(prm.robust_pow, 1.0f);
   q.scale = float(std::ldexp(1.0, 28) / K);   // |r| <= 1, <= 4 s^2 taps per frame and HR pixel
+  // HDR bracket: samples (and residuals) reach the clip level (> 1) in reference units.
+  const bool hdr_in = int(prm.exposure.size()) == K &&
+                      std::any_of(prm.exposure.begin(), prm.exposure.end(), [](float v) { return std::fabs(v - 1.0f) > 1e-3f; });
+  if (hdr_in) q.scale /= std::ceil(std::max(prm.clip, 1.0f));
   q.dscale = q.scale;
 
   const uint32_t gx = uint32_t(K) * div_up(uint32_t(w), 16), gy = div_up(uint32_t(h), 16);
@@ -438,7 +616,22 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
   VkDescriptorSet sAvg = gpu_->set(wavg_, {&e, &r});      // r is dead after werr: holds pre-spread weights
   VkDescriptorSet sAvgRes = gpu_->set(wavg_, {&e, &wrawb});   // residual weights for the guide AND test
   VkDescriptorSet sMinH = gpu_->set(wminh_, {&r, &e, &vm});
-  VkDescriptorSet sMinV = gpu_->set(wminv_, {&e, &wt, &vm});
+  // HDR: per-frame exposure e_k (+ the weight normaliser at index K) for wvalid / wminv.
+  const bool hdr = hdr_in;
+  Buffer& fx = buf(size_t(K + 2) * 4, true);
+  float hdr_fmax = 1.0f;
+  {
+    float* f = fx.as<float>();
+    for (int k = 0; k < K; ++k) {
+      f[k] = hdr ? std::max(prm.exposure[size_t(k)], 1e-3f) : 1.0f;
+      hdr_fmax = std::max(hdr_fmax, f[k] * f[k]);   // read-noise limit of the inverse-variance ratio
+    }
+    f[K] = hdr_fmax;
+    float emin = 1.0f;
+    for (int k = 0; k < K; ++k) emin = std::min(emin, f[k]);
+    f[K + 1] = hdr ? prm.clip * emin : 0.0f;   // reference's clip level (prm.clip = the shortest frame's)
+  }
+  VkDescriptorSet sMinV = gpu_->set(wminv_, {&e, &wt, &vm, &y, &fx});
   // adj.comp built for this scale (half the Mali registers at 1x); LKRL_ADJ_GENERIC = the pc.s build (A/B).
   static const bool adj_generic = std::getenv("LKRL_ADJ_GENERIC") && std::atoi(std::getenv("LKRL_ADJ_GENERIC")) != 0;
   const Pipeline& adjP = adj_generic ? adj_ : (s == 2 ? adj_s2_ : adj_s1_);
@@ -458,7 +651,7 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
                   kM = VK_NULL_HANDLE, kV = VK_NULL_HANDLE;
   if (lkw) {
     kRT = gpu_->set(kresid_, {&z0, &y, &pb, &rrt, &db});
-    kTDet = gpu_->set(ktdet_, {&rrt, &y, &tdetb});
+    kTDet = gpu_->set(ktdet_, {&rrt, &y, &tdetb, &db});
     kTH = gpu_->set(kth_, {&rrt, &y, &rwt2, &wvt2, &tdetb});
     kWT = gpu_->set(kt_, {&rrt, &y, &rwt2, &wtr, &wvt2, &kebuf});
     kWV = gpu_->set(ktv_, {&kebuf, &rwt2, &wvt2, &r, &e, &wrawb, &s3, &s4});
@@ -466,7 +659,7 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
     kG = gpu_->set(kguide_, {&gm, &gv, &pb, &wrawb, &db, &wtr});
     kMH = gpu_->set(kminh_, {&wrawb, &wtr, &kebuf});
     kM = gpu_->set(kmin_, {&rrt, &kebuf, &s3, &wl, &s5});
-    kV = gpu_->set(wvalid_, {&wl, &vm, &wt});
+    kV = gpu_->set(wvalid_, {&wl, &vm, &wt, &y, &fx});
   }
   KPush kq{};
   kq.h = h; kq.w = w; kq.s = s; kq.K = K; kq.H = H; kq.W = W; kq.kOff = LB; kq.mode = 0;
@@ -510,7 +703,13 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
         qd.f2 = prm.temporal_dark_level;
         KPush qh = qd; qh.f1 = 0.0f;
         const uint32_t g1 = div_up(uint32_t(w), 16);
-        if (qd.f0 > 0.0f) gpu_->dispatch(ktdet_, kTDet, &qd, g1, gy, uint32_t(K));
+        KPush qdet = qd;   // motion gate scale: the misregistration tolerance (LKRL_TDGATE A/B, 0 = off)
+        static const float tdgate = std::getenv("LKRL_TDGATE") ? float(std::atof(std::getenv("LKRL_TDGATE"))) : prm.robust_tau;
+        // Every scale (user 2026-11-19; at 1x it measured -10 % fine detail on the car-burst plate crop).
+        qdet.rob_k = prm.local_block > 0 ? tdgate : 0.0f;
+        static const float tdspread = std::getenv("LKRL_TDSPREAD") ? float(std::atof(std::getenv("LKRL_TDSPREAD"))) : 2.0f;
+        qdet.f2 = tdspread;   // 2 = field curvature (default), 1 = neighbour disagreement, 0 = offset size
+        if (qd.f0 > 0.0f) gpu_->dispatch(ktdet_, kTDet, &qdet, g1, gy, uint32_t(K));
         gpu_->dispatch(kth_, kTH, &qh, g1, gy, uint32_t(K));
         gpu_->dispatch(kt_, kWT, &qd, g1, gy, uint32_t(K));
         if (prm.temporal_dark_wide) {
@@ -572,15 +771,28 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
     weights_stale = false;
   };
   auto submit = [&]() -> bool { ++S.submits; return gpu_->submit(); };
-
-  gpu_->begin();
+    gpu_->begin();
+  if (rcd_mode == 2) {   // GPU RCD start: reference frame (fp16, frame 0 of y) -> LR RGB -> x s into z
+    Buffer &rcdS = buf(size_t(h) * w * 16), &rcdC = buf(size_t(h) * w * 16);
+    VkDescriptorSet rS = gpu_->set(rcd_start_, {ref_fused.empty() ? &y : &yref, &rcdS, &rcdC, &z});
+    Push rq = q;
+    for (int m = 0; m < 4; ++m) {
+      rq.mode = m;
+      gpu_->dispatch(rcd_start_, rS, &rq, div_up(uint32_t(w), m == 0 ? 8u : 16u), div_up(uint32_t(h), 8));
+    }
+    rq.mode = 4; gpu_->dispatch(rcd_start_, rS, &rq, div_up(uint32_t(W), 8), div_up(uint32_t(H), 8));
+    gpu_->copy(z, z0, nHR * 4);
+    if (cavg >= 2) gpu_->copy(z, zstart, nHR * 4);
+  }
   gpu_->fill(acc, 0);
   if (guide) gpu_->dispatch(gstats_, sGStats, &q, gqx, gqy, uint32_t(K));
   weights_stale = true;
+  // 2026-11-20: 1x 3 -> 1 motion step (GJJJ; the tile LK prefetch already aligns): vs GGJJJ 64-70 dB on 4
+  // bursts (day, night, two shakier), fine detail -0.9..+0.5 %, no visible change. GGJJJ alone: phone -0.8 s.
   // 2026-11-14 (hybrid merge): 1x 5 -> 3 merge steps (real detail 0.99-1.01), 2x 10 -> 8 (finest band 0.94).
   // Finish geometry against the reference-only start before the average or
   // reconstruction can blur it. A late G fitted the intermediate merge instead.
-  std::string sched = !prm.schedule.empty() ? prm.schedule : (s == 1 ? "GGGJJJ" : "GGGJJJJJJJJ");
+  std::string sched = !prm.schedule.empty() ? prm.schedule : (s == 1 ? "GJJJ" : "GGGJJJJJJJJ");
   // Hybrid chroma: the shift-and-add average after the first motion steps (its chroma, the fit's luma).
   if (cavg && sched.find('A') == std::string::npos) {
     const size_t at = sched.find('J');
@@ -604,7 +816,7 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
       if (avg) { gpu_->fill(z, 0); need_cov = true; }
       if (need_cov) gpu_->fill(cov, 0);
       Push m = q; m.mode = need_cov ? 1 : 0;
-      if (avg) m.rpow = -1.0f;   // average: clipped samples count (all-clipped pixels stay blown, not 0)
+      if (avg) m.rpow = hdr_in ? -2.0f : -1.0f;   // average: clipped samples count (all-clipped pixels stay blown, not 0)
       static const float freq_c = std::getenv("LKRL_FREQ") ? float(std::atof(std::getenv("LKRL_FREQ"))) : 0.0f;
       if (avg && freq_c > 0.0f && K > 1) {
         // Frequency-domain robustness (HDR+ / IPOL merge, per sample): every frame enters with weight 1
@@ -713,7 +925,7 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
       const float omega = omega_env > 0.0f ? omega_env : (s == 1 ? 1.6f : 1.0f);
       u.rpow = omega;
       static const int avg_r = std::getenv("LKRL_AVGR") ? std::atoi(std::getenv("LKRL_AVGR")) : -1;
-      if (avg) { u.a = 0.0f; u.rpow = -1.0f; u.robk = 0.0f; u.LB = avg_r >= 0 ? avg_r : (s == 1 ? 0 : 1); }
+      if (avg) { u.a = 0.0f; u.rpow = hdr_in ? -2.0f : -1.0f; u.robk = 0.0f; u.LB = avg_r >= 0 ? avg_r : (s == 1 ? 0 : 1); }
       if (!avg && trace_j==1) trace("update-push.bin",&u,sizeof(u));
       // Colour-difference fit (default since 2026-11-17; cdupd.comp): solve G, R-G, B-G instead of
       // R, G, B. Synthetic ground truth (tilted / straight bars, perfect motion): the independent fit
@@ -742,63 +954,6 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
       gpu_->dispatch(zupd_, sUpd, &u, div_up(uint32_t(nHR), 256));
       if (u.robk > 0.0f || avg) gpu_->fill(acc, 0);
       need_cov = avg;   // the next J recomputes its (gain) divisor
-      static const bool kn_on = std::getenv("LKRL_KN") != nullptr;
-      if (avg && kn_on) {
-        // KernelNet average (prototype, CPU): z_c(X) = sum w_k exp(-0.5 d^T Om(X)^-1 d) y / sum(...)
-        // over every frame's channel-c samples within 3 raw px, d = HR pixel centre - warped sample
-        // (raw px), Om(X) = MFSR's KernelNet kernel at X (reference frame). No weight: GPU average kept.
-        if (!submit()) return fail("submit (kn)");
-        gpu_->begin();
-        static const float kscale = std::getenv("LKRL_KN_SCALE") ? float(std::atof(std::getenv("LKRL_KN_SCALE"))) : 0.25f;
-        static const float kcap = std::getenv("LKRL_KN_CAP") ? float(std::atof(std::getenv("LKRL_KN_CAP"))) : 2.0f;
-        std::vector<float> map; int mh = 0, mw = 0;
-        if (KernelNetMap(frames, h, w, std::sqrt(std::max(0.5f * prm.noise_a + prm.noise_b, 0.0f)), &map, &mh, &mw)) {
-          const size_t HW = size_t(H) * W;
-          std::vector<float> inv(3 * HW), num(3 * HW, 0.0f), den(3 * HW, 0.0f);
-          for (int Y = 0; Y < H; ++Y)
-            for (int X = 0; X < W; ++X) {
-              float om[3];
-              KernelOmega(map, mh, mw, h, w, (X + 0.5f) / s, (Y + 0.5f) / s, kscale, kcap, om);
-              const float dt = om[0] * om[2] - om[1] * om[1];
-              const size_t i = size_t(Y) * W + X;
-              inv[3 * i] = om[2] / dt; inv[3 * i + 1] = -om[1] / dt; inv[3 * i + 2] = om[0] / dt;
-            }
-          const float* P = pb.as<float>();
-          const float* D = db.as<float>();
-          const float* Wt = wt.as<float>();
-          const int nbx2 = (w + LB - 1) / LB, nby2 = (h + LB - 1) / LB;
-          const int R = 3 * s;
-          for (int k = 0; k < K; ++k)
-            for (int i = 0; i < h; ++i)
-              for (int j = 0; j < w; ++j) {
-                const size_t o = (size_t(k) * h + i) * w + j;
-                const float yv = frames[o];
-                float wk = Wt[o];
-                if (yv >= prm.clip) wk = 1.0f;
-                if (wk <= 0.0f) continue;
-                const float ux = j + 0.5f, uy = i + 0.5f;
-                const int bx = std::min(std::max(int(ux) / LB, 0), nbx2 - 1), by = std::min(std::max(int(uy) / LB, 0), nby2 - 1);
-                const float* pk = P + 6 * k;
-                const float* dk = D + 2 * ((size_t(k) * nby2 + by) * nbx2 + bx);
-                const float qx = pk[0] * ux + pk[1] * uy + pk[2] + dk[0];
-                const float qy = pk[3] * ux + pk[4] * uy + pk[5] + dk[1];
-                const int c = ((i & 1) == 0 && (j & 1) == 0) ? 0 : (((i & 1) && (j & 1)) ? 2 : 1);
-                const int Xc = int(std::floor(qx * s)), Yc = int(std::floor(qy * s));
-                for (int Y = std::max(Yc - R, 0); Y <= std::min(Yc + R, H - 1); ++Y)
-                  for (int X = std::max(Xc - R, 0); X <= std::min(Xc + R, W - 1); ++X) {
-                    const float dx = (X + 0.5f) / s - qx, dy = (Y + 0.5f) / s - qy;
-                    const size_t ip = size_t(Y) * W + X;
-                    const float qf = inv[3 * ip] * dx * dx + 2.0f * inv[3 * ip + 1] * dx * dy + inv[3 * ip + 2] * dy * dy;
-                    if (qf > 18.0f) continue;
-                    const float wgt = wk * std::exp(-0.5f * qf);
-                    num[c * HW + ip] += wgt * yv; den[c * HW + ip] += wgt;
-                  }
-              }
-          float* Z = z.as<float>();
-          for (size_t i = 0; i < 3 * HW; ++i)
-            if (den[i] > 1e-3f) Z[i] = num[i] / den[i];
-        }
-      }
       if (avg && cavg && gpu_hyb) {   // keep the average on the GPU for the combine
         gpu_->copy(z, zavgB, nHR * 4);
         gpu_->copy(zstart, z, nHR * 4);
@@ -917,6 +1072,47 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
     // Default ON since 2026-11-18 (full 2x car burst: 0.35 % of pixels changed, all on long straight
     // structure: poles, rails, road lines, car body lines; foliage / road / rocks 0.000-0.003 %, detail
     // equal; pole dotting -45 %; ~9 ms GPU per 1024 px tile on Mali-G615). LKRL_LONGEDGE=0 turns it off.
+    // Directional lattice notch (dln_apply.comp, 2026-11-19), before the long-edge pass: removes the
+    // lattice-period dashes / beads along thin near-axis lines at 2x (far poles, twigs, branch outlines;
+    // IMG_20260919_184641_979 8 frames, far pole: dash energy at 4 HR px -75 %, at 2 px -51 %; foliage
+    // detail -1.6 %). Gate = coherence of a radius-6 tensor + edge energy vs the noise model, so dashes on
+    // a thin twig inside a leafy crown (low coherence there) are not reached.
+    // LKRL_DLN=0 off.
+    static const int dln_env = std::getenv("LKRL_DLN") ? std::atoi(std::getenv("LKRL_DLN")) : -1;
+    // On at every scale (user 2026-11-19: all of today's fixes on for 1x, 1.5x and 2x; at 1x it measured
+    // -5 % (dln) / -4 % (axn) fine detail on the car-burst plate crop). LKRL_DLN=0 off.
+    if (dln_env != 0) {
+      auto envf = [](const char* n, float d) { const char* v = std::getenv(n); return v ? float(std::atof(v)) : d; };
+      const size_t HWs = size_t(H) * W;
+      Buffer &dT = buf(HWs * 8), &dU = buf(HWs * 8), &dP = buf(HWs * 8);
+      Push dq = q;
+      dq.a = prm.noise_a / float(s * s); dq.b = prm.noise_b / float(s * s);   // merged noise at output px (prototype)
+      dq.LB = int(envf("LKRL_DLN_R", 6.0f));
+      const uint32_t ggx = div_up(uint32_t(W), 16), ggy = div_up(uint32_t(H), 16);
+      gpu_->dispatch(le_tensor_, gpu_->set(le_tensor_, {&hybO, &dT}), &dq, ggx, ggy);
+      dq.mode = 0; gpu_->dispatch(le_blur_, gpu_->set(le_blur_, {&dT, &dU}), &dq, ggx, ggy);
+      dq.mode = 1; gpu_->dispatch(le_blur_, gpu_->set(le_blur_, {&dU, &dT}), &dq, ggx, ggy);
+      dq.clip = envf("LKRL_DLN_K", 4.0f); dq.robk = envf("LKRL_DLN_C0", 0.5f); dq.tau = envf("LKRL_DLN_C1", 0.8f);
+      dq.rpow = envf("LKRL_DLN_D", 1.0f);   // tap spacing (output px)
+      dq.LB = int(envf("LKRL_DLN_N", 3.0f));  // triangle half-length (taps)
+      VkDescriptorSet dS = gpu_->set(dln_apply_, {&hybO, &dT, &dP});
+      dq.mode = 0; gpu_->dispatch(dln_apply_, dS, &dq, ggx, ggy);   // fp16 RGB copy (neighbour taps)
+      dq.mode = 1; gpu_->dispatch(dln_apply_, dS, &dq, ggx, ggy);
+      // Axis lattice notch (axn_apply.comp): thin near-axis poles in front of foliage, where the tensor
+      // gate above stays shut (dots + textured background). Line test = sign consistency of the
+      // across-line second difference over 17 px; short strokes (plate letters) are left alone.
+      // 184641 8 frames: far lamp poles over bushes clean, car / plate / foliage detail -0.3..-3 %.
+      // LKRL_AXN=0 off.
+      static const bool axn_on = !std::getenv("LKRL_AXN") || std::atoi(std::getenv("LKRL_AXN")) != 0;
+      if (axn_on) {
+        dq.LB = int(envf("LKRL_AXN_N", 8.0f)); dq.clip = envf("LKRL_AXN_K", 4.0f);
+        dq.robk = envf("LKRL_AXN_C0", 0.7f); dq.tau = envf("LKRL_AXN_C1", 0.9f);
+        dq.rpow = envf("LKRL_AXN_M", 6.0f);   // along-line chroma half-length (taps)
+        VkDescriptorSet aS = gpu_->set(axn_apply_, {&hybO, &dT, &dP});
+        dq.mode = 0; gpu_->dispatch(axn_apply_, aS, &dq, ggx, ggy);
+        dq.mode = 1; gpu_->dispatch(axn_apply_, aS, &dq, ggx, ggy);
+      }
+    }
     static const bool le_on = !std::getenv("LKRL_LONGEDGE") || std::atoi(std::getenv("LKRL_LONGEDGE")) != 0;
     if (le_on) {
       auto envf = [](const char* n, float d) { const char* v = std::getenv(n); return v ? float(std::atof(v)) : d; };
@@ -932,6 +1128,40 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
       lq.tau = std::cos(envf("LKRL_LE_TOL", 0.12f)); lq.LB = int(envf("LKRL_LE_R", 16.0f)); lq.rpow = envf("LKRL_LE_SIG", 1.5f);
       gpu_->copy(hybO, leZ, nHR * 4);   // le_apply reads the copy, writes only qualifying pixels in place
       gpu_->dispatch(le_apply_, gpu_->set(le_apply_, {&leZ, &leT, &hybO}), &lq, ggx, ggy);
+    }
+    // Luma-guided chroma (gcf_apply.comp, 2026-11-19): at 2x the sparse R / B planes put their edges
+    // a little off the green edge (blue fringe / dots on a thin trunk against the sky, green fringes on
+    // plate letters, IMG_20260919_184641_979). Colour differences refit as a local linear function of
+    // luma over 5 x 5; luma unchanged. LKRL_GCF=0 off; LKRL_GCF_R / _K.
+    static const int gcf_env = std::getenv("LKRL_GCF") ? std::atoi(std::getenv("LKRL_GCF")) : -1;
+    if (gcf_env != 0) {   // 1x and 2x
+      auto envf = [](const char* n, float d) { const char* v = std::getenv(n); return v ? float(std::atof(v)) : d; };
+      const size_t HWs = size_t(H) * W;
+      Buffer &gP = buf(HWs * 8), &gAB = buf(HWs * 16);
+      Push gq = q;
+      gq.a = prm.noise_a / float(s * s); gq.b = prm.noise_b / float(s * s);
+      gq.LB = int(envf("LKRL_GCF_R", 2.0f)); gq.clip = envf("LKRL_GCF_K", 1.0f);
+      const uint32_t ggx = div_up(uint32_t(W), 16), ggy = div_up(uint32_t(H), 16);
+      VkDescriptorSet gS = gpu_->set(gcf_apply_, {&hybO, &gP, &gAB});
+      for (int m = 0; m < 3; ++m) { gq.mode = m; gpu_->dispatch(gcf_apply_, gS, &gq, ggx, ggy); }
+    }
+    // Reference chroma anchor (canc_apply.comp, 2026-11-19): the merge's local-mean colour is moved to the
+    // reference frame's (z0, its RCD start) where they differ beyond the reference's noise. Removes the
+    // teal of a swaying trunk against the sky (other frames put sky colour on it; the reference alone is
+    // right); luma and fine colour detail stay the merge's. Gated to pixels where most frames were
+    // rejected (plate letters keep the merge's colour). 1x, 1.5x and 2x. LKRL_CANC=0 off; _R / _K.
+    static const int canc_env = std::getenv("LKRL_CANC") ? std::atoi(std::getenv("LKRL_CANC")) : -1;
+    if (canc_env != 0) {
+      auto envf = [](const char* n, float d) { const char* v = std::getenv(n); return v ? float(std::atof(v)) : d; };
+      const size_t HWs = size_t(H) * W;
+      Buffer &cA = buf(HWs * 16), &cB = buf(HWs * 16);
+      Push cq = q;
+      cq.a = prm.noise_a; cq.b = prm.noise_b;
+      cq.LB = int(envf("LKRL_CANC_R", 3.0f)); cq.clip = envf("LKRL_CANC_K", 3.0f);
+      const uint32_t ggx = div_up(uint32_t(W), 16), ggy = div_up(uint32_t(H), 16);
+      if (weights_stale) weights();   // final per-sample weights -> frames used per pixel
+      VkDescriptorSet cS = gpu_->set(canc_apply_, {&hybO, &z0, &cA, &cB, &wt});
+      for (int m = 0; m < 3; ++m) { cq.mode = m; gpu_->dispatch(canc_apply_, cS, &cq, ggx, ggy); }
     }
     // Learned prior, Vulkan fallback (Network on, no usable NPU): the folded network, one dispatch per
     // layer, on the merged image in place (same weights / result as the NPU path, lkrl_prior.cpp).
@@ -966,6 +1196,98 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
   if (!submit()) return fail("final submit");
   if (hyb_done) z_out->assign(hybO.as<float>(), hybO.as<float>() + nHR);
   else z_out->assign(z.as<float>(), z.as<float>() + nHR);
+  // NaN safety net (2026-11-20). A merge that overflows the int32 fixed-point accumulators (an exposure
+  // bracket merged without its exposures) produced NaN, which the later passes (LFC, DCT) spread into
+  // blank areas. Any bad output pixel (below) takes the reference frame's own colour at that point
+  // (mean of its same-colour raw samples in the 3 x 3 LR neighbourhood, clipped samples at the clip
+  // level): a local, plausible value, never NaN. Normal merges are unchanged (no non-finite pixels).
+  {
+    const size_t HWp = size_t(H) * W;
+    float* zo = z_out->data();
+    const float cl = HalfRound(prm.clip);
+    // Bad = non-finite, dilated by 6 px: the overflow also leaves finite garbage next to each NaN and the
+    // GPU post passes (gcf, canc) ran before this and smeared it into rings ~5 px out (2 px left visible
+    // rings on My/HDR merged without exposures). No value-range test: merged lamps legitimately exceed
+    // 2 x clip (a range test boxed every street light of IMG_20260921_194618_520).
+    std::vector<uint8_t> bm(HWp, 0);
+    bool any = false;
+    for (size_t q = 0; q < HWp; ++q)
+      for (int c = 0; c < 3; ++c) {
+        const float v = zo[c * HWp + q];
+        if (!std::isfinite(v)) { bm[q] = 1; any = true; break; }
+      }
+    if (any) {
+      std::vector<uint8_t> d(bm);
+      for (int Y = 0; Y < H; ++Y)
+        for (int X = 0; X < W; ++X)
+          if (bm[size_t(Y) * W + X])
+            for (int dy = -6; dy <= 6; ++dy)
+              for (int dx = -6; dx <= 6; ++dx) {
+                const int yy = Y + dy, xx = X + dx;
+                if (yy >= 0 && xx >= 0 && yy < H && xx < W) d[size_t(yy) * W + xx] = 1;
+              }
+      bm.swap(d);
+    }
+    size_t bad = 0;
+    for (size_t q = 0; q < HWp && any; ++q) {
+      if (!bm[q]) continue;
+      ++bad;
+      const int i = std::min(int(q / W) / s, h - 1), j = std::min(int(q % W) / s, w - 1);
+      float sum[3] = {0, 0, 0}, cnt[3] = {0, 0, 0};
+      for (int di = -1; di <= 1; ++di)
+        for (int dj = -1; dj <= 1; ++dj) {
+          const int ii = std::clamp(i + di, 0, h - 1), jj = std::clamp(j + dj, 0, w - 1);
+          const float v = ref_start[size_t(ii) * w + jj];
+          if (!std::isfinite(v)) continue;
+          const int c = (ii & 1) == 0 ? ((jj & 1) == 0 ? 0 : 1) : ((jj & 1) == 0 ? 1 : 2);   // RGGB
+          sum[c] += std::min(v, cl); cnt[c] += 1.0f;
+        }
+      for (int c = 0; c < 3; ++c) zo[c * HWp + q] = cnt[c] > 0.0f ? sum[c] / cnt[c] : 0.0f;
+    }
+    if (bad) {
+      if (st) st->nonfinite += bad;
+      std::fprintf(stderr, "lkr-lite: NaN safety net replaced %zu bad pixels in a %dx%d tile\n", bad, W, H);
+    }
+  }
+  // HDR bracket: where no frame saw the scene unclipped (bare lamps, the sun) the solve has no data and
+  // neighbouring edge samples pulled z down to ~ the reference's clip level, coloured (real bracket
+  // IMG_20261120_151412_514: a ceiling tube at 1/4 of white, magenta with blue / orange beads). Such
+  // pixels are at least the shortest frame's clip: set them clipped (all planes) so the finish turns
+  // them neutral white like any clipped area. Mask = reference samples that clipped themselves and no
+  // frame filled (HdrFillReference).
+  if (!ref_fused.empty()) {
+    const float cl = HalfRound(prm.clip);
+    // Soft: strength f = clamp(2 x binomial 3 x 3 of the mask) (often only the green sites of a lamp clip:
+    // the raw mask is a checkerboard; a hard fill gave a dotted / jagged line). z = max(z, f x white),
+    // white = neutral after white balance.
+    std::vector<float> f(size_t(h) * w, 0.0f);
+    for (int i = 0; i < h; ++i)
+      for (int j = 0; j < w; ++j) {
+        float a = 0.0f;
+        for (int di = -1; di <= 1; ++di)
+          for (int dj = -1; dj <= 1; ++dj) {
+            const int ii = std::clamp(i + di, 0, h - 1), jj = std::clamp(j + dj, 0, w - 1);
+            a += float((2 - std::abs(di)) * (2 - std::abs(dj))) * hdr_unfilled[size_t(ii) * w + jj];
+          }
+        f[size_t(i) * w + j] = std::min(1.0f, a * (2.0f / 16.0f));
+      }
+    const size_t HWp = size_t(H) * W;
+    float* zo = z_out->data();
+    const float v = 1.02f * cl;
+    for (int Y = 0; Y < H; ++Y)
+      for (int X = 0; X < W; ++X) {
+        // bilinear of the LR strength at the HR pixel centre
+        const float fy = std::clamp((Y + 0.5f) / s - 0.5f, 0.0f, float(h - 1)), fx = std::clamp((X + 0.5f) / s - 0.5f, 0.0f, float(w - 1));
+        const int y0 = int(fy), x0 = int(fx), y1 = std::min(y0 + 1, h - 1), x1 = std::min(x0 + 1, w - 1);
+        const float ay = fy - y0, ax = fx - x0;
+        const float st = (1 - ay) * ((1 - ax) * f[size_t(y0) * w + x0] + ax * f[size_t(y0) * w + x1]) +
+                         ay * ((1 - ax) * f[size_t(y1) * w + x0] + ax * f[size_t(y1) * w + x1]);
+        if (st <= 0.0f) continue;
+        const size_t q = size_t(Y) * W + X;
+        // neutral after white balance (equal camera RGB turned magenta); G reaches the clip mark at st = 1
+        for (int c = 0; c < 3; ++c) zo[c * HWp + q] = std::max(zo[c * HWp + q], st * v * prm.wb[1] / std::max(prm.wb[c], 1e-3f));
+      }
+  }
   if (!zavg.empty()) {   // luma of the fit (z), chroma (wb-space R-Y, B-Y) of the average
     const size_t HW = size_t(H) * W;
     const float* wb = prm.wb;
@@ -1136,124 +1458,12 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
       const double a = double(c1[i]) + c1[HW + i] + c1[2 * HW + i];
       const double b = double(cw[i]) + cw[HW + i] + cw[2 * HW + i];
       const float rho = a > 0 ? float(std::min(b / a, 1.0)) : 1.0f;
+      if (hdr) {   // weights carry each frame's inverse noise variance / hdr_fmax: below 1 where the long frame cleans shadows
+        const double inf = a > 0 ? b * hdr_fmax / a : 1.0;   // merged information vs plain coverage of usable samples
+        (*noise_scale)[i] = std::clamp(float(std::sqrt(0.8 / std::max(inf, 1e-3))), 0.3f, 2.0f * std::sqrt(float(K)));
+        continue;
+      }
       (*noise_scale)[i] = std::min(std::sqrt(std::max(0.8f / std::max(rho, 1e-3f), 1.0f)), std::sqrt(float(K)));
-    }
-  }
-  const float kndn_env = prm.kernelnet_denoise >= 0.0f ? prm.kernelnet_denoise :
-      (std::getenv("LKRL_KNDN") ? float(std::atof(std::getenv("LKRL_KNDN"))) : 1.0f);
-  // Noise-gated, night only: x 0 at <= 10 % relative noise at mid-grey, x 1 at >= 16 %.
-  // The 4 -> 8 % gate (2026-11-14) opened on daylight and dusk bursts and smeared foliage
-  // (IMG_20260919_184641_979 5 %: 2x fine detail 0.110 -> 0.081; IMG_20261112_125318_179 8 %,
-  // IMG_20260921_194618_520 8.5 % fully on). Measured 2026-11-17: daylight 0.6-5 %, dusk ~8.5 %,
-  // HDR+ night 0155_20160923 11.6 %.
-  const float kn_rel = std::sqrt(std::max(0.18f * prm.noise_a + prm.noise_b, 0.0f)) / 0.18f;
-  const float kndn = kndn_env * std::min(std::max((kn_rel - 0.10f) / 0.06f, 0.0f), 1.0f);   // 10 % -> 16 %
-  if (std::getenv("LKRL_KN_PRINT")) std::fprintf(stderr, "kn_rel %.4f kndn %.3f\n", kn_rel, kndn);
-  static const bool kn_cpu = std::getenv("LKRL_KNDN_CPU") != nullptr;
-  if (kndn > 0.0f && !kn_cpu && noise_scale && noise_scale->size() == size_t(H) * W) {
-    // GPU (as PhotonCamera runs it): KernelNet conv layers (kn_conv) then the denoise (kn_dn).
-    static const std::vector<float> wpk = [] {
-      std::vector<float> weights;
-      KernelNetPacked(&weights);
-      return weights;
-    }();
-    if (wpk.empty()) return fail("KernelNet weights");
-    std::vector<float> xin;
-    KernelNetInput(frames, h, w, std::sqrt(std::max(0.5f * prm.noise_a + prm.noise_b, 0.0f)), &xin);
-    const int lh = h / 2, lw = w / 2, mh = (lh - 1) / 2 + 1, mw = (lw - 1) / 2 + 1;
-    const size_t HW = size_t(H) * W;
-    Buffer &kw = buf(wpk.size() * 4), &kin = buf(xin.size() * 4), &ka0 = buf(size_t(16) * mh * mw * 4),
-           &ka1 = buf(size_t(16) * mh * mw * 4), &kmap = buf(size_t(3) * mh * mw * 4),
-           &kz = buf(3 * HW * 4), &kout = buf(3 * HW * 4, true), &kns = buf(HW * 4);
-    std::memcpy(kw.map, wpk.data(), wpk.size() * 4);
-    std::memcpy(kin.map, xin.data(), xin.size() * 4);
-    std::memcpy(kz.map, z_out->data(), 3 * HW * 4);
-    std::memcpy(kns.map, noise_scale->data(), HW * 4);
-    struct ConvPush { int32_t cin, cout, inW, inH, outW, outH, stride, k, relu, wOff, bOff, mode; };
-    struct DnPush { int32_t H, W, mh, mw, s, K, p0, p1; float a, b, strength, p2; };
-    static_assert(sizeof(ConvPush) == 48 && sizeof(DnPush) == 48, "kn push");
-    const int spec[6][5] = {{2, 16, 3, 2, 1}, {16, 16, 3, 1, 1}, {16, 16, 3, 1, 1},
-                            {16, 16, 3, 1, 1}, {16, 16, 3, 1, 1}, {16, 3, 1, 1, 0}};
-    gpu_->resetSets();
-    gpu_->begin();
-    const Buffer* in = &kin;
-    int inW = lw, inH = lh, off = 0;
-    const Buffer* acts[2] = {&ka0, &ka1};
-    for (int li = 0; li < 6; ++li) {
-      const int* l = spec[li];
-      ConvPush cp{l[0], l[1], inW, inH, mw, mh, l[3], l[2], l[4], off, off + l[1] * l[0] * l[2] * l[2], li == 5 ? 2 : 1};
-      off += l[1] * l[0] * l[2] * l[2] + l[1];
-      const Buffer* out = li == 5 ? &kmap : acts[li % 2];
-      VkDescriptorSet st = gpu_->set(knconv_, {in, out, &kw});
-      gpu_->dispatch(knconv_, st, &cp, div_up(uint32_t(l[1] * mw * mh), 256));
-      in = out; inW = mw; inH = mh;
-    }
-    DnPush dp{H, W, mh, mw, s, K, 0, 0, prm.noise_a, prm.noise_b, kndn, 0.0f};
-    VkDescriptorSet sd = gpu_->set(kndn_, {&kz, &kout, &kns, &kmap});
-    gpu_->dispatch(kndn_, sd, &dp, div_up(uint32_t(W), 16), div_up(uint32_t(H), 16));
-    if (!submit()) return fail("kernelnet submit");
-    z_out->assign(kout.as<float>(), kout.as<float>() + 3 * HW);
-  } else if (kndn > 0.0f && noise_scale && noise_scale->size() == size_t(H) * W) {
-    // PhotonCamera dynamicgaussian_kernelnet.glsl (post-merge denoise, same math): KernelNet kernel
-    // of the reference, area scaled by merged / single-frame variance (here per pixel: ns^2 / K, shadow
-    // headroom x2 below 0.1), times the Wiener range weight N^2 / (dl^2 + N^2) on luma. Camera space.
-    std::vector<float> map; int mh = 0, mw = 0;
-    if (KernelNetMap(frames, h, w, std::sqrt(std::max(0.5f * prm.noise_a + prm.noise_b, 0.0f)), &map, &mh, &mw)) {
-      const size_t HW = size_t(H) * W;
-      const float* zi = z_out->data();
-      std::vector<float> out(3 * HW);
-      const int R = 4 * s;
-      auto lum = [&](size_t i) { return 0.299f * zi[i] + 0.587f * zi[HW + i] + 0.114f * zi[2 * HW + i]; };
-      const size_t mp = size_t(mh) * mw;
-      for (int Y = 0; Y < H; ++Y)
-        for (int X = 0; X < W; ++X) {
-          const size_t i = size_t(Y) * W + X;
-          float l = 0.0f; int nl = 0;
-          for (int dy = -1; dy <= 1; ++dy)
-            for (int dx = -1; dx <= 1; ++dx) {
-              const int yy = std::min(std::max(Y + dy, 0), H - 1), xx = std::min(std::max(X + dx, 0), W - 1);
-              l += lum(size_t(yy) * W + xx); ++nl;
-            }
-          l /= float(nl);
-          const float preVar = prm.noise_a * std::max(l, 0.0f) + prm.noise_b;
-          const float ns = (*noise_scale)[i];
-          const float postVar = preVar * ns * ns / float(K);
-          const float areaRatio = std::min(std::max(postVar / std::max(preVar, 1e-9f), 0.0f), 1.0f);
-          const float t = std::min(std::max(l / 0.1f, 0.0f), 1.0f), sm = t * t * (3 - 2 * t);
-          const float shadow = 2.0f + (1.0f - 2.0f) * sm;
-          // map texel at this pixel (bilinear, uv = pixel centre); sigmas in map-grid units -> HR px
-          const float u = (X + 0.5f) / W * mw - 0.5f, v = (Y + 0.5f) / H * mh - 0.5f;
-          const int u0 = std::min(std::max(int(std::floor(u)), 0), mw - 1), v0 = std::min(std::max(int(std::floor(v)), 0), mh - 1);
-          const int u1 = std::min(u0 + 1, mw - 1), v1 = std::min(v0 + 1, mh - 1);
-          const float fu = std::min(std::max(u - u0, 0.0f), 1.0f), fv = std::min(std::max(v - v0, 0.0f), 1.0f);
-          float kp[3];
-          for (int cc = 0; cc < 3; ++cc) {
-            const float* M = map.data() + cc * mp;
-            const float a0 = M[size_t(v0) * mw + u0] + (M[size_t(v0) * mw + u1] - M[size_t(v0) * mw + u0]) * fu;
-            const float a1 = M[size_t(v1) * mw + u0] + (M[size_t(v1) * mw + u1] - M[size_t(v1) * mw + u0]) * fu;
-            kp[cc] = a0 + (a1 - a0) * fv;
-          }
-          // sigmaScale = strength * (post resolution / rawHalf resolution) = strength * 2 s
-          const float corr = kndn * 2.0f * float(s) * std::sqrt(areaRatio * shadow);
-          const float s1 = std::max(kp[0] * corr, 0.02f), s2 = std::max(kp[1] * corr, 0.02f);
-          const float rho = std::min(std::max(kp[2], -0.95f), 0.95f);
-          const float ir2 = 1.0f / (2.0f * (1.0f - rho * rho));
-          const float i11 = ir2 / (s1 * s1), i22 = ir2 / (s2 * s2), i12 = -ir2 * 2.0f * rho / (s1 * s2);
-          float sr = 0, sg = 0, sb = 0, ws = 0;
-          for (int j = -R; j <= R; ++j)
-            for (int q = -R; q <= R; ++q) {
-              const float e = float(q * q) * i11 + float(q * j) * i12 + float(j * j) * i22;
-              if (e > 12.0f) continue;
-              const int yy = std::min(std::max(Y + j, 0), H - 1), xx = std::min(std::max(X + q, 0), W - 1);
-              const size_t n = size_t(yy) * W + xx;
-              const float dl = lum(n) - l;
-              const float wgt = std::exp(-e) * postVar / (dl * dl + postVar);
-              sr += wgt * zi[n]; sg += wgt * zi[HW + n]; sb += wgt * zi[2 * HW + n]; ws += wgt;
-            }
-          ws = std::max(ws, 1e-6f);
-          out[i] = sr / ws; out[HW + i] = sg / ws; out[2 * HW + i] = sb / ws;
-        }
-      z_out->swap(out);
     }
   }
   if (z_out) trace("final-z.f32", z_out->data(), nHR * 4);   // BM3D-lite prototype input
@@ -1332,7 +1542,9 @@ bool LiteSolver::solve(const float* frames, int K, int h, int w, std::vector<flo
               denom > 0 ? prm.noise_a / denom : 0.0f, denom > 0 ? prm.noise_b / denom : 1.0f,
               prm.dct_luma * prm.dct_luma, prm.dct_chroma * prm.dct_chroma, prm.wb[0], prm.wb[1], prm.wb[2],
               prm.dct_dark_level, prm.dct_dark_cap, prm.dct_dark_luma, prm.dct_luma_cap, prm.dct_chroma_all ? 1.0f : 0.0f, prm.dct_luma_floor,
-              prm.dct_fallback ? prm.dct_grain * prm.dct_grain : 0.0f};
+              prm.dct_fallback ? prm.dct_grain * prm.dct_grain : 0.0f,
+              prm.dct_grain_rel * prm.dct_grain_rel, prm.dct_grain_rho, prm.dct_chroma_norm ? 1.0f : 0.0f, prm.dct_grain_tilt,
+              prm.dct_grain_sub};
     gpu_->resetSets();
     // LKRL_DCT_OLD (debug.lkr.dctold): the previous one-block-per-invocation shaders, for A/B.
     static const bool dct_old = std::getenv("LKRL_DCT_OLD") && std::atoi(std::getenv("LKRL_DCT_OLD")) != 0;
@@ -1388,10 +1600,12 @@ bool LiteSolver::finish(const float* z, std::vector<float>* x, int H, int W, con
   std::memcpy(bx.map, x->data(), 3 * HW * 4);
   std::memcpy(bz.map, z, 3 * HW * 4);
   if (hns) std::memcpy(bns.map, noise_scale->data(), HW * 4);
-  struct FinPush { int32_t H, W, mode, pl, sm, has_ns, notch, desat; float wbr, wbg, wbb, clip, grain, eqs, p0, p1; };
-  static_assert(sizeof(FinPush) == 64, "fin push");
-  FinPush f{H, W, 0, 0, 0, hns ? 1 : 0, fa.notch ? 1 : 0, fa.desat ? 1 : 0, fa.wb[0], fa.wb[1], fa.wb[2],
-            fa.clip, fa.grain, fa.eq_strength, 0.0f, 0.0f};
+  struct FinPush { int32_t H, W, mode, pl, sm, has_ns, notch, desat; float wbr, wbg, wbb, clip, grain, eqs, p0, p1;
+                   float hr, hg, hb, hrec; };
+  static_assert(sizeof(FinPush) == 80, "fin push");
+  FinPush f{H, W, 0, 0, 0, hns ? 1 : 0, fa.notch ? 1 : 0, fa.desat ? (std::getenv("LKRL_HL_OLD") ? 2 : 1) : 0, fa.wb[0], fa.wb[1], fa.wb[2],
+            fa.clip, fa.grain, fa.eq_strength, float(fa.hl_radius), 0.0f, fa.hl_ratio[0], fa.hl_ratio[1], fa.hl_ratio[2],
+            fa.hl_rec ? 1.0f : 0.0f};
   gpu_->resetSets();
   VkDescriptorSet st = gpu_->set(fin_, {&bx, &bz, &bns, &bp, &bt, &bm, &bk});
   const uint32_t gx = div_up(uint32_t(W), 16), gy = div_up(uint32_t(H), 16);
@@ -1408,6 +1622,7 @@ bool LiteSolver::finish(const float* z, std::vector<float>* x, int H, int W, con
   }
   if (fa.grain > 0.0f || fa.notch) run(5);
   if (fa.grain > 0.0f && fa.notch) notch(0);
+  if (fa.desat && fa.hl_rec) run(7);   // highlight reconstruction: dilated per-channel clip (P1..P3)
   run(6);
   if (!gpu_->submit()) return fail("fin submit");
   x->assign(bx.as<float>(), bx.as<float>() + 3 * HW);

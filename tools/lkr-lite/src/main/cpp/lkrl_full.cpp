@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "lkrl_full.h"
+#include "lkrl_lfc.h"
 #include "lkrl_prior.h"
 
 #include <algorithm>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -121,6 +123,21 @@ static void BoxBlurGrey(std::vector<float>* a, int n, int r) {
   }
 }
 
+int AutoTileSize(int w, int h, int s, int overlap, int align) {
+  // The grid fitted to this frame (2026-11-20): target 416 at 1x, 320 at 2x (Mali-G615 cache), up to 5 %
+  // above it when that saves a row or column, then the smallest tile giving that grid (the last tile no
+  // longer overlaps its neighbour by most of its width). 4080 x 3060 at 1x: 11 x 8 = 88 tiles of 416 ->
+  // 10 x 8 = 80 of 424, phone ~-0.5 s; 2x zoom keeps 7 x 5 of 320.
+  const int target = s == 1 ? 416 : 320;
+  const int ov0 = std::min(overlap, target / 4) & ~1;
+  auto fit = [&](int len) {
+    const int n = std::max(1, int(std::ceil(double(len - ov0) / (1.05 * target - ov0))));
+    return (len - ov0 + n - 1) / n + ov0;
+  };
+  const int t = std::max(fit(w), fit(h));
+  return (t + align - 1) / align * align;
+}
+
 bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, const int cfa[4],
                const float black[4], float white, const std::array<float, 3>& wb, const FullParams& prm,
                const PriorFactory& make_prior, std::vector<float>* rgb_out, int* out_w, int* out_h,
@@ -141,6 +158,27 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
     }
     std::rotate(frames.begin() + prm.holdout, frames.begin() + prm.holdout + 1, frames.end());
   }
+  // HDR bracket: exposure of each frame relative to the reference (frame 0).
+  std::vector<float> erel(size_t(K), 1.0f);
+  bool hdr = false;
+  if (!prm.exposure.empty()) {
+    if (int(prm.exposure.size()) != K || holdout) {
+      if (err) *err = "exposure needs one value per frame and no holdout";
+      return false;
+    }
+    for (int k = 0; k < K; ++k) {
+      if (!(prm.exposure[size_t(k)] > 0.0f)) { if (err) *err = "exposure must be > 0"; return false; }
+      erel[size_t(k)] = prm.exposure[size_t(k)] / prm.exposure[0];
+      if (std::fabs(erel[size_t(k)] - 1.0f) > 0.02f) hdr = true;
+    }
+    if (!hdr) std::fill(erel.begin(), erel.end(), 1.0f);
+  }
+  // Clip level in reference units: the shortest frame's (samples above it are clipped somewhere);
+  // clipped samples are written just above it so the solver's ">= clip" test excludes them.
+  float emin = 1.0f;
+  for (float e : erel) emin = std::min(emin, e);
+  const float hdr_clip = prm.solve.clip / emin, hdr_mark = 1.02f * hdr_clip;
+  S.hdr_white = hdr ? hdr_clip : 1.0f;
   int ox = -1, oy = -1;
   for (int k = 0; k < 4; ++k)
     if (cfa[k] == 0) { ox = k & 1; oy = k >> 1; }
@@ -174,7 +212,7 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
   const int s = prm.s;
 
   // 0) Sharpest frame as the reference (moved to index 0; the rest keep order).
-  if (prm.sharpest_ref && !prm.paper_parity && K > 1 && !holdout) {
+  if (prm.sharpest_ref && !prm.paper_parity && K > 1 && !holdout && !hdr) {
     std::vector<double> sharp(size_t(K), 0.0);
     std::vector<std::thread> pool;
     const int nthr = std::max(1, std::min(K, int(std::thread::hardware_concurrency()) / 2));
@@ -205,11 +243,14 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
   // the robust threshold too lenient and smeared a moving car).
   // Runs beside the coarse alignment below, which does not use it.
   double t = now_ms();
+  float hl_ratio[3] = {1.0f, 1.0f, 1.0f};
+  size_t hl_cells = 0;
   std::thread noise_fit([&] {
     const double tn = now_ms();
     std::vector<float> c(size_t(g.w) * g.h);
     LoadTile(frames[0], g, 0, 0, g.w, g.h, black, white, c.data());
     S.sigma = NoiseSigma(c.data(), g.h, g.w);
+    if (const char* v = std::getenv("LKRL_SIGMA")) S.sigma = float(std::atof(v));   // diagnostics
     int bins = 0;
     NoiseAB(c.data(), g.h, g.w, &S.a, &S.b, &bins);
     S.fit_a = S.a;
@@ -222,6 +263,28 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
     // every robust / temporal test reject all frames. Fall back to the
     // level-independent MAD sigma as read noise.
     if (S.a <= 0 && S.b < 0.25f * S.sigma * S.sigma) S.b = S.sigma * S.sigma;
+    // Highlight reconstruction colour (SolveParams::hl_ratio): white-balanced rim colour (G = 1), summed over the reference's 2x2 cells in the soft-clip band (brightest channel in
+    // [0.85 clip, clip), every channel unclipped) -- the unclipped rim of clipped areas, the same band
+    // the reconstruction blends over. Sums = brightness-weighted, so the bright rim dominates.
+    {
+      const float clip = prm.solve.clip, lo = 0.85f * clip;
+      double sc[3] = {0, 0, 0}, so[3] = {0, 0, 0};
+      size_t nb = 0;
+      for (int y = 0; y + 1 < g.h; y += 2)
+        for (int x = 0; x + 1 < g.w; x += 2) {
+          const float* r0 = c.data() + size_t(y) * g.w + x;
+          const float v[3] = {r0[0], 0.5f * (r0[1] + r0[g.w]), r0[g.w + 1]};
+          const float mx = std::max(v[0], std::max(r0[1], std::max(r0[g.w], v[2])));
+          if (mx < lo || mx >= clip) continue;
+          const float vw[3] = {v[0] * wb[0], v[1] * wb[1], v[2] * wb[2]};
+          for (int k = 0; k < 3; ++k) { sc[k] += vw[k]; so[k] += 0.5 * (vw[(k + 1) % 3] + vw[(k + 2) % 3]); }
+          ++nb;
+        }
+      // Rim colour normalised to green (wb space); a clipped channel is rebuilt from the unclipped ones.
+      for (int k = 0; k < 3; ++k) hl_ratio[k] = (nb >= 64 && sc[1] > 0) ? float(std::clamp(sc[k] / sc[1], 0.25, 4.0)) : 1.0f;
+      (void)so;
+      hl_cells = nb;
+    }
     S.ms_noise = now_ms() - tn;
   });
 
@@ -242,6 +305,12 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
     return u[u.size() / 2];
   };
   auto alignmentGrey = [&](const RawFrame& frame, int* bw, int* bh) {
+    if (hdr) {   // bracket: near-clipped bins (raw units) carry no exposure-consistent signal -> NaN, skipped by LK
+      std::vector<float> v = BinnedGrey(frame, g, bin, black, white, bw, bh);
+      const float lim = 0.8f * prm.solve.clip;
+      for (float& x : v) if (x >= lim) x = std::numeric_limits<float>::quiet_NaN();
+      return v;
+    }
     if (!prm.paper_parity) return BinnedGrey(frame, g, bin, black, white, bw, bh);
     // Paper section 3.4: coarse forward-additive LK on bilinear-demosaiced
     // grayscale, rather than averaging Bayer cells before demosaicking.
@@ -256,14 +325,21 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
     std::vector<float> ref = alignmentGrey(frames[0], &bw, &bh);
     const float mref = median_of(ref);
     const LkRef lref = LkPrepare(ref.data(), bh, bw, 3);
-    const int nthr = std::max(1, std::min(K - 1, int(std::thread::hardware_concurrency()) / 2));
+    // One thread per frame up to the cores minus the noise fit's (2026-11-20; was half the cores: 7 frames
+    // ran in 2 rounds on the 8-core phone, ~0.75 s serial before any GPU work). LKRL_COARSE_THR overrides.
+    static const int coarse_thr = std::getenv("LKRL_COARSE_THR") ? std::atoi(std::getenv("LKRL_COARSE_THR")) : 0;
+    const int ncpu = std::max(1, int(std::thread::hardware_concurrency()));
+    const int nthr = std::max(1, std::min(K - 1, coarse_thr > 0 ? coarse_thr : std::max(1, ncpu - 1)));
     std::vector<std::thread> pool;
     for (int tt = 0; tt < nthr; ++tt)
       pool.emplace_back([&, tt] {
         for (int k = 1 + tt; k < K; k += nthr) {
           int w2, h2;
           std::vector<float> mov = alignmentGrey(frames[k], &w2, &h2);
-          if (!prm.paper_parity) {
+          if (hdr) {   // bracket: known exposure ratio (clipped areas would bias a median ratio)
+            gain[k] = 1.0f / erel[size_t(k)];
+            for (float& v : mov) v *= gain[k];
+          } else if (!prm.paper_parity) {
             const float mm = median_of(mov);
             if (mref > 0 && mm > 0) {
               const float gk = mref / mm;
@@ -287,6 +363,20 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
         }
       });
     for (auto& th : pool) th.join();
+    if (const char* fn = std::getenv("LKRL_AFFINE_FILE")) {   // diagnostics: K lines of 6 numbers
+      if (FILE* f = std::fopen(fn, "r")) {
+        for (int k = 0; k < K; ++k) for (int m = 0; m < 6; ++m) if (std::fscanf(f, "%lf", &P[k][m]) != 1) break;
+        std::fclose(f);
+      }
+    }
+    if (std::getenv("LKRL_NOGAIN")) std::fill(gain.begin(), gain.end(), 1.0f);   // diagnostics
+    if (const char* v = std::getenv("LKRL_COARSE_SHIFT")) {   // diagnostics: add (dx, dy) to frames 1..K-1
+      float dx = 0, dy = 0; std::sscanf(v, "%f %f", &dx, &dy);
+      for (int k = 1; k < K; ++k) { P[k][2] += dx; P[k][5] += dy; }
+    }
+    if (std::getenv("LKRL_PRINT_AFFINE"))   // diagnostics
+      for (int k = 0; k < K; ++k)
+        std::fprintf(stderr, "affine %d: %.6f %.6f %.3f %.6f %.6f %.3f gain %.4f\n", k, P[k][0], P[k][1], P[k][2], P[k][3], P[k][4], P[k][5], gain[k]);
   }
   noise_fit.join();
   S.ms_coarse = now_ms() - t;   // wall, noise fit included
@@ -295,7 +385,10 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
   t = now_ms();
   const PriorFn prior = make_prior ? make_prior(S.a, S.b, S.sigma, wb) : PriorFn();
   // The DCT x-step needs the solved tile (s * tile) to be a multiple of 4.
-  const int tile = std::min({prm.tile, g.w, g.h}) & (((prm.solve.dct_prior || prm.solve.dct_fallback) && prm.s == 1) ? ~3 : ~1);
+  const int tile_target = prm.tile > 0 ? prm.tile : (prm.s == 1 ? 416 : 320);
+  const int tile_align = ((prm.solve.dct_prior || prm.solve.dct_fallback) && prm.s == 1) ? 4 : 2;
+  const int tile_req = prm.tile > 0 ? tile_target : AutoTileSize(g.w, g.h, prm.s, prm.overlap, tile_align);
+  const int tile = std::min({tile_req, g.w, g.h}) & ~(tile_align - 1);
   const int ov = std::min(prm.overlap, tile / 4) & ~1;
   const int step = tile - ov;
   auto starts = [&](int len) {
@@ -326,6 +419,10 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
   sp.sigma_max = prm.smax_x * S.sigma;
   sp.sigma_end = prm.end_x * S.sigma;
   sp.wb = wb;
+  for (int k = 0; k < 3; ++k) sp.hl_ratio[k] = hl_ratio[k];
+  if (const char* v = std::getenv("LKRL_HL_LOG"))
+    if (v[0] == '1') std::fprintf(stderr, "lkr-lite: highlight ratios R %.3f G %.3f B %.3f from %zu rim cells\n",
+                                  hl_ratio[0], hl_ratio[1], hl_ratio[2], hl_cells);
   if (prm.paper_parity) {
     sp.prior_gain = 1.0f;
     sp.grain = 0.0f;
@@ -346,6 +443,7 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
   }
   sp.noise_a = S.a;
   sp.noise_b = S.b;
+  if (hdr) { sp.clip = hdr_clip; sp.exposure = erel; }
   sp.holdout = holdout;
   if (holdout) {
     S.holdout_w = g.w;
@@ -520,7 +618,10 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
       for (int k = 0; k < K; ++k) {
         float* fk = tf.data() + size_t(k) * n * n;
         LoadTile(frames[k], g, gx, gy, n, n, black, white, fk);
-        if (gain[k] != 1.0f)   // clipped samples stay clipped (>= clip -> 1)
+        if (hdr) {   // reference units; clipped samples (any frame, the reference too) marked above hdr_clip
+          const float gk = 1.0f / erel[size_t(k)];
+          for (size_t i = 0; i < size_t(n) * n; ++i) fk[i] = fk[i] >= prm.solve.clip ? hdr_mark : fk[i] * gk;
+        } else if (gain[k] != 1.0f)   // clipped samples stay clipped (>= clip -> 1)
           for (size_t i = 0; i < size_t(n) * n; ++i) fk[i] = fk[i] >= prm.solve.clip ? 1.0f : fk[i] * gain[k];
       }
       const double tl1 = now_ms();
@@ -539,6 +640,8 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
           for (int jj = 0; jj < g2; ++jj) {
             const float* r0 = t + size_t(2 * ii) * n + 2 * jj;
             o[size_t(ii) * g2 + jj] = 0.25f * (r0[0] + r0[1] + r0[n] + r0[n + 1]);
+            if (hdr && std::max(std::max(r0[0], r0[1]), std::max(r0[n], r0[n + 1])) >= hdr_clip)   // clipped: masked in LK
+              o[size_t(ii) * g2 + jj] = std::numeric_limits<float>::quiet_NaN();
           }
       };
       LkRef tref;
@@ -551,8 +654,26 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
       // and blurred the night treeline).
       const int sub_size = look_t > 0.5f ? prm.sub_lk_night : prm.sub_lk;
       const int sub_blur = int(std::lround(prm.sub_lk_blur_night * look_t));
+      // Any tile size (2026-11-20): quadrants of sub_size spread evenly over the tile (overlapping when n is
+      // not a multiple), each 16 px field block from the nearest quadrant. The old n % sub_size == 0 rule
+      // silently turned this off for the faster 416 / 424 px tiles: wind-moved bushes lost ~20 % fine detail
+      // (IMG_20260919_184641_979). With n a multiple the quadrants and blocks are exactly the old ones.
       const bool use_sub = sub_size >= 64 && prm.tile_lk && !prm.paper_parity && sp.local_block == 16 &&
-                           n % sub_size == 0 && look_t <= prm.sub_lk_max_noise;
+                           n >= sub_size && look_t <= prm.sub_lk_max_noise;
+      // Quadrant starts along one axis (grey px) and the field blocks [b0, b1) each one owns.
+      const int sub_gs = sub_size / 2;
+      std::vector<int> qs;
+      std::vector<std::pair<int, int>> qb;
+      if (use_sub) {
+        const int nq = std::max(1, (g2 + sub_gs / 2) / sub_gs);
+        for (int i = 0; i < nq; ++i) qs.push_back(nq == 1 ? (g2 - sub_gs) / 2 : i * (g2 - sub_gs) / (nq - 1));
+        auto firstBlock = [](int lo2) { return lo2 <= 8 ? 0 : (lo2 - 8 + 15) / 16; };   // first block centre >= lo2 (LR px)
+        for (int i = 0; i < nq; ++i) {
+          const int lo2 = i == 0 ? 0 : qs[i - 1] + qs[i] + sub_gs;              // 2 x midpoint of the centres
+          const int hi2 = i == nq - 1 ? 2 * g2 + 16 : qs[i] + qs[i + 1] + sub_gs;
+          qb.push_back({firstBlock(lo2), firstBlock(hi2)});
+        }
+      }
       const int sub_nbx = (n + 15) / 16, sub_nby = (n + 15) / 16;
       std::vector<float>& sub_field = o.sub_field;
       sub_field.clear();
@@ -560,10 +681,10 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
       o.use_sub = use_sub;
       std::vector<LkRef> qref;   // quadrant references, row-major in the order align_frame visits them
       if (use_sub) {
-        const int gs = sub_size / 2;
+        const int gs = sub_gs;
         std::vector<float> sr(size_t(gs) * gs);
-        for (int qy = 0; qy + gs <= g2; qy += gs)
-          for (int qx = 0; qx + gs <= g2; qx += gs) {
+        for (int qy : qs)
+          for (int qx : qs) {
             for (int i = 0; i < gs; ++i)
               for (int j = 0; j < gs; ++j) sr[size_t(i) * gs + j] = gref[size_t(qy + i) * g2 + qx + j];
             if (sub_blur > 0) BoxBlurGrey(&sr, gs, sub_blur);
@@ -588,11 +709,12 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
         // Sub-tile alignment (parallax): quadrant affine relative to the tile's,
         // written as the local motion start d(u) = (A' u + t') - (A u + t), LR px.
         if (k > 0 && use_sub) {
-          const int gs = sub_size / 2;   // quadrant edge in grey px
+          const int gs = sub_gs;   // quadrant edge in grey px
           std::vector<float> sm(size_t(gs) * gs);
           size_t qi = 0;
-          for (int qy = 0; qy + gs <= g2; qy += gs)
-            for (int qx = 0; qx + gs <= g2; qx += gs) {
+          for (size_t iy = 0; iy < qs.size(); ++iy)
+            for (size_t ix = 0; ix < qs.size(); ++ix) {
+              const int qx = qs[ix], qy = qs[iy];
               const LkRef& sr = qref[qi++];
               for (int i = 0; i < gs; ++i)
                 for (int j = 0; j < gs; ++j) sm[size_t(i) * gs + j] = gm[size_t(qy + i) * g2 + qx + j];
@@ -612,7 +734,8 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
               const double ax = pq[0], bx_ = pq[1], ay = pq[3], by_ = pq[4];
               const double tx = 2.0 * (pq[2] + qx - (ax * qx + bx_ * qy));
               const double ty = 2.0 * (pq[5] + qy - (ay * qx + by_ * qy));
-              const int b0x = 2 * qx / 16, b1x = 2 * (qx + gs) / 16, b0y = 2 * qy / 16, b1y = 2 * (qy + gs) / 16;
+              const size_t ixq = size_t(std::find(qs.begin(), qs.end(), qx) - qs.begin()), iyq = size_t(std::find(qs.begin(), qs.end(), qy) - qs.begin());
+              const int b0x = qb[ixq].first, b1x = qb[ixq].second, b0y = qb[iyq].first, b1y = qb[iyq].second;
               for (int by = b0y; by < b1y && by < sub_nby; ++by)
                 for (int bx = b0x; bx < b1x && bx < sub_nbx; ++bx) {
                   const double ux = bx * 16 + 8, uy = by * 16 + 8;
@@ -651,15 +774,15 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
         for (int k = 0; k < K; ++k)
           for (int c = 0; c < 6; ++c) p[k * 6 + c] = float(pts[size_t(k)][size_t(c)]);
         if (use_sub) {
-          const int gs = sub_size / 2;
+          const int gs = sub_gs;
           struct Sub { int k, qx, qy; size_t qi; std::array<double, 6> ps; };
           std::vector<Sub> subs;
           std::vector<std::vector<float>> sms;
           for (int k = 1; k < K; ++k) {
             const auto& pt = pts[size_t(k)];
             size_t qi = 0;
-            for (int qy = 0; qy + gs <= g2; qy += gs)
-              for (int qx = 0; qx + gs <= g2; qx += gs) {
+            for (int qy : qs)
+              for (int qx : qs) {
                 std::vector<float> sm(size_t(gs) * gs);
                 for (int i = 0; i < gs; ++i)
                   for (int j = 0; j < gs; ++j) sm[size_t(i) * gs + j] = gms[size_t(k)][size_t(qy + i) * g2 + qx + j];
@@ -685,7 +808,8 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
             const double ax = pq[0], bx_ = pq[1], ay = pq[3], by_ = pq[4];
             const double tx = 2.0 * (pq[2] + qx - (ax * qx + bx_ * qy));
             const double ty = 2.0 * (pq[5] + qy - (ay * qx + by_ * qy));
-            const int b0x = 2 * qx / 16, b1x = 2 * (qx + gs) / 16, b0y = 2 * qy / 16, b1y = 2 * (qy + gs) / 16;
+            const size_t ixq = size_t(std::find(qs.begin(), qs.end(), qx) - qs.begin()), iyq = size_t(std::find(qs.begin(), qs.end(), qy) - qs.begin());
+              const int b0x = qb[ixq].first, b1x = qb[ixq].second, b0y = qb[iyq].first, b1y = qb[iyq].second;
             for (int by = b0y; by < b1y && by < sub_nby; ++by)
               for (int bx = b0x; bx < b1x && bx < sub_nbx; ++bx) {
                 const double ux = bx * 16 + 8, uy = by * 16 + 8;
@@ -933,6 +1057,35 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
     total.alloc_ms += v.alloc_ms; total.pipeline_ms += v.pipeline_ms; total.sets_ms += v.sets_ms;
     total.record_ms += v.record_ms; total.queue_ms += v.queue_ms; total.wait_ms += v.wait_ms;
     total.coherency_ms += v.coherency_ms; total.query_ms += v.query_ms;
+  }
+  {
+    static const float lfc_env = std::getenv("LKRL_LFC") ? float(std::atof(std::getenv("LKRL_LFC"))) : -1.0f;
+    const float lk = lfc_env >= 0.0f ? lfc_env : prm.lfc_k;
+    // Last NaN guard, always, before the image-wide pass that would spread it (tiles replace theirs).
+    for (size_t i = 0, n3 = size_t(*out_w) * *out_h * 3; i < n3; ++i)
+      if (!std::isfinite(rgb_data[i])) rgb_data[i] = 0.0f;
+    if (lk > 0.0f) {
+      const double tl = now_ms();
+      const float wbf[3] = {wb[0], wb[1], wb[2]};
+      LfcStats ls;
+      LowFreqChroma(rgb_data, *out_w, *out_h, wbf, lk, S.a, S.b, prm.s, &ls);
+      S.lfc_ms = float(now_ms() - tl); S.lfc_wu = ls.wu; S.lfc_wv = ls.wv;
+    }
+  }
+  // Highlight reconstruction (FinishLook) can lift clipped channels above the output white (clouds whose
+  // green clipped: rebuilt from red / blue). Report the reached level as the white, as an HDR merge does,
+  // so writers scale instead of clamping one channel (a clamped green turns the cloud pink). 99.99th
+  // percentile of the values above the white: a lone ringing overshoot does not darken the whole file.
+  static const bool hl_rec_env_off = std::getenv("LKRL_HL_REC") && std::getenv("LKRL_HL_REC")[0] == '0';
+  if (prm.solve.highlight_desat && hl_cells >= 64 && !hl_rec_env_off && !std::getenv("LKRL_HL_OLD")) {
+    std::vector<float> over;
+    for (size_t i = 0, n3 = size_t(*out_w) * *out_h * 3; i < n3; ++i)
+      if (rgb_data[i] > S.hdr_white) over.push_back(rgb_data[i]);
+    if (over.size() >= 16) {
+      const size_t q = size_t(double(over.size() - 1) * 0.9999);
+      std::nth_element(over.begin(), over.begin() + q, over.end());
+      S.hdr_white = std::max(S.hdr_white, over[q]);
+    }
   }
   S.ms_total = now_ms() - t0;
   if (st) *st = S;

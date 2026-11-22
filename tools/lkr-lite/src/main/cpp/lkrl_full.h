@@ -29,8 +29,16 @@ struct RawFrame {
 
 struct FullParams {
   int s = 1;               // output scale (1 or 2)
-  int tile = 512;          // LR tile edge incl. overlap (even)
-  int overlap = 32;        // LR overlap between tiles (even)
+  // LR tile edge incl. overlap (even); 0 = auto: 416 at 1x, 320 at 2x (with overlap 16: 1x 88 tiles 12.1-12.3 s). Mali-G615 (2026-11-20, day burst,
+  // 8 frames): 512 -> 384 at 1x 14.4 -> 13.6 s, 512 -> 320 at 2x zoom 15.4 -> 11.4 s; 768 / 1024 were
+  // 15.9 / 22.2 s (a tile's working set falls out of cache). Image 57-64 dB vs 512, detail unchanged.
+  int tile = 0;
+  // LR overlap between tiles (even). 32 -> 16 (2026-11-20): Mali 2x zoom 11.6 -> 9.8 s (42 -> 35 tiles);
+  // no seam build-up (differences in the overlap strips 0.76-1.26x elsewhere, 52-63 dB vs 32).
+  int overlap = 16;
+  // Low-frequency colour noise on the finished image (lkrl_lfc.cpp): Wiener strength in measured-noise
+  // units, 0 = off. Self-gating (measured noise), so on for every scene. LKRL_LFC overrides.
+  float lfc_k = 16.0f;   // night burst 194618: colour blotches -31 %; day 184641: no pixel changes > 0.01
   // Optional zero-initialised caller allocation for (w, h, 3) floats; null or a null result uses rgb_out.
   std::function<float*(int, int)> out_alloc;
   // Optional: refines the burst's own noise fit (a, b in normalised raw units,
@@ -89,11 +97,18 @@ struct FullParams {
   // merge, aligned to the finished image and compared with it through the forward model.
   // FullStats::holdout receives the maps. -1 = off. Needs >= 3 frames.
   int holdout = -1;
+  // HDR bracket (Lecouat et al. 2022 on Lite): exposure of each input frame in any common unit
+  // (e.g. ExposureTime x ISO), frame 0 = reference. Empty, or all equal = the normal merge. Mixed:
+  // samples are divided by exposure / reference's, clipped samples are excluded per frame, each
+  // frame is weighted by its own noise; the result is in reference units with highlights up to
+  // FullStats::hdr_white (> 1). Not combined with holdout or sharpest_ref.
+  std::vector<float> exposure;
   bool auto_local_lambda = true;   // scale solve.local_lambda by (noise / 0.0025)^2, cap 5   // init local motion with sr-pipeline align.comp (coarse-to-fine)
 };
 
 struct FullStats {
   int tiles = 0;
+  float lfc_ms = 0, lfc_wu = 0, lfc_wv = 0;   // low-frequency colour pass: time, mean Wiener weight U / V
   float sigma = 0, a = 0, b = 0;
   float fit_a = 0, fit_b = 0;   // the burst's own fit, before noise_refine
   bool noise_learned = false;   // a, b came from noise_refine (learned model)
@@ -103,7 +118,8 @@ struct FullStats {
   double ms_init = 0, ms_finish = 0, ms_blend = 0;   // sums over tiles: solver CPU start, FinishLook, output blend
   double ms_solve = 0, ms_prep = 0, ms_load = 0;   // ms_load: LoadTile part of ms_prep
   int workers = 0;
-  int ref_index = 0;   // input frame used as the reference (sharpest_ref)   // tile workers actually running (own Vulkan context each)   // sums over tiles: solver wall, tile load + per-tile LK
+  int ref_index = 0;
+  float hdr_white = 1.0f;   // HDR bracket: output level of the clip (divide by it for a 0..1 image); 1 otherwise   // input frame used as the reference (sharpest_ref)   // tile workers actually running (own Vulkan context each)   // sums over tiles: solver wall, tile load + per-tile LK
   float prior_gain = 0, grain = 0;   // look actually used
   float sigma_look = 0;
   float local_lambda = 0;              // noise level the look was chosen from
@@ -121,6 +137,10 @@ struct FullStats {
 // PriorFactory is called once with the fitted noise (a, b, sigma) and wb, and
 // returns the PriorFn used for every tile (empty = 'none').
 using PriorFactory = std::function<PriorFn(float a, float b, float sigma, const std::array<float, 3>& wb)>;
+
+// Auto LR tile edge for a w x h LR grid at output scale s (FullParams.tile = 0); align = 4 at 1x with the
+// DCT, else 2. Exposed so the NPU prior can be compiled for the real tile size before the first merge.
+int AutoTileSize(int w, int h, int s, int overlap, int align);
 
 bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames, int W, int H, const int cfa[4],
                const float black[4], float white, const std::array<float, 3>& wb, const FullParams& prm,

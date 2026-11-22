@@ -48,6 +48,7 @@ struct Params {
     double aces[3][3];  // [col][row]
     double white[3];
     double contrast, saturation, purity, hue, shadowEv, highlightEv, gamut, shoulder;
+    double shadowLift = 0.2, highlightRecovery = 0.0;
     int p3;
     int applyLens, greenRow, qbX, qbY, lowStep, aL, aT, aR, aB;
 };
@@ -154,23 +155,27 @@ static void refLook(const float q[4], int x, int y, const Buffer<float> &lensMap
     matVecD(p.aces, camW, aces);
     double peak = fmax(0.0, fmax(aces[0], fmax(aces[1], aces[2])));
     double toe = .06 / (.06 + peak);
-    double gain = peak >= .6 ? 1.0 : 1.0 + 3.0 * toe * toe * (1.0 - smoothstepD(.18, .6, peak));
+    double gain = peak >= .6 ? 1.0 : 1.0 + 3.0 * p.shadowLift * toe * toe * (1.0 - smoothstepD(.18, .6, peak)) * smoothstepD(.001, .008, peak);
+    double distance = fmax(log2(fmax(peak, .125)) + 3.0, 0.0);
+    double depth = distance * distance / (distance + 1.0);
+    gain *= exp2(-p.highlightRecovery * (1.0 - exp(-1.6 * depth)));
     for (int i = 0; i < 3; ++i) aces[i] *= gain;
     matVecD(A2R, aces, rec);
     if (p.jpeg == 3) {
         double display[3];
         matVecD(p.p3 ? R2P : R2S, rec, display);
+        for (int i = 0; i < 3; ++i) display[i] = fmax(display[i], 0.0);
         double peak = fmax(display[0], fmax(display[1], display[2]));
-        double scale = 1.0;
-        if (peak > 0.6) {
-            double t = peak - 0.6;
-            double compressed = 0.6 + t / (1.0 + t / 0.4);
-            scale += clampD(p.shoulder, 0.0, 1.0) * (compressed / peak - 1.0);
+        double knee = 0.76 - 0.16 * clampD(p.shoulder, 0.0, 1.0);
+        double mapped = peak, scale = 1.0, white = 0.0;
+        if (peak > knee) {
+            double d = 1.0 - knee;
+            mapped = 1.0 - d * d / (peak + d - knee);
+            scale = mapped / peak;
+            white = 1.0 - 1.0 / (1.0 + 0.15 * (peak - mapped));
         }
-        for (int i = 0; i < 3; ++i) {
-            double x = pow(oetfD(clampD(display[i] * scale, 0.0, 1.0)), 1.0 / 1.1);
-            out[i] = 0.25 * x + 0.75 * x * x * (3.0 - 2.0 * x);
-        }
+        for (int i = 0; i < 3; ++i)
+            out[i] = oetfD(clampD(display[i] * scale * (1.0 - white) + mapped * white, 0.0, 1.0));
         return;
     }
     for (int i = 0; i < 3; i++) {
@@ -244,7 +249,7 @@ static void checkCase(const char *name, Buffer<float> &quad, Buffer<float> &lens
     int rc = bgu_look(quad, lens, wb, ccm, aces, white, p.jpeg, (float)p.ev,
                       (float)p.contrast, (float)p.saturation, (float)p.purity,
                       (float)p.hue, (float)p.shadowEv, (float)p.highlightEv,
-                      (float)p.gamut, (float)p.shoulder, p.p3, p.applyLens, p.greenRow,
+                      (float)p.gamut, (float)p.shoulder, (float)p.shadowLift, (float)p.highlightRecovery, p.p3, p.applyLens, p.greenRow,
                       p.qbX, p.qbY, p.lowStep, p.aL, p.aT, p.aR, p.aB, guide, dev);
     if (rc != 0) {
         printf("FAIL %s: filter rc=%d\n", name, rc);
@@ -355,6 +360,8 @@ int main() {
     // Case D: JPEG extreme + P3.
     Params d = c;
     d.ev = 1.0;
+    d.shadowLift = 1.0;
+    d.highlightRecovery = 1.0;
     d.contrast = 1.5;
     d.saturation = 2.0;
     d.purity = 2.0;
