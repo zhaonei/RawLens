@@ -88,8 +88,12 @@ class MfsrSettingsTest {
         assertArrayEquals(intArrayOf(1020, 764, 2040, 1530), LkrZoom.X2.crop(4080, 3060))
         // 1.5x: centre 2720x2040, solved at x2 (5440x4080) then resampled to the sensor size
         assertArrayEquals(intArrayOf(680, 510, 2720, 2040), LkrZoom.X1_5.crop(4080, 3060))
+        // 1.2x (this fork): centre 3400x2550, same x2 solve and resample. The origin is
+        // aligned down to 254 because a Bayer crop must keep an even edge.
+        assertArrayEquals(intArrayOf(340, 254, 3400, 2550), LkrZoom.X1_2.crop(4080, 3060))
         for (z in LkrZoom.entries) z.crop(4080, 3060)?.forEach { assertEquals(0, it % 2) }   // Bayer phase
-        assertEquals(LkrZoom.X1_5, LkrZoom.X1.next())
+        assertEquals(LkrZoom.X1_2, LkrZoom.X1.next())
+        assertEquals(LkrZoom.X1_5, LkrZoom.X1_2.next())
         assertEquals(LkrZoom.FULL_2X, LkrZoom.X2.next())
         assertEquals(LkrZoom.X1, LkrZoom.FULL_2X.next())
         assertEquals(null, LkrZoom.FULL_2X.crop(4080, 3060))
