@@ -10,6 +10,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MfsrSettingsTest {
+    @Test fun mfsrLabUsesIndependentDetailAndFlatDenoiseByDefault() {
+        assertEquals(1f, MfsrTuning.Entry.INDEPENDENT_WIDTHS.defaultValue(), 0f)
+        assertEquals(0.85f, MfsrTuning.Entry.K_DETAIL.defaultValue(), 0f)
+        assertEquals(1.30f, MfsrTuning.Entry.K_DENOISE.defaultValue(), 0f)
+    }
+
     @Test fun removedLkrKernelNetSwitchIsIgnored() {
         // KernelNet was removed from LK-R (2026-11-20); a saved choice must not change anything.
         assertEquals(MfsrSettings(), MfsrSettings.fromPreferences(mapOf("lkr_kernelnet_denoise" to false)))
@@ -33,9 +39,10 @@ class MfsrSettingsTest {
 
     @Test fun followsZslWithMfsrOnlyCeiling() {
         val settings = MfsrSettings(enabled = true)
-        for (count in 2..16) assertEquals(count, settings.activeFrameCount(count))
+        val ceiling = MfsrSettings.MAX_MERGE_FRAMES   // 30 since a157caaa (merges use the whole burst)
+        for (count in 2..ceiling) assertEquals(count, settings.activeFrameCount(count))
         assertEquals(2, settings.activeFrameCount(1))
-        assertEquals(16, settings.activeFrameCount(30))
+        assertEquals(ceiling, settings.activeFrameCount(ceiling + 10))
     }
 
     @Test fun lkrFollowsTheFullBurstRange() {
@@ -55,8 +62,8 @@ class MfsrSettingsTest {
         assertEquals("MFSR\nUNAVAILABLE", on.quickText(m, 12, 12, false, false))
         assertEquals("MFSR\nWARMING", on.quickText(m, 12, 8, true, false))
         assertEquals("MFSR\n×12", on.quickText(m, 12, 12, true, false))
-        assertEquals("MFSR\nWARMING", on.quickText(m, 30, 15, true, false))
-        assertEquals("MFSR\n×16", on.quickText(m, 30, 16, true, false))
+        assertEquals("MFSR\nWARMING", on.quickText(m, 40, 29, true, false))
+        assertEquals("MFSR\n×30", on.quickText(m, 40, 30, true, false))
     }
 
     @Test fun lkrMiddleReferenceDefaultsOnAndRoundTrips() {
@@ -66,11 +73,38 @@ class MfsrSettingsTest {
         assertFalse(MfsrSettings.fromPreferences(off.toPreferences()).lkrMiddleReference)
     }
 
+    @Test fun greenFitDefaultsOnForCompatibleMfsrAndCanBeDisabled() {
+        val defaults = MfsrSettings.fromPreferences(emptyMap<String, Any>())
+        assertTrue(defaults.useGreenFit)
+        val disabled = defaults.copy(greenFit = false)
+        assertFalse(MfsrSettings.fromPreferences(disabled.toPreferences()).useGreenFit)
+        assertFalse(defaults.copy(mfsrFullRes = true).useGreenFit)
+        assertFalse(defaults.copy(zipperFix = false).useGreenFit)
+        assertFalse(defaults.copy(twoBand = true).useGreenFit)
+    }
+
+    @Test fun rtSharpenDefaultsOffAndRoundTrips() {
+        assertFalse(MfsrSettings.fromPreferences(emptyMap<String, Any>()).rtSharpen)
+        val enabled = MfsrSettings(rtSharpen = true)
+        assertEquals(enabled, MfsrSettings.fromPreferences(enabled.toPreferences()))
+    }
+
     @Test fun kbSr2xDefaultsOffAndRoundTrips() {
         assertFalse(MfsrSettings().mfsrFullRes)
         assertFalse(MfsrSettings.fromPreferences(emptyMap<String, Any>()).mfsrFullRes)
         val on = MfsrSettings(mfsrFullRes = true)
         assertTrue(MfsrSettings.fromPreferences(on.toPreferences()).mfsrFullRes)
+    }
+
+    @Test fun wronskiDefaultsAtBothScalesAndTwoBandRequiresOptIn() {
+        for (fullRes in listOf(false, true)) {
+            val settings = MfsrSettings(mfsrFullRes = fullRes)
+            val legacy = mapOf("mfsr_full_res" to fullRes, "mfsr_two_band" to true)
+            assertEquals(settings, MfsrSettings.fromPreferences(legacy))
+            assertFalse(settings.twoBand)
+            val optedIn = settings.copy(twoBand = true)
+            assertEquals(optedIn, MfsrSettings.fromPreferences(optedIn.toPreferences()))
+        }
     }
 
     @Test fun lkrDefaultsToNoPrior() {
@@ -82,16 +116,28 @@ class MfsrSettingsTest {
         assertTrue(MfsrSettings.fromPreferences(on.toPreferences()).lkrDctPrior)
     }
 
+    @Test fun lkrNpuDenoiseIsOptInAndStoredSeparately() {
+        assertFalse(MfsrSettings.fromPreferences(mapOf("lkr_network" to true)).lkrNpuDenoise)
+        val settings = MfsrSettings(lkrNpuDenoise = true, lkrNetwork = false, lkrDctPrior = true)
+        assertEquals(settings, MfsrSettings.fromPreferences(settings.toPreferences()))
+    }
+
+    @Test fun lkrNoPriorIsOptInAndPreservesSavedDenoisers() {
+        assertFalse(MfsrSettings.fromPreferences(mapOf("lkr_network" to true)).lkrNoPrior)
+        val settings = MfsrSettings(lkrNoPrior = true, lkrNetwork = true, lkrNpuDenoise = true, lkrDctPrior = true)
+        assertEquals(settings, MfsrSettings.fromPreferences(settings.toPreferences()))
+    }
+
     @Test fun lkrZoomCropsTheCentreAndKeepsSensorOutput() {
         assertEquals(null, LkrZoom.X1.crop(4080, 3060))
         // 2x: centre half, solved at x2 -> exactly 4080x3060
         assertArrayEquals(intArrayOf(1020, 764, 2040, 1530), LkrZoom.X2.crop(4080, 3060))
         // 1.5x: centre 2720x2040, solved at x2 (5440x4080) then resampled to the sensor size
         assertArrayEquals(intArrayOf(680, 510, 2720, 2040), LkrZoom.X1_5.crop(4080, 3060))
-        // 1.2x (this fork): centre 3400x2550, same x2 solve and resample. The origin is
-        // aligned down to 254 because a Bayer crop must keep an even edge.
-        assertArrayEquals(intArrayOf(340, 254, 3400, 2550), LkrZoom.X1_2.crop(4080, 3060))
         for (z in LkrZoom.entries) z.crop(4080, 3060)?.forEach { assertEquals(0, it % 2) }   // Bayer phase
+        // 1.2x (this fork): centre 3400x2550 of a 4080x3060 sensor, same x2 solve and
+        // resample; the origin aligns down to an even 254 for the Bayer phase.
+        assertArrayEquals(intArrayOf(340, 254, 3400, 2550), LkrZoom.X1_2.crop(4080, 3060))
         assertEquals(LkrZoom.X1_2, LkrZoom.X1.next())
         assertEquals(LkrZoom.X1_5, LkrZoom.X1_2.next())
         assertEquals(LkrZoom.FULL_2X, LkrZoom.X2.next())

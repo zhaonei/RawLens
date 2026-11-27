@@ -19,7 +19,7 @@ internal fun MainActivity.redmiRootMode(): LapisRootProfile.Mode =
  * (no capture change: every frame is still full sensor), so what you frame
  * is the crop the merge solves at x2.
  *
- * In the bottom row next to OFF / AUTO, the round resolution button toggles, independently of zoom,
+ * In the control row beside AE-L, the round resolution button toggles, independently of zoom,
  * the sensor-size output and the kept x2 solve, labelled in MP like the lens switcher.
  */
 internal fun MainActivity.wireLkrZoomChip() {
@@ -56,7 +56,7 @@ internal fun MainActivity.wireLkrZoomChip() {
  * Output size in MP from the live RAW size: sensor MP, or the x2 solve of the
  * framed crop (1x: 4x pixels, 1.5x: ~2.25x, 2x: sensor size). Falls back to "1×" / "2×".
  */
-private fun MainActivity.lkrMegapixelLabel(fullRes: Boolean, zoom: LkrZoom): String {
+internal fun MainActivity.lkrMegapixelLabel(fullRes: Boolean, zoom: LkrZoom): String {
     val base = captureRawPixels
     if (base <= 0) return if (fullRes) "2×" else "1×"
     val mp = (if (fullRes) base * 4 / (zoom.factor * zoom.factor) else base.toFloat()) / 1e6

@@ -61,7 +61,11 @@ internal object LkrMerge {
         /** Keep the x2 solve: 1x -> whole frame at x2; 1.5x / 2x -> crop at x2, no downsample. */
         val fullRes: Boolean = false,
         /** The frames are an LK-R HDR capture (0 EV reference first, then short / long frames). */
-        val hdrBracket: Boolean = false
+        val hdrBracket: Boolean = false,
+        val npuDenoise: Boolean = false,
+        val noPrior: Boolean = false,
+        /** Rebuild clipped highlights from the unclipped neighbours' local colour (Settings -> Merge). */
+        val highlightRecovery: Boolean = true
     )
 
     fun mergeDecoded(
@@ -225,11 +229,13 @@ internal object LkrMerge {
         LkrBridge.nativeSetCacheDir(context.codeCacheDir.absolutePath)
         // Learned per-device noise model as prior for the burst's own fit (as HDR+);
         // the native side declines when it is untrained for this ISO.
-        val noiseSource = WaveletDenoiser.NoiseSource.of(metadata)
+        val noiseSource = RawNoiseModel.Source.of(metadata)
         LkrBridge.nativeSetNoiseModel(
-            noiseSource?.let { WaveletDenoiser.storePath(WaveletDenoiser.noiseDir(context), it) },
+            noiseSource?.let { RawNoiseModel.storePath(RawNoiseModel.noiseDir(context), it) },
             noiseSource?.iso?.toFloat() ?: 0f)
-        LkrBridge.nativeSetPrior(settings.network)
+        LkrBridge.nativeSetPrior(settings.network && !settings.npuDenoise && !settings.noPrior)
+        LkrBridge.nativeSetNpuDenoise(settings.npuDenoise, settings.noPrior)
+        LkrBridge.nativeSetHighlightRecovery(settings.highlightRecovery)
         LkrBridge.nativeSetExposures(exposures)
         if (exposures != null) Log.i(LOG_TAG, "lkr HDR bracket exposures (ref first): ${exposures.joinToString { "%.4g".format(it) }}")
         val t0 = SystemClock.elapsedRealtime()

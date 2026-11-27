@@ -212,7 +212,7 @@ internal class BurstMergeRunner(private val appContext: Context) {
     ): Completed {
         val captureId = take.lastModified()
         val merged = AdpfHint.boosted(appContext) { LkrMerge.mergeDecoded(appContext, frames,
-            LkrMerge.Settings(network = inputs.mfsr.lkrNetwork, dctPrior = inputs.mfsr.lkrDctPrior, tuning = LkrTuning.overrides(appContext),
+            LkrMerge.Settings(network = inputs.mfsr.lkrNetwork, npuDenoise = inputs.mfsr.lkrNpuDenoise, noPrior = inputs.mfsr.lkrNoPrior, highlightRecovery = inputs.mfsr.lkrHighlightRecovery, dctPrior = inputs.mfsr.lkrDctPrior, tuning = LkrTuning.overrides(appContext),
                 zoom = inputs.mfsr.lkrZoom, fullRes = inputs.mfsr.lkrFullRes)) }
             ?: throw IllegalStateException("LK-R merge failed")
         try {
@@ -288,7 +288,7 @@ internal class BurstMergeRunner(private val appContext: Context) {
         val referenceIndex = (mergedInputs.size / 2).coerceIn(mergedInputs.indices)
         val tMerge = SystemClock.elapsedRealtime()
         val mergedRaw = AdpfHint.boosted(appContext) { processor.merge(mergedInputs, referenceIndex, inputs.hdrPlus,
-            noiseSource = WaveletDenoiser.NoiseSource.of(frames[referenceIndex].metadata)) }
+            noiseSource = RawNoiseModel.Source.of(frames[referenceIndex].metadata)) }
             ?: throw IllegalStateException("HDR+ merge failed")
         val mergeMs = SystemClock.elapsedRealtime() - tMerge
         val decision = processor.lastDecision
@@ -312,9 +312,6 @@ internal class BurstMergeRunner(private val appContext: Context) {
         val merged = requireNotNull(
             RawPreDemosaicPipeline.process(mergedRaw, refMeta, PreDemosaicSettings()).cfa
         )
-        val effective = if (inputs.denoise.aiEnabled) {
-            RawDevelopmentCoordinator(appContext).denoiseCfa(merged, refMeta) ?: merged
-        } else merged
         val outputs = ArrayList<String>()
         val provenance = offlineHdrPlusProvenance(frames.map { it.metadata }, decision,
             processor.lastTimings, processor.lastMotion, mergeMs)
@@ -327,7 +324,7 @@ internal class BurstMergeRunner(private val appContext: Context) {
             )
             Log.i("BurstMergeRunner", "Offline HDR+ saving DNG: compression=$dngCompression camera=${refMeta.cameraId}")
             outputs += DngSaver(appContext).saveMerged(
-                effective, refMeta, captureId, gps = null,
+                merged, refMeta, captureId, gps = null,
                 displayName = CaptureFileNames.hdrPlusDng(captureId),
                 sixteenBit = true,
                 dngCompression = dngCompression,
@@ -338,14 +335,14 @@ internal class BurstMergeRunner(private val appContext: Context) {
             Log.i("BurstMergeRunner", "Offline HDR+ developing ${inputs.developedFormat}")
             val developer = RawDevelopmentCoordinator(appContext)
             if (inputs.developedFormat == DevelopedFormat.JXL) {
-                val developed = developer.developMergedJxl(effective, refMeta,
+                val developed = developer.developMergedJxl(merged, refMeta,
                     RawDevelopmentSettings(denoise = inputs.denoise, exposureEv = 0.0),
                     look = inputs.jpeg, jxl = inputs.jxl)
                 outputs += JxlSaver(appContext).save(developed, refMeta, null,
                     captureTimeMillis = captureId,
                     typeSuffix = CaptureFileNames.TYPE_HDRPLUS)
             } else {
-                val developed = developer.developMergedJpeg(effective, refMeta,
+                val developed = developer.developMergedJpeg(merged, refMeta,
                     RawDevelopmentSettings(denoise = inputs.denoise, exposureEv = 0.0), inputs.jpeg)
                 try {
                     outputs += JpegSaver(appContext).save(developed, refMeta, null,
@@ -358,7 +355,7 @@ internal class BurstMergeRunner(private val appContext: Context) {
             }
         }
         return Completed(outputs, keptFrames.size, frames.size, mergeMs,
-            effective.width, effective.height)
+            merged.width, merged.height)
     }
 
     companion object {

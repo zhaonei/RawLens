@@ -44,7 +44,6 @@ import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
-import com.particlesdevs.photoncamera.processing.ml.RawNindNcnnProcessor
 import java.io.File
 import java.util.Locale
 import android.os.Build
@@ -118,12 +117,12 @@ internal fun MainActivity.showSettings(initialTab: Int = SETTINGS_ROOT) {
     // Name and one-line summary per page, in page-index order.
     val pageInfo = listOf(
         "General" to "RAW capture, viewfinder, location, backup & restore",
-        "Photo" to "File format and photo output",
+        "Photo" to "File format, photo output and DNG tools",
         "Video" to "RAW and encoded video, audio, stabilization, monitoring",
-        "Exposure" to "PROGRAM auto exposure, exposure brackets, face priority",
+        "Exposure" to "Shutter range, Program AE, HDR and bracketing",
         "Burst" to "Zero shutter lag, gyro sidecars, offline merges",
         "Merge" to "HDR+, MFSR and LK-R burst merges",
-        "Details" to "JPEG cleanup, AI RAW denoise, wavelet denoise, capture sharpening",
+        "Details" to "RAW denoise (classic or network), capture sharpening",
         "Lenses" to "",
         "Debug" to "App log, camera diagnostics, debug frames",
         "About" to "Version, licences, updates",
@@ -175,7 +174,7 @@ internal fun MainActivity.showSettings(initialTab: Int = SETTINGS_ROOT) {
     }
     val subHost = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(0, 0, 0, dp(24))
+        setPadding(dp(16), 0, dp(16), dp(24))
         visibility = View.GONE
     }
     (settingsScroll.getChildAt(0) as LinearLayout).addView(subHost)
@@ -229,6 +228,7 @@ internal fun MainActivity.showSettings(initialTab: Int = SETTINGS_ROOT) {
         override fun jxlOutputSettings() = this@showSettings.jxlOutputSettings()
         override fun lensPreferences() = this@showSettings.lensPreferences()
         override fun setStatus(message: String) = this@showSettings.setStatus(message)
+        override fun showPhotoLutSettings() = this@showSettings.showPhotoLutSettings()
         override fun refreshCaptureFormatControl() = this@showSettings.refreshCaptureFormatControl()
         override fun clearTabStatusViews() {
             rawZslSettingsStatus = null
@@ -238,6 +238,8 @@ internal fun MainActivity.showSettings(initialTab: Int = SETTINGS_ROOT) {
             currentTab = 1
             showJpegTab()
         }
+        override fun applyPhotoOutputSettings(settings: JpegOutputSettings) =
+            this@showSettings.applyPhotoOutputSettings(settings)
         override fun onMonoChanged(mono: MonoSettings) = this@showSettings.updateQuickControls()
     })
     val tabPages: List<() -> Unit> = listOf(
@@ -265,7 +267,7 @@ internal fun MainActivity.showSettings(initialTab: Int = SETTINGS_ROOT) {
                 val (name, pageSummary) = pageInfo[index]
                 val summary = if (index != SETTINGS_LENSES_TAB) pageSummary else {
                     val count = selectedLensIds().size
-                    "$count RAW lens${if (count == 1) "" else "es"} enabled · discover and choose"
+                    "$count RAW lens${if (count == 1) "" else "es"} enabled"
                 }
                 content.addView(kit.navRow(name, summary, pageIcons[index]) { goTab(index) },
                     LinearLayout.LayoutParams(
@@ -287,6 +289,8 @@ internal fun MainActivity.showSettings(initialTab: Int = SETTINGS_ROOT) {
                 pageScrollY = 0
             }
             currentTab = target
+            val inset = if (target == SETTINGS_ROOT) 0 else dp(16)
+            content.setPadding(inset, 0, inset, dp(24))
             if (target == SETTINGS_ROOT) showRoot() else tabPages[target]()
             backButton.contentDescription = if (target == SETTINGS_ROOT) "Close settings" else "Back"
             settingsScroll.scrollTo(0, 0)
@@ -339,7 +343,5 @@ internal fun MainActivity.rawZslSettingsText(status: RawZslStatus): String {
         RawZslState.ACTIVE -> "ACTIVE"
         RawZslState.FALLBACK -> "UNAVAILABLE — NORMAL RAW FALLBACK"
     }
-    return "Status: $state\n${status.detail}\n" +
-        "Keeps the selected number of full-resolution RAW frames in camera memory. " +
-        "Unsupported devices automatically use normal RAW capture."
+    return "Status: $state\n${status.detail}"
 }

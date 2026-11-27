@@ -237,9 +237,9 @@ object AdaptiveDevelopmentExposure {
             }
             index += stride
         }
-        val noise = HdrPlusSceneNoise.sampleNormalized(cfa.width, cfa.height, CLIP_LEVEL) { x, y ->
+        val noise = RawSceneNoise.sampleNormalized(cfa.width, cfa.height, CLIP_LEVEL) { x, y ->
             cfa.values[y * cfa.width + x]
-        }?.let { HdrPlusSceneNoise.fit(listOf(it)) }
+        }?.let { RawSceneNoise.fit(listOf(it)) }
         return analyzeSamples(samples, count, tuning, weights, excludeClipped = singleFrame, noise = noise)
     }
 
@@ -341,8 +341,8 @@ object AdaptiveDevelopmentExposure {
             }
             index += stride
         }
-        val noise = HdrPlusSceneNoise.sampleNormalized(crop.width, crop.height, CLIP_LEVEL, ::valueAt)
-            ?.let { HdrPlusSceneNoise.fit(listOf(it)) }
+        val noise = RawSceneNoise.sampleNormalized(crop.width, crop.height, CLIP_LEVEL, ::valueAt)
+            ?.let { RawSceneNoise.fit(listOf(it)) }
         return analyzeSamples(samples, count, tuning, weights, excludeClipped = singleFrame, noise = noise)
     }
 
@@ -468,7 +468,7 @@ object AdaptiveDevelopmentExposure {
         /** Single-frame sensor samples only: merged RGB may carry valid values above 1. */
         excludeClipped: Boolean = false,
         /** The frame's own blind noise fit (never a vendor profile); null = histogram gates only. */
-        noise: HdrPlusNoiseModel? = null
+        noise: RawNoiseEstimate? = null
     ): AdaptiveExposureResult {
         // AE-1: the log-average takes log2 of every sample between p5 and p95,
         // so a zero there made it -inf (max lift, HDR-scene ceiling) and a
@@ -671,7 +671,7 @@ object AdaptiveDevelopmentExposure {
     private const val MAX_SAMPLES = 65_536
     private const val MIN_SAMPLES = 64
     /** Normalized sensor level treated as clipped (white level minus a small black/noise margin). */
-    private const val CLIP_LEVEL = 0.97f
+    internal const val CLIP_LEVEL = 0.97f
     internal const val SHADOW_FLOOR = 1e-4f
     private const val TARGET_MIDDLE = 0.18
     // Defaults for [AdaptiveExposureTuning]; wired from JpegOutputSettings.

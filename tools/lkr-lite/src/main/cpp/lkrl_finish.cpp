@@ -119,6 +119,130 @@ static void NotchBayerPeriod(float* P, int H, int W) {
   }
 }
 
+// Highlight recovery with LOCAL donor colour (2026-11-27). A clipped channel is rebuilt from the
+// unclipped channels, with the colour ratio measured from the unclipped pixels NEAR it (the rim of the
+// same lamp / window / sign), not one global rim colour: a warm window next to cool sky got a green
+// cast with the global ratio. Donor sums per 16 px block over pixels where both channels of a pair are
+// below lo, bilinearly interpolated per pixel (blocks without enough donors fall back to the global
+// ratio hl_ratio). GPU twin: fin.comp modes 20 / 21 (same blocks, same arithmetic).
+namespace {
+constexpr int kHlBlock = 16;              // HR px per donor block
+constexpr float kHlMinDonors = 16.0f;     // donor pixels needed for a local ratio
+constexpr int kHlPairs[3][2] = {{0, 1}, {1, 2}, {0, 2}};
+
+struct HlDonorGrid {
+  int nbx = 0, nby = 0;
+  std::vector<float> s;   // per block 9 floats: pair p at [3p]: sum wb-space u_a, [3p+1]: u_b, [3p+2]: count
+};
+
+HlDonorGrid HlDonors(const float* x, int H, int W, const float* wb, float lo) {
+  const float clip = lo / 0.85f;
+  HlDonorGrid g;
+  g.nbx = (W + kHlBlock - 1) / kHlBlock;
+  g.nby = (H + kHlBlock - 1) / kHlBlock;
+  g.s.assign(size_t(g.nbx) * g.nby * 9, 0.0f);
+  const size_t HW = size_t(H) * W;
+  for (int by = 0; by < g.nby; ++by)
+    for (int bx = 0; bx < g.nbx; ++bx) {
+      float* s = &g.s[(size_t(by) * g.nbx + bx) * 9];
+      for (int y = by * kHlBlock; y < std::min(H, (by + 1) * kHlBlock); ++y)
+        for (int xx = bx * kHlBlock; xx < std::min(W, (bx + 1) * kHlBlock); ++xx) {
+          const size_t i = size_t(y) * W + xx;
+          const float v[3] = {x[i], x[HW + i], x[2 * HW + i]};
+          // Donor weight by brightness: only the bright unclipped margin of the highlight itself (max
+          // channel 0.5..0.75 clip ramps in) speaks for its colour. Equal weights let blue sky, foliage and
+          // shadow next to a cloud set the ratio: cyan clouds, green / pink bands at the clip edge
+          // (Samsung hdrplus, 2026-11-26).
+          const float t = std::clamp((std::max({v[0], v[1], v[2]}) - 0.5f * clip) / (0.25f * clip), 0.0f, 1.0f);
+          const float w = t * t;
+          if (w <= 0.0f) continue;
+          for (int p = 0; p < 3; ++p) {
+            const int a = kHlPairs[p][0], b = kHlPairs[p][1];
+            if (v[a] < lo && v[b] < lo) {
+              s[3 * p] += w * v[a] * wb[a];
+              s[3 * p + 1] += w * v[b] * wb[b];
+              s[3 * p + 2] += w;
+            }
+          }
+        }
+    }
+  return g;
+}
+
+// wb-space colour ratio u_c / u_k at pixel (X, Y) from the donor blocks around it.
+float HlRatio(const HlDonorGrid& g, int X, int Y, int c, int k, const float* hl) {
+  const int a = std::min(c, k), b = std::max(c, k);
+  const int p = (a == 0 && b == 1) ? 0 : (a == 1 && b == 2) ? 1 : 2;
+  const int num = (c == a) ? 0 : 1, den = 1 - num;
+  const float fx = (X + 0.5f) / kHlBlock - 0.5f, fy = (Y + 0.5f) / kHlBlock - 0.5f;
+  const int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
+  const float tx = fx - x0, ty = fy - y0;
+  float N = 0.0f, D = 0.0f, n = 0.0f;
+  for (int dy = 0; dy < 2; ++dy)
+    for (int dx = 0; dx < 2; ++dx) {
+      const int bx = std::clamp(x0 + dx, 0, g.nbx - 1), by = std::clamp(y0 + dy, 0, g.nby - 1);
+      const float w = (dx ? tx : 1.0f - tx) * (dy ? ty : 1.0f - ty);
+      const float* s = &g.s[(size_t(by) * g.nbx + bx) * 9 + 3 * p];
+      N += w * s[num];
+      D += w * s[den];
+      n += w * s[2];
+    }
+  // Shrink towards the global rim ratio by donor weight instead of switching at a count: the hard
+  // switch drew a visible colour step (green arcs along cloud edges) where blocks crossed it.
+  const float global = hl[c] / hl[k];
+  if (!(D > 1e-12f) || !(n > 0.0f)) return global;
+  const float al = n / (n + kHlMinDonors);
+  return al * (N / D) + (1.0f - al) * global;
+}
+
+// Clipped channels move towards the colour the unclipped channels imply, using donor ratios from the
+// neighbourhood; then the all-clipped rule makes the rest neutral (same as the old per-pixel rule).
+void HighlightRecover(float* x, int H, int W, const float* wb, float clip, const float* hl) {
+  const size_t HW = size_t(H) * W;
+  const float lo = 0.85f * clip;
+  const float range = std::max(clip - lo, 1e-6f);
+  const float q[3] = {0.25f * wb[0], 0.5f * wb[1], 0.25f * wb[2]};
+  const HlDonorGrid g = HlDonors(x, H, W, wb, lo);
+  for (int Y = 0; Y < H; ++Y)
+    for (int X = 0; X < W; ++X) {
+      const size_t i = size_t(Y) * W + X;
+      const float v[3] = {x[i], x[HW + i], x[2 * HW + i]};
+      if (std::max({v[0], v[1], v[2]}) <= lo) continue;
+      float m[3];
+      for (int c = 0; c < 3; ++c) {
+        const float t = std::clamp((v[c] - lo) / range, 0.0f, 1.0f);
+        m[c] = t * t * (3.0f - 2.0f * t);
+      }
+      // Brightest level the pixel implies (wb space). As a clipped channel's donors clip too (support
+      // -> 0) it moves towards this instead of staying at the clip: the old fade left G short in the
+      // band where R / B were partly clipped, an orange ring around rebuilt cloud cores.
+      const float implied = std::max({v[0] * wb[0], v[1] * wb[1], v[2] * wb[2]});
+      float luma = 0.0f;
+      for (int c = 0; c < 3; ++c) {
+        const int a = (c + 1) % 3, b = (c + 2) % 3;
+        const float wa = 1.0f - m[a], wbk = 1.0f - m[b], support = wa + wbk;
+        float est = 0.0f;
+        if (support > 1e-6f)
+          est = (wa * HlRatio(g, X, Y, c, a, hl) * v[a] * wb[a] + wbk * HlRatio(g, X, Y, c, b, hl) * v[b] * wb[b]) /
+                (support * wb[c]);
+        const float s = std::min(support, 1.0f);
+        const float target = s * est + (1.0f - s) * implied / wb[c];
+        x[c * HW + i] += m[c] * std::max(target - v[c], 0.0f);
+        luma += q[c] * x[c * HW + i];
+      }
+      // All channels clipped: no channel knows the level, so take the brightest one the pixel implies
+      // (max wb-space value) instead of capping at the clip. The cap left the brightest cloud cores at
+      // the clip while their partly clipped rims were rebuilt up to ~2x clip: dark neutral holes that read
+      // pink against the sky-lit rim (Samsung hdrplus clouds, 2026-11-26). Output above the clip is fine
+      // here: MergeFull reports it as hdr_white and the writers scale.
+      const float white = std::min({m[0], m[1], m[2]});
+      const float level = std::max({luma, x[i] * wb[0], x[HW + i] * wb[1], x[2 * HW + i] * wb[2]});
+      for (int c = 0; c < 3; ++c)
+        x[c * HW + i] += white * (level / wb[c] - x[c * HW + i]);
+    }
+}
+}  // namespace
+
 // DSLR-look finish (not in the paper): colour of x without Bayer-period
 // structure, plus luminance-only grain = grain * notch(L(z - x)).
 void FinishLook(const float* z, float* x, int H, int W, const SolveParams& prm, const float* noise_scale,
@@ -253,60 +377,11 @@ void FinishLook(const float* z, float* x, int H, int W, const SolveParams& prm, 
   // clip (same soft edge as below) moves towards max(itself, ratio_c x mean of the other two in wb space),
   // so the cloud keeps the shape the unclipped channels recorded and the colour of its unclipped edge.
   // Output can exceed the clip; the white rule below then only acts where ALL channels clip.
+  // Off (SolveParams::highlight_recovery = false, or LKRL_HL_REC=0): the neutral rule below runs instead.
   static const bool hl_rec_off = std::getenv("LKRL_HL_REC") && std::getenv("LKRL_HL_REC")[0] == '0';
-  const bool hl_rec = prm.highlight_desat && !hl_rec_off && !std::getenv("LKRL_HL_OLD");
-  // Dilated per-channel clip (fin.comp mode 7): bright pixels count a channel clipped when it clips within
-  // 2 s px (the merge leaves too-low values inside a channel's clipped area -> dark specks once rebuilt).
-  std::vector<float> xd;
-  if (hl_rec) {
-    const float lo = 0.85f * prm.clip;
-    const int r = 2 * prm.s;
-    xd.assign(x, x + 3 * HW);
-    for (int Y = 0; Y < H; ++Y)
-      for (int X = 0; X < W; ++X) {
-        const size_t i = size_t(Y) * W + X;
-        if (std::max(x[i], std::max(x[HW + i], x[2 * HW + i])) <= lo) continue;
-        for (int dy = -r; dy <= r; ++dy)
-          for (int dx = -r; dx <= r; ++dx) {
-            const size_t j = size_t(std::clamp(Y + dy, 0, H - 1)) * W + size_t(std::clamp(X + dx, 0, W - 1));
-            for (int c = 0; c < 3; ++c) xd[c * HW + i] = std::max(xd[c * HW + i], x[c * HW + j]);
-          }
-      }
-  }
-  if (hl_rec) {
-    const float lo = 0.85f * prm.clip, hi = prm.clip;
-    for (size_t i = 0; i < HW; ++i) {
-      const float v[3] = {x[i], x[HW + i], x[2 * HW + i]};
-      if (std::max(v[0], std::max(v[1], v[2])) <= lo) continue;
-      float m[3], u[3];   // clipped share; scene level each channel implies (wb space / rim colour)
-      for (int c = 0; c < 3; ++c) {
-        const float t = std::clamp((xd[c * HW + i] - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f);
-        m[c] = t * t * (3.0f - 2.0f * t);
-        u[c] = v[c] * prm.wb[c] / prm.hl_ratio[c];
-      }
-      for (int c = 0; c < 3; ++c) {
-        if (m[c] <= 0.0f) continue;
-        // From the other channels, each weighted by how unclipped it is (a clipped one reads low).
-        const int a = (c + 1) % 3, b = (c + 2) % 3;
-        const float wa = 1.0f - m[a], wbb = 1.0f - m[b];
-        if (wa + wbb <= 1e-3f) continue;   // all clipped: the white rule below
-        const float rec = prm.hl_ratio[c] * (wa * u[a] + wbb * u[b]) / (wa + wbb) / prm.wb[c];
-        x[c * HW + i] = v[c] + m[c] * (std::max(v[c], rec) - v[c]);
-      }
-      // Colour from the rim, brightness from the reconstruction: where neighbouring pixels clip in
-      // different channels (perforated metal near Nyquist, 133623) each was rebuilt from another
-      // channel -> colour speckle. Keep the rebuilt level U (mean implied level), rim colour, by the
-      // largest clipped share.
-      const float mm = std::max(m[0], std::max(m[1], m[2]));
-      if (mm > 0.0f) {
-        float U = 0.0f;
-        for (int c = 0; c < 3; ++c) U += x[c * HW + i] * prm.wb[c] / prm.hl_ratio[c];
-        U *= 1.0f / 3.0f;
-        for (int c = 0; c < 3; ++c) x[c * HW + i] += mm * (U * prm.hl_ratio[c] / prm.wb[c] - x[c * HW + i]);
-      }
-    }
-  }
-  if (prm.highlight_desat) {
+  const bool hl_rec = prm.highlight_desat && prm.highlight_recovery && !hl_rec_off && !std::getenv("LKRL_HL_OLD");
+  if (hl_rec) HighlightRecover(x, H, W, prm.wb.data(), prm.clip, prm.hl_ratio);
+  if (prm.highlight_desat && !hl_rec) {
     static const bool hl_old = std::getenv("LKRL_HL_OLD") != nullptr;
     const float lo = (hl_old ? 0.92f : 0.85f) * prm.clip, hi = prm.clip;
     // HDR (prm.clip > 1, reference units): the output white is the HDR clip, not 1, so white is capped
@@ -314,28 +389,15 @@ void FinishLook(const float* z, float* x, int H, int W, const SolveParams& prm, 
     // clip read 0.88 of the reachable level). Normal merges (clip <= 1) are unchanged.
     const float wmin = std::min(prm.wb[0], std::min(prm.wb[1], prm.wb[2])) * std::max(1.0f, prm.clip);
     for (size_t i = 0; i < HW; ++i) {
-      // With reconstruction: white only where every channel clipped (min channel); else the old rules.
-      float d[3] = {x[i], x[HW + i], x[2 * HW + i]};
-      if (hl_rec && std::max(d[0], std::max(d[1], d[2])) > 0.85f * prm.clip)
-        for (int c = 0; c < 3; ++c) d[c] = std::max(d[c], xd[c * HW + i]);
-      const float v = (hl_old || hl_rec) ? std::min(d[0], std::min(d[1], d[2]))
-                                         : std::max(x[i], std::max(x[HW + i], x[2 * HW + i]));
+      const float v = hl_old ? std::min({x[i], x[HW + i], x[2 * HW + i]})
+                             : std::max({x[i], x[HW + i], x[2 * HW + i]});
       float m = std::clamp((v - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f);
       if (!hl_old) m = m * m * (3.0f - 2.0f * m);
       if (m <= 0.0f) continue;
       float L = q[0] * x[i] + q[1] * x[HW + i] + q[2] * x[2 * HW + i];   // wb-space luma
       // The output is stored clamped to [0, 1] per camera channel (16-bit DNG): a neutral brighter than
       // min(wb) would get its least-gained channel (G) cut back and turn pink again, so white is capped there.
-      if (!hl_old && !hl_rec) L = std::min(L, wmin);
-      if (hl_rec) {
-        // Every channel clipped: the scene is at least as bright as the most-gained channel implies
-        // (max over c of v_c wb_c / col_c), the level the reconstructed surroundings reach; at the clip
-        // level it read as dark specks inside cloud cores. Rim colour, as the reconstruction.
-        float U = 0.0f;
-        for (int c = 0; c < 3; ++c) U = std::max(U, d[c] * prm.wb[c] / prm.hl_ratio[c]);
-        for (int c = 0; c < 3; ++c) x[c * HW + i] += m * (U * prm.hl_ratio[c] / prm.wb[c] - x[c * HW + i]);
-        continue;
-      }
+      if (!hl_old) L = std::min(L, wmin);
       for (int c = 0; c < 3; ++c) {
         const float neutral = L / prm.wb[c];
         x[c * HW + i] += m * (neutral - x[c * HW + i]);

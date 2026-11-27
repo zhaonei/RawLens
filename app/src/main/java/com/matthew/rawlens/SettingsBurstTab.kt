@@ -4,6 +4,7 @@
 package com.matthew.rawlens
 
 import com.matthew.rawlens.MainActivity.Companion.KEY_ZSL_HYBRID_TOPUP
+import com.matthew.rawlens.MainActivity.Companion.KEY_ZSL_REACTION_LATENCY_MS
 
 import com.matthew.rawlens.MainActivity.Companion.MAX_RAW_ZSL_FRAMES
 
@@ -55,18 +56,18 @@ import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
-import com.particlesdevs.photoncamera.processing.ml.RawNindNcnnProcessor
 import java.io.File
 import java.util.Locale
 import android.os.Build
 import android.os.SystemClock
+
+private const val LATENCY_STEP_MS = 10
 
 /** Settings → Burst. Moved verbatim from MainActivity.showSettings (showBurstTab). */
 internal fun MainActivity.showBurstSettings(p: SettingsPage) {
     val content = p.content
     fun sectionTitle(text: String): TextView = p.kit.sectionTitle(text)
     fun sectionDesc(text: String): TextView = p.kit.sectionDesc(text)
-    fun settingsButton(label: String, active: Boolean = false): Button = p.kit.settingsButton(label, active)
     fun settingsCheck(label: String, checked: Boolean): SettingsSwitch = p.kit.settingsCheck(label, checked)
     fun polish() = p.kit.polish()
     fun markActive(active: Button) = p.markActive(active)
@@ -77,11 +78,9 @@ internal fun MainActivity.showBurstSettings(p: SettingsPage) {
             "Staged IMG_<ts>_BURST.craw takes merge here later via MFSR, LK-R or HDR+, " +
                 "to DNG, JPEG, or both. RAW Video never lists."
         ))
-        content.addView(settingsButton("Open merges").apply {
-            setOnClickListener { openMerges() }
-        })
+        content.addView(p.kit.navRow("Merges", "Develop saved bursts") { openMerges() })
         content.addView(SettingsSwitch(this).apply {
-            text = "Save ZSL bursts to .craw for offline merge"
+            text = "Save bursts for later merging"
             setTextColor(getColor(R.color.text_primary))
             isChecked = burstCrawEnabled
             setOnCheckedChangeListener { _, enabled ->
@@ -143,7 +142,7 @@ internal fun MainActivity.showBurstSettings(p: SettingsPage) {
             })
         })
         var hybridTopup = lensPreferences().getBoolean(KEY_ZSL_HYBRID_TOPUP, true)
-        content.addView(settingsCheck("Top-up: complete a thin ring with fresh frames", hybridTopup).apply {
+        content.addView(settingsCheck("Top up with fresh frames", hybridTopup).apply {
             setOnCheckedChangeListener { _, enabled ->
                 hybridTopup = enabled
                 lensPreferences().edit().putBoolean(KEY_ZSL_HYBRID_TOPUP, hybridTopup).apply()
@@ -151,6 +150,39 @@ internal fun MainActivity.showBurstSettings(p: SettingsPage) {
                 setStatus(if (hybridTopup) "ZSL TOP-UP ON" else "ZSL TOP-UP OFF")
             }
         })
+        content.addView(sectionDesc("Top-up adds fresh frames when the zero shutter lag buffer has too few."))
+        var latencyMs = lensPreferences().getInt(KEY_ZSL_REACTION_LATENCY_MS, 0)
+            .coerceIn(0, ZslPolicy.MAX_REACTION_LATENCY_MS)
+        fun latencyText() = "Reaction latency compensation: " + if (latencyMs == 0) "off" else "$latencyMs ms"
+        val latencyLabel = TextView(this).apply {
+            text = latencyText()
+            setTextColor(getColor(R.color.text_primary))
+            textSize = 14f
+            setPadding(dp(12), dp(8), dp(12), 0)
+        }
+        content.addView(latencyLabel)
+        content.addView(SettingsSlider(this).apply {
+            max = ZslPolicy.MAX_REACTION_LATENCY_MS / LATENCY_STEP_MS
+            progress = latencyMs / LATENCY_STEP_MS
+            setOnSettingsSliderChangeListener(object : SettingsSlider.OnSettingsSliderChangeListener {
+                override fun onProgressChanged(seekBar: SettingsSlider, progress: Int, fromUser: Boolean) {
+                    latencyMs = progress * LATENCY_STEP_MS
+                    latencyLabel.text = latencyText()
+                }
+
+                override fun onStartTrackingTouch(seekBar: SettingsSlider) = Unit
+
+                override fun onStopTrackingTouch(seekBar: SettingsSlider) {
+                    lensPreferences().edit().putInt(KEY_ZSL_REACTION_LATENCY_MS, latencyMs).apply()
+                    controller.setZslReactionLatencyMs(latencyMs)
+                    setStatus(if (latencyMs == 0) "REACTION LATENCY OFF" else "REACTION LATENCY -$latencyMs MS")
+                }
+            })
+        })
+        content.addView(sectionDesc(
+            "ZSL uses frames from this long before the shutter press, to make up for your reaction time. " +
+                "Each 100 ms keeps about 3 more RAW frames in memory. Saved _BURST.craw takes still hold the whole buffer."
+        ))
         rawZslSettingsStatus = TextView(this).apply {
             text = rawZslSettingsText(rawZslStatus)
             setTextColor(getColor(R.color.text_secondary))
@@ -164,10 +196,11 @@ internal fun MainActivity.showBurstSettings(p: SettingsPage) {
             textSize = 12f
         }.also(content::addView)
         content.addView(Button(this).apply {
-            text = "Save sidecars next to DNGs (choose photo folder)"
+            text = "Choose photo folder"
             setOnClickListener { pickSidecarFolder() }
         })
         content.addView(TextView(this).apply {
+            tag = "settings-description"
             text = "Android forbids text sidecars under DCIM via MediaStore. " +
                 "RawLens asks for the photo folder on first install; choose " +
                 "DCIM/RawLens so burst.json + gyro/ land in " +
@@ -180,4 +213,5 @@ internal fun MainActivity.showBurstSettings(p: SettingsPage) {
         })
         markActive(burstTab)
         polish()
+        p.kit.collapseSection("Burst gyro sidecars", "Burst gyro sidecars", "Gyro data saved beside bursts")
 }

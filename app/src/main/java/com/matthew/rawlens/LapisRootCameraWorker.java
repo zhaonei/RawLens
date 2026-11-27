@@ -48,6 +48,16 @@ public final class LapisRootCameraWorker {
     private static int owner;
     private static String apkPath, nativeDir;
     private static final JSONObject report = new JSONObject();
+    private static long startupStarted;
+    private static final Method PROPERTY_GET = propertyMethod("get", String.class);
+    private static final Method PROPERTY_SET = propertyMethod("set", String.class, String.class);
+    private static Method propertyMethod(String name, Class<?>... parameters) {
+        try { return Class.forName("android.os.SystemProperties").getMethod(name, parameters); }
+        catch (Exception failure) { throw new ExceptionInInitializerError(failure); }
+    }
+    private static void startupStage(String name) throws Exception {
+        report.put(name, SystemClock.elapsedRealtime()-startupStarted);
+    }
 
     public static void main(String[] args) throws Exception {
         if (args.length != 11 || android.os.Process.myUid() != 0) throw new SecurityException("Root capture requires root");
@@ -76,6 +86,7 @@ public final class LapisRootCameraWorker {
     }
 
     private static void run(String[] args) throws Exception {
+        startupStarted=SystemClock.elapsedRealtime();
         if (!LapisRootProfile.INSTANCE.supported()) throw new IOException("Untested device or firmware");
         boolean live = args[0].startsWith("session-");
         String mode = live ? args[0].substring(8) : args[0];
@@ -131,6 +142,7 @@ public final class LapisRootCameraWorker {
                 !hash(new File(SMH_CUSTOM_LIB)).equals(LapisRootProfile.SMH_CUSTOM_SHA256))throw new IOException("Unexpected sensor-mode-helper libraries");
             String oldConfig=command("getprop",HDR_CONFIG).trim(),oldRuntime=command("getprop",HDR_RUNTIME).trim();
             if(!oldConfig.matches("-?[0-9]*")||!oldRuntime.matches("-?[0-9]*"))throw new IOException("Unknown existing HDR override");
+            startupStage("validatedMs");
             String token = UUID.randomUUID().toString();
             File patched = new File(job,"vendor-patch.so");
             File videoMetadata=new File(job,"video-metastore.so");
@@ -161,6 +173,7 @@ public final class LapisRootCameraWorker {
                 hexaRestore+="test \"$(sha256sum '"+RES_LIB+"' | cut -d ' ' -f 1)\" = '"+RES_SHA256+"' || exit 1\n";
                 for(File f:hexaPatched)hexaRestore+="rm -f "+shellQuote(f.getPath())+"\n";
             }
+            startupStage("patchPreparedMs");
             String selectedLib=dcg?CORE_LIB:LIB;
             String cropRestore="";
             if(crop4)for(String lib:new String[]{SMH_LIB,SMH_CUSTOM_LIB,"/vendor/lib64/libcam.sensor_mode_helper.so","/vendor/lib64/libcam.sensor_mode_helper_custom.so"})
@@ -218,12 +231,9 @@ public final class LapisRootCameraWorker {
                 command("setprop",PROP,full?"12":raw60?"4":dsg2?"13":dcg?"9":crop4?"8":hexa?"11":"7");
                 // A handed-off 50 MP session left stale stream tables in cameraserver.
                 boolean cameraserver=full||hexa||video||CAMERASERVER_PENDING.exists();
-                if (live) restartAndAwait(cameraserver);
-                else {
-                    command("setprop","ctl.restart","camerahalserver");
-                    if (cameraserver) command("setprop","ctl.restart","cameraserver");
-                    Thread.sleep(7000);
-                }
+                startupStage("overridesAppliedMs");
+                restartAndAwait(cameraserver);
+                if (!live) awaitCameraMetadata();
                 Files.deleteIfExists(CAMERASERVER_PENDING.toPath());
                 float focus=Float.parseFloat(args[10]);
                 if(!Float.isFinite(focus)||focus<0||focus>20)throw new IOException("Invalid focus distance");
@@ -282,6 +292,30 @@ public final class LapisRootCameraWorker {
             Thread.sleep(50);
         }
         report.put("halRestartMs",-1);
+    }
+    private static void awaitCameraMetadata() throws Exception {
+        long started=SystemClock.elapsedRealtime(),deadline=started+20000;
+        // Use the same root-process access route as captureHexadeca. The public
+        // characteristics call is affected by Xiaomi's desktop camera override.
+        Class<?> toggle=Class.forName("android.window.DesktopModeFlags$ToggleOverride");
+        Field cache=Class.forName("android.window.DesktopModeFlags").getDeclaredField("sCachedToggleOverride");
+        cache.setAccessible(true);
+        for(Object value:toggle.getEnumConstants())if(value.toString().equals("OVERRIDE_UNSET"))cache.set(null,value);
+        CameraManager manager=context.getSystemService(CameraManager.class);
+        Method chars=CameraManager.class.getDeclaredMethod("getCameraCharacteristics",String.class,int.class);
+        chars.setAccessible(true);
+        Exception last=null;
+        while(SystemClock.elapsedRealtime()<deadline) {
+            try {
+                CameraCharacteristics c=(CameraCharacteristics)chars.invoke(manager,"0",0);
+                if(c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!=null) {
+                    report.put("providerReadyMs",SystemClock.elapsedRealtime()-started);
+                    return;
+                }
+            } catch(Exception failure) { last=failure; }
+            Thread.sleep(100);
+        }
+        throw new IOException("Main camera metadata did not return after sensor setup",last);
     }
     private static String servicePid(String service)throws Exception{return command("getprop","init.svc_debug_pid."+service).trim();}
     private static boolean restarted(String service,String previous)throws Exception {
@@ -342,6 +376,8 @@ public final class LapisRootCameraWorker {
 
     private static void liveSession(boolean full,boolean dcg,boolean crop4,boolean dsg2,boolean raw60)throws Exception {
         JSONObject ready=new JSONObject().put("mode",full?"50mp":raw60?"video60":dsg2?"2xdsg14":dcg?"dcg14":crop4?"4x":"2x").put("state","ready");
+        startupStage("startupMs");
+        ready.put("startupMs",report.getLong("startupMs"));
         ownedJson(new File(job,"ready.json"),ready);
         long lastHeartbeat=SystemClock.elapsedRealtime()/1000;
         int expected=full?0x100c300e:raw60?0x1004300e:dsg2?0x100d301a:dcg?0x1009301a:crop4?0x1008301a:0x1007301a,width=full?8160:4080,height=full?6120:(dsg2||raw60)?2304:3060;
@@ -357,7 +393,7 @@ public final class LapisRootCameraWorker {
                     .put("width",width).put("height",height).put("driverCode",active==null?0:active[2]));
                 verified=match;
             }
-            Thread.sleep(200);
+            Thread.sleep(verified?200:50);
         }
         report.put("mode",full?"50mp":raw60?"video60":dsg2?"2xdsg14":dcg?"dcg14":crop4?"4x":"2x").put("session",true);
     }
@@ -478,8 +514,8 @@ public final class LapisRootCameraWorker {
     private static String sha256(byte[] bytes)throws Exception{StringBuilder out=new StringBuilder();for(byte b:MessageDigest.getInstance("SHA-256").digest(bytes))out.append(String.format(Locale.ROOT,"%02x",b&255));return out.toString();}
 
     /**
-     * 200 MP (16320x12240, 4x4-block CFA) readout, converted on-device (version 2: Vulkan
-     * residual-interpolation demosaic + 2x2 downsample) to a 50 MP LinearRaw DNG. Recipe matches the validated 2026-11-14 probe:
+     * 200 MP (16320x12240, 4x4-block CFA) readout, converted with rawr
+     * 2x2 same-colour sums + Quad Detail remosaic to a 50 MP Bayer CFA DNG. Recipe matches the validated 2026-11-14 probe:
      * VIDEO_RECORD template, repeating 5 fps, force mode 11, scenario 3, cell-full sensor.
      */
     /** Captured 200 MP frame, copied out of the camera buffer, converted after the camera is restored. */
@@ -542,13 +578,13 @@ public final class LapisRootCameraWorker {
             double green=(gains[1]+gains[2])/2.0;
             set.invoke(nativeResult,CaptureResult.SENSOR_NEUTRAL_COLOR_POINT,new Rational[]{rational(green/gains[0]),new Rational(1,1),rational(green/gains[3])});
             set.invoke(nativeResult,CaptureResult.SCALER_CROP_REGION,new Rect(0,0,outWidth,outHeight));
-            set.invoke(nativeResult,CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP,null);
             set.invoke(nativeResult,CaptureResult.STATISTICS_HOT_PIXEL_MAP,null);
             set.invoke(nativeResult,CaptureResult.SENSOR_NOISE_PROFILE,null);
             HexaPending pending=new HexaPending();
             pending.metadata=LapisHexaDng.metadata(image,corrected,result,orientation);
+            LapisHexaDng.recordShading(report,pending.metadata);
             // Copy the 400 MB frame to a private file-backed mapping (native memory), so the camera and
-            // the sensor mode can be released before the slow GPU conversion.
+            // the sensor mode can be released before CFA reduction and remosaic.
             pending.rawFile=new File(job,"raw200.tmp");
             try(RandomAccessFile io=new RandomAccessFile(pending.rawFile,"rw")) {
                 long bytes=(long)width*height*2;io.setLength(bytes);
@@ -563,57 +599,51 @@ public final class LapisRootCameraWorker {
             if(session!=null)session.close();if(reader!=null)reader.close();if(device!=null)device.close();thread.quitSafely();
         }
     }
-    /** Version 2: per-frame tiled gains + 4x4-aware residual-interpolation demosaic on Vulkan,
-     * 2x2 area downsample -> 50 MP linear camera RGB (LinearRaw DNG, no second demosaic). */
+    /** rawr reduced RAW: optional phase fit, same-colour sums, Quad Detail remosaic.
+     * CFA remains Bayer; source DN scale is multiplied by four by summation. */
     private static void finishHexadeca(HexaPending pending)throws Exception {
         final int width=16320,height=12240,outWidth=8160,outHeight=6120;
-        byte[] filterSpv,pointSpv,boxSpv;
-        try(ZipFile zip=new ZipFile(apkPath)) {
-            try(InputStream in=zip.getInputStream(zip.getEntry("assets/shaders/hexa/hexa_filter.spv"))){filterSpv=readAll(in);}
-            try(InputStream in=zip.getInputStream(zip.getEntry("assets/shaders/hexa/hexa_point.spv"))){pointSpv=readAll(in);}
-            try(InputStream in=zip.getInputStream(zip.getEntry("assets/shaders/hexa/hexa_box.spv"))){boxSpv=readAll(in);}
-        }
-        File rgbFile=new File(job,"rgb16.tmp");
+        final boolean phaseFit=new File(job,"phase-fit-request").isFile();
+        File bayerFile=new File(job,"bayer50.tmp");
         try {
-            ByteBuffer raw,rgb;
+            ByteBuffer raw,bayer;
             try(RandomAccessFile io=new RandomAccessFile(pending.rawFile,"r")) {
                 raw=io.getChannel().map(FileChannel.MapMode.READ_ONLY,0,(long)width*height*2);
             }
-            // 300 MB: outside the 256 MB ART heap (allocateDirect counts against it).
-            try(RandomAccessFile io=new RandomAccessFile(rgbFile,"rw")) {
-                long bytes=(long)outWidth*outHeight*3*2;io.setLength(bytes);
-                rgb=io.getChannel().map(FileChannel.MapMode.READ_WRITE,0,bytes).order(ByteOrder.LITTLE_ENDIAN);
+            try(RandomAccessFile io=new RandomAccessFile(bayerFile,"rw")) {
+                long bytes=(long)outWidth*outHeight*2;io.setLength(bytes);
+                bayer=io.getChannel().map(FileChannel.MapMode.READ_WRITE,0,bytes).order(ByteOrder.LITTLE_ENDIAN);
             }
-            double[] timing=LapisRootCameraNative.hexaV2(raw,width*2,width,height,pending.black,1023f,rgb,filterSpv,pointSpv,boxSpv);
+            double conversionMs=LapisRootCameraNative.hexaReduced(raw,width,height,pending.black,bayer,phaseFit);
             loadDngWriter();
             File dng=new File(job,"capture.dng");
             long writeStart=SystemClock.elapsedRealtime();
-            LapisHexaDng.write(dng,rgb,outWidth,outHeight,pending.metadata,pending.timestamp,
-                String.format(Locale.ROOT,"200 MP 16320x12240 4x4 GBRG readout; tiled per-frame gains; residual-interpolation demosaic (Vulkan, %d tiles, %.0f ms); 2x2 area downsample",(int)timing[3],timing[2]));
+            LapisHexaDng.write(dng,bayer,outWidth,outHeight,pending.metadata,pending.timestamp,pending.black,phaseFit);
             long writeMs=SystemClock.elapsedRealtime()-writeStart;
             if(new File(job,"develop-request").isFile()) {
                 File metadataFile=new File(job,"develop-metadata.json");
-                LapisHexaDng.writeDevelopMetadata(metadataFile,pending.metadata,outWidth,outHeight);
+                LapisHexaDng.writeDevelopMetadata(metadataFile,pending.metadata,outWidth,outHeight,pending.black);
                 android.system.Os.chown(metadataFile.getPath(),owner,owner);
-                File retained=new File(job,"develop-rgb16.bin");
-                Files.move(rgbFile.toPath(),retained.toPath());
+                File retained=new File(job,"develop-bayer16.bin");
+                Files.move(bayerFile.toPath(),retained.toPath());
                 android.system.Os.chown(retained.getPath(),owner,owner);
             }
             android.system.Os.chown(dng.getPath(),owner,owner);
             report.put("mode","200mp").put("width",outWidth).put("height",outHeight).put("sourceWidth",width).put("sourceHeight",height)
-                .put("driverCode",pending.driverCode).put("cfa","GBRG").put("sourceBlock",4).put("whiteLevel",1023).put("blackLevel",pending.black)
+                .put("driverCode",pending.driverCode).put("cfa","GBRG").put("sourceBlock",4).put("whiteLevel",4092).put("blackLevel",pending.black*4)
                 .put("sourceBusBits",10).put("deliveredBits",10).put("precision14Verified",false)
-                .put("remosaic",LapisHexaDng.ALGORITHM).put("linearRaw",true).put("gainsMs",timing[0]).put("gpuMs",timing[1])
-                .put("conversionMs",timing[2]).put("tiles",(int)timing[3]).put("dngWriteMs",writeMs)
+                .put("remosaic",LapisHexaDng.ALGORITHM).put("linearRaw",false).put("phaseFit",phaseFit).put("backend","upstream-cpu-reference")
+                .put("conversionMs",conversionMs).put("dngWriteMs",writeMs)
                 .put("iso",pending.iso).put("exposureNanos",pending.exposure)
                 .put("timestampNanos",pending.timestamp).put("dngBytes",dng.length());
         } finally {
-            Files.deleteIfExists(rgbFile.toPath());Files.deleteIfExists(pending.rawFile.toPath());
+            Files.deleteIfExists(bayerFile.toPath());Files.deleteIfExists(pending.rawFile.toPath());
         }
     }
 
     private static void hexaSettings(CaptureRequest.Builder b,int iso,long exposure,float[] gains,float focus) {
         settings(b,iso,exposure,gains);
+        b.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON);
         b.set(CaptureRequest.CONTROL_CAPTURE_INTENT,CaptureRequest.CONTROL_CAPTURE_INTENT_VIDEO_RECORD);
         b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,new android.util.Range<>(5,5));
         b.set(CaptureRequest.SENSOR_FRAME_DURATION,Math.max(200_000_000L,exposure+1_000_000L));
@@ -701,6 +731,10 @@ public final class LapisRootCameraWorker {
     private static long tiffLong(RandomAccessFile io,boolean little)throws IOException{int n=io.readInt();return (little?Integer.reverseBytes(n):n)&0xffffffffL;}
     private static <T>T await(CompletableFuture<T> value)throws Exception{return value.get(15,TimeUnit.SECONDS);}
     private static String command(String... args)throws Exception {
+        // Same property service and SELinux caller, without spawning a process for
+        // every readiness poll or property snapshot. Keep all state/hash checks.
+        if(args.length==2 && args[0].equals("getprop"))return (String)PROPERTY_GET.invoke(null,args[1]);
+        if(args.length==3 && args[0].equals("setprop")) { PROPERTY_SET.invoke(null,args[1],args[2]);return ""; }
         java.lang.Process p=new ProcessBuilder(args).redirectErrorStream(true).start();String out=new String(readAll(p.getInputStream()),java.nio.charset.StandardCharsets.UTF_8);
         if(p.waitFor()!=0)throw new IOException(args[0]+": "+out.trim());return out;
     }

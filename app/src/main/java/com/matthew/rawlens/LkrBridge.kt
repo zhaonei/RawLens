@@ -101,6 +101,12 @@ internal object LkrBridge {
      *  NNAPI; no NPU: Vulkan fallback). */
     @JvmStatic external fun nativeSetPrior(enabled: Boolean)
 
+    /** Select the NPU denoiser for the next merge on this thread. */
+    @JvmStatic external fun nativeSetNpuDenoise(enabled: Boolean, noPrior: Boolean)
+
+    /** Local-colour highlight recovery for the NEXT merge on this thread (true = default). */
+    @JvmStatic external fun nativeSetHighlightRecovery(enabled: Boolean)
+
     /** A usable NPU for the network (MDLA / Hexagon through NNAPI, every op on that one device). */
     @JvmStatic external fun nativeHasNpu(): Boolean
 
@@ -110,7 +116,7 @@ internal object LkrBridge {
     @JvmStatic external fun nativePrewarm(dir: String): Long
 
     /**
-     * Learned per-device noise model (WaveletDenoiser store file, [iso]) for the next
+     * Learned per-device noise model (RawNoiseModel store file, [iso]) for the next
      * [nativeMerge] / [nativeMergeStaged] on the calling thread: it refines the burst's
      * own noise fit as in HDR+. Null path = burst fit only. Consumed by that merge.
      */

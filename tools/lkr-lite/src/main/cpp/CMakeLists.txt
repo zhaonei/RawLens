@@ -21,7 +21,7 @@ else()
 endif()
 set(LKRL_GEN "${CMAKE_CURRENT_BINARY_DIR}/lkrl_gen")
 file(MAKE_DIRECTORY "${LKRL_GEN}")
-set(LKRL_SHADERS resid werr wavg wminh wminv adj zupd jac jacblk solveblk gstats wguide wvalid lkfit hyb adj_wg fin edgeshift cdupd le_tensor le_blur le_apply dln_apply axn_apply gcf_apply canc_apply rcd_start prior_conv)
+set(LKRL_SHADERS resid werr wavg wminh wminv adj nes ne_apply ne_zupd zupd jac jacblk upfine rescue_e rescue_apply solveblk local_search gstats wguide wvalid lkfit hyb adj_wg fin edgeshift cdupd cdrow le_tensor le_blur le_apply dln_apply axn_apply gcf_apply canc_apply rcd_start prior_conv)
 set(LKRL_INCS "")
 foreach(sh ${LKRL_SHADERS})
   add_custom_command(
@@ -41,6 +41,18 @@ foreach(sc 1 2)
       DEPENDS "${LKRL_DIR}/shaders/adj.comp" "${LKRL_DIR}/shaders/lite_common.glsl"
       VERBATIM)
   list(APPEND LKRL_INCS "${LKRL_GEN}/adj_s${sc}.inc")
+endforeach()
+# Catmull-Rom forward model experiment (LKRL_CUBIC).
+foreach(sh adj_cubic jac jacblk lkr/resid)
+  string(REPLACE "/" "_" _o "${sh}")
+  string(REPLACE "adj_cubic" "adj" _o "${_o}")
+  add_custom_command(
+      OUTPUT "${LKRL_GEN}/${_o}_cubic.inc"
+      COMMAND "${LKRL_GLSLC}" --target-env=vulkan1.1 -fshader-stage=compute -O -mfmt=num -DCUBIC
+              -I "${LKRL_DIR}/shaders" -I "${LKRL_DIR}/shaders/lkr" -o "${LKRL_GEN}/${_o}_cubic.inc" "${LKRL_DIR}/shaders/${sh}.comp"
+      DEPENDS "${LKRL_DIR}/shaders/${sh}.comp" "${LKRL_DIR}/shaders/cubic.glsl" "${LKRL_DIR}/shaders/lite_common.glsl"
+              "${LKRL_DIR}/shaders/lkr/lkr_common.glsl" VERBATIM)
+  list(APPEND LKRL_INCS "${LKRL_GEN}/${_o}_cubic.inc")
 endforeach()
 # LK-R's weight shaders, verbatim copies in shaders/lkr (own include dir: lkr_common.glsl).
 foreach(sh resid weight_tdet weight_th weight_t weight_tv weight_td weight_guide weight_minh weight_min dct_x_y dct_x_u dct_x_v dct_yuv dct_xo_y dct_xo_u dct_xo_v)
@@ -65,7 +77,7 @@ if(NOT ANDROID)
   find_path(LKRL_VULKAN_INCLUDE vulkan/vulkan.h HINTS /opt/homebrew/include /usr/local/include REQUIRED)
 endif()
 
-add_library(lkrl_core STATIC lkrl_gpu.cpp lkrl_solver.cpp lkrl_host.cpp lkrl_mhc.cpp lkrl_image.cpp lkrl_finish.cpp lkrl_adapter.cpp lkrl_full.cpp lkrl_lfc.cpp lkrl_blocksearch.cpp lkrl_gpulk.cpp lkrl_prior.cpp)
+add_library(lkrl_core STATIC lkrl_gpu.cpp lkrl_solver.cpp lkrl_host.cpp lkrl_mhc.cpp lkrl_image.cpp lkrl_finish.cpp lkrl_adapter.cpp lkrl_full.cpp lkrl_lfc.cpp lkrl_blocksearch.cpp lkrl_patchseed.cpp lkrl_gpulk.cpp lkrl_prior.cpp)
 add_dependencies(lkrl_core lkrl_shaders)
 target_include_directories(lkrl_core PUBLIC "${LKRL_DIR}" "${SRP_DIR}" "${LKRL_GEN}" ${LKRL_VULKAN_INCLUDE})
 target_compile_features(lkrl_core PUBLIC cxx_std_17)
@@ -76,6 +88,11 @@ if(ANDROID)
   file(READ "${LKRL_PRIOR_MODEL}" LKRL_PRIOR_HEX HEX)
   string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," LKRL_PRIOR_BYTES "${LKRL_PRIOR_HEX}")
   file(WRITE "${LKRL_GEN}/lkrl_prior_model.h" "static const unsigned char lkrl_prior_model[] = {${LKRL_PRIOR_BYTES}};\n")
+  set(LKRL_DENOISER_MODEL "${LKRL_DIR}/../resources/prior/denoiser.bin")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${LKRL_DENOISER_MODEL}")
+  file(READ "${LKRL_DENOISER_MODEL}" LKRL_DENOISER_HEX HEX)
+  string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," LKRL_DENOISER_BYTES "${LKRL_DENOISER_HEX}")
+  file(APPEND "${LKRL_GEN}/lkrl_prior_model.h" "static const unsigned char lkrl_denoiser_model[] = {${LKRL_DENOISER_BYTES}};\n")
   # Slimmer network for the Vulkan fallback (no NPU)
   set(LKRL_PRIOR_FB_MODEL "${LKRL_DIR}/../resources/prior/prior_fb.bin")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${LKRL_PRIOR_FB_MODEL}")
@@ -88,7 +105,8 @@ if(ANDROID)
   endif()
   target_link_libraries(lkrl_core PUBLIC neuralnetworks)
 endif()
-target_compile_definitions(lkrl_core PRIVATE LKRL_PRIOR_DEFAULT_BIN="${LKRL_DIR}/../resources/prior/prior_v2.bin"
+target_compile_definitions(lkrl_core PRIVATE LKRL_DENOISER_DEFAULT_BIN="${LKRL_DIR}/../resources/prior/denoiser.bin"
+                           LKRL_PRIOR_DEFAULT_BIN="${LKRL_DIR}/../resources/prior/prior_v2.bin"
                            LKRL_PRIOR_FB_DEFAULT_BIN="${LKRL_DIR}/../resources/prior/prior_fb.bin")
 target_compile_options(lkrl_core PRIVATE -Wall -Wextra -Werror=return-type -O3 -ffp-contract=off -fno-fast-math)
 set_target_properties(lkrl_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -109,6 +127,13 @@ if(NOT ANDROID)
   target_link_libraries(lkrl_run PRIVATE lkrl_core)
   add_executable(lkrl_full_run "${LKRL_DIR}/../../../host/lkrl_full_run.cpp")
   target_link_libraries(lkrl_full_run PRIVATE lkrl_core)
+  option(LKRL_TORCH_PRIOR "Enable TorchScript prior experiments in the Lite CLI" OFF)
+  if(LKRL_TORCH_PRIOR)
+    find_package(Torch REQUIRED)
+    target_sources(lkrl_full_run PRIVATE "${LKRL_DIR}/../../../host/torch_prior.cpp")
+    target_link_libraries(lkrl_full_run PRIVATE "${TORCH_LIBRARIES}")
+    target_compile_definitions(lkrl_full_run PRIVATE LKRL_TORCH_PRIOR)
+  endif()
 endif()
 
 # ---- Android JNI (replaces tools/lkr-pipeline in the app, 2026-11-14) -----------------------
@@ -117,7 +142,7 @@ endif()
 if(ANDROID)
   add_library(lkrpipeline SHARED lkrl_jni.cpp)
   # Learned per-device noise model (header-only, shared with the wavelet stage and HDR+).
-  target_include_directories(lkrpipeline PRIVATE "${LKRL_DIR}/../../../../../app/src/main/cpp/wavelet")
+  target_include_directories(lkrpipeline PRIVATE "${LKRL_DIR}/../../../../../app/src/main/cpp/noise")
   target_compile_options(lkrpipeline PRIVATE -O3 -Wall -fno-rtti)
   find_library(LKRL_LOG_LIB log REQUIRED)
   target_link_libraries(lkrpipeline PRIVATE lkrl_core android ${LKRL_LOG_LIB})

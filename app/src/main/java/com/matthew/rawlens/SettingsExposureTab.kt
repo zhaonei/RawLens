@@ -60,7 +60,6 @@ import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
-import com.particlesdevs.photoncamera.processing.ml.RawNindNcnnProcessor
 import java.io.File
 import java.util.Locale
 import android.os.Build
@@ -69,7 +68,6 @@ import android.os.SystemClock
 /** Settings → Exposure. Moved verbatim from MainActivity.showSettings (showExposureTab). */
 internal fun MainActivity.showExposureSettings(p: SettingsPage) {
     val content = p.content
-    content.addView(p.kit.sectionDesc(FlashStillPolicy.AUTO_UNAVAILABLE_NOTE))
     fun sectionTitle(text: String): TextView = p.kit.sectionTitle(text)
     fun sectionDesc(text: String): TextView = p.kit.sectionDesc(text)
     fun polish() = p.kit.polish()
@@ -78,8 +76,17 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
         rawZslSettingsStatus = null
         sidecarSettingsStatus = null
         content.removeAllViews()
-        content.addView(sectionTitle("PROGRAM custom AE"))
-        content.addView(sectionDesc("RAW-driven per-lens sensor ISO + shutter. Full per-lens editor (priority, locks, bounds, bias) mirrors the PROGRAM panel; ISO/S chips open it too."))
+        content.addView(sectionTitle("Manual exposure"))
+        content.addView(p.kit.settingsCheck("Extended shutter range",
+            controller.extendedManualShutterEnabled()).apply {
+            setOnCheckedChangeListener { _, checked ->
+                controller.setExtendedManualShutter(checked)
+                updateQuickControls()
+            }
+        })
+        content.addView(sectionDesc("Extends manual shutter times up to 30 seconds for this lens in Photo mode. Uses Camera2 without root. Exposure times above the advertised range depend on the phone; preview uses a shorter exposure while the saved still uses the selected shutter. Photo mode only; DCG/DSG keeps automatic exposure."))
+        content.addView(sectionTitle("Program AE"))
+        content.addView(sectionDesc(FlashStillPolicy.AUTO_UNAVAILABLE_NOTE))
         var dynamicSettings = dynamicExposureSettings()
         fun applyDynamicSettings() {
             lensPreferences().edit()
@@ -92,21 +99,13 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
             controller.setDynamicExposureSettings(dynamicSettings)
         }
         content.addView(SettingsSwitch(this).apply {
-            text = "PROGRAM custom AE (RAW-driven)"
+            text = "RAW-driven Program AE"
             setTextColor(getColor(R.color.text_primary))
             isChecked = dynamicSettings.enabled
             setOnCheckedChangeListener { _, enabled ->
                 dynamicSettings = dynamicSettings.copy(enabled = enabled)
                 applyDynamicSettings()
             }
-        })
-        content.addView(TextView(this).apply {
-            text = "PROGRAM custom AE is RAW-driven per-lens (sensor ISO + shutter). " +
-                "Hold ISO/SHUTTER chips to lock, tap for slider, Auto releases both. " +
-                "Cameras without manual sensor control keep using Android AE. " +
-                "Use ISO/S chips for the full editor; ETTR overrides PROGRAM when converged."
-            setTextColor(getColor(R.color.text_secondary))
-            textSize = 11f
         })
         if (!controller.hasManualSensorControl()) {
             content.addView(TextView(this).apply {
@@ -118,7 +117,19 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
         }
         var programSettings = programProfile()
         fun applyProgramSettings() = saveProgramProfile(programSettings)
-        val curveControls = android.widget.LinearLayout(this).apply { orientation = android.widget.LinearLayout.VERTICAL }
+        val curveControls = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        val curveToggle = Button(this).apply {
+            text = "Show brightness targets"
+            visibility = if (programSettings.brightnessTuning == ProgramBrightnessTuning.FIXED) View.GONE else View.VISIBLE
+            setOnClickListener {
+                val expanded = curveControls.visibility == View.VISIBLE
+                curveControls.visibility = if (expanded) View.GONE else View.VISIBLE
+                text = if (expanded) "Show brightness targets" else "Hide brightness targets"
+            }
+        }
         content.addView(Button(this).apply {
             fun refresh() { text = "Scene brightness: ${programSettings.brightnessTuning.label}" }
             refresh()
@@ -127,14 +138,15 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
                     programSettings.brightnessTuning, { it.label }) { mode ->
                     programSettings = programSettings.copy(brightnessTuning = mode)
                     applyProgramSettings()
-                    curveControls.visibility = if (programSettings.brightnessTuning == ProgramBrightnessTuning.FIXED) View.GONE else View.VISIBLE
+                    curveControls.visibility = View.GONE
+                    curveToggle.text = "Show brightness targets"
+                    curveToggle.visibility = if (mode == ProgramBrightnessTuning.FIXED) View.GONE else View.VISIBLE
                     refresh()
                 }
             }
         })
-        content.addView(sectionDesc("Natural preserves darker scenes by adapting the exposure target to scene brightness. Fixed uses the same target in every scene. Protect highlights also limits bright areas. Adaptive curves are experimental. Saved per lens."))
+        content.addView(curveToggle)
         content.addView(curveControls)
-        curveControls.visibility = if (programSettings.brightnessTuning == ProgramBrightnessTuning.FIXED) View.GONE else View.VISIBLE
         curveControls.addView(sectionDesc("Exposure targets as a percentage of linear RAW brightness. Lower values keep the scene darker; higher values increase sensor exposure. Bias applies on top. The curve blends smoothly between these four scene levels."))
         val targetSliders = mutableListOf<SettingsSlider>()
         val targetNames = listOf("Dark scene", "Dim scene", "Normal scene", "Bright scene")
@@ -319,10 +331,11 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
                 override fun onStopTrackingTouch(seekBar: SettingsSlider) = applyProgramSettings()
             })
         })
+        content.addView(sectionTitle("ETTR"))
         var ettr = ettrSettings()
         fun applyEttr() = saveEttrSettings(ettr)
         content.addView(SettingsSwitch(this).apply {
-            text = "ETTR single exposure (RAW-measured)"
+            text = "RAW-measured single exposure"
             setTextColor(getColor(R.color.text_primary))
             isChecked = ettr.enabled
             setOnCheckedChangeListener { _, enabled ->
@@ -331,6 +344,7 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
             }
         })
         content.addView(TextView(this).apply {
+            tag = "settings-description"
             text = "When the gain ceiling binds, ETTR keeps the hand-motion " +
                 "shutter cap and accepts a darker frame instead of trading noise for blur."
             setTextColor(getColor(R.color.text_secondary))
@@ -358,9 +372,9 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
         refreshEttrButtons()
         content.addView(ettrHeadroomButton)
         content.addView(ettrIsoLimitButton)
-        content.addView(sectionTitle("Two-exposure RAW HDR (experimental)"))
+        content.addView(sectionTitle("RAW HDR"))
         content.addView(SettingsSwitch(this).apply {
-            text = "Experimental two-exposure RAW HDR"
+            text = "Two-exposure capture"
             setTextColor(getColor(R.color.text_primary))
             isChecked = dualRawEnabled
             isEnabled = controller.supportsDualRaw() || dualRawEnabled
@@ -376,7 +390,8 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
             }
         })
         content.addView(TextView(this).apply {
-            text = "Available on any lens with manual RAW capture, or rooted Redmi DCG14 with AE always on. " +
+            tag = "settings-description"
+            text = "Experimental. Available on any lens with manual RAW capture, or rooted Redmi DCG14 with AE always on. " +
                 "DCG14 meters each exposure separately using AE compensation; ISO may differ. " +
                 "Saves a 16-bit DNG from two sequential exposures, " +
                 "using the short exposure to recover clipped highlights. " +
@@ -387,9 +402,9 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
             textSize = 11f
         })
         content.addView(sectionTitle("Exposure brackets"))
-        content.addView(sectionDesc("Brackets captures a 3-frame exposure bracket and saves every frame as its own DNG (IMG_<time>_F00/F01/F02). No merge."))
+        content.addView(sectionDesc("Brackets uses ±2 EV by default and ±4 EV with Wide bracket enabled. It captures 3 frames and saves every frame as its own DNG (IMG_<time>_F00/F01/F02). No merge."))
         content.addView(SettingsSwitch(this).apply {
-            text = "Bracket range: −4 / 0 / +4 EV"
+            text = "Wide bracket (±4 EV)"
             setTextColor(getColor(R.color.text_primary))
             isChecked = hdrBracketStops() == 4
             setOnCheckedChangeListener { _, enabled ->
@@ -400,7 +415,7 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
             }
         })
         content.addView(SettingsSwitch(this).apply {
-            text = "Debug: LK-R HDR bracket (up to 8 frames: 0 EV frames, 2 × −2, 1 × +1.5 EV)"
+            text = "LK-R test bracket"
             setTextColor(getColor(R.color.text_primary))
             isChecked = lkrHdrDebugBracket()
             setOnCheckedChangeListener { _, enabled ->
@@ -439,4 +454,7 @@ internal fun MainActivity.showExposureSettings(p: SettingsPage) {
         })
         markActive(exposureTab)
         polish()
+        p.kit.collapseSection("ETTR", "ETTR", "Expose to the right: headroom and limits")
+        p.kit.collapseSection("RAW HDR", "RAW HDR", "Two-exposure RAW HDR")
+        p.kit.collapseSection("Exposure brackets", "Exposure brackets", "Bracket spacing and merge")
 }

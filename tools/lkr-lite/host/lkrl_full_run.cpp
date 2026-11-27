@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,10 @@
 #include "lkrl_pack.h"
 #include "lkrl_tuning.h"
 #include "srp_dng.h"
+
+#ifdef LKRL_TORCH_PRIOR
+lkrl::PriorFactory LoadTorchPrior(const std::string& checkpoint);
+#endif
 
 // ExposureTime (33434, RATIONAL) x ISO (34855, SHORT) from IFD0 of a little-endian DNG; 0 if absent.
 static double DngExposure(const std::string& path) {
@@ -53,7 +58,7 @@ int main(int argc, char** argv) {
   int pack_bits = 0;
   bool profile = false;
   int hdr_mode = 1;
-  std::string model_error_path;
+  std::string model_error_path, learned_prior;
   for (int i = 3; i < argc; ++i) {
     std::string k = argv[i];
     auto nx = [&] { return std::atoi(argv[++i]); };
@@ -65,11 +70,19 @@ int main(int argc, char** argv) {
     else if (k == "--pgain") { prm.solve.prior_gain = float(std::atof(argv[++i])); prm.auto_look = false; }
     else if (k == "--grain") { prm.solve.grain = float(std::atof(argv[++i])); prm.auto_look = false; }
     else if (k == "--repeat-reference") repeat_reference = nx() != 0;
+    else if (k == "--no-prior") prm.solve.no_prior = true;
     else if (k == "--prior") {
       if (i + 1 >= argc || (std::string(argv[i + 1]) != "0" && std::string(argv[i + 1]) != "1")) {
         std::fprintf(stderr, "--prior requires 0 or 1\n"); return 2;
       }
       dct_prior = std::string(argv[++i]) == "1";
+    }
+    else if (k == "--learned-prior") {
+      if (i + 1 >= argc || argv[i + 1][0] == '-') {
+        std::fprintf(stderr, "--learned-prior requires a TorchScript model path\n");
+        return 2;
+      }
+      learned_prior = argv[++i];
     }
     else if (k == "--dluma") prm.solve.dct_luma = float(std::atof(argv[++i]));
     else if (k == "--aperture") prm.solve.dct_aperture = float(std::atof(argv[++i]));
@@ -95,6 +108,7 @@ int main(int argc, char** argv) {
     else if (k == "--holdout") prm.holdout = nx();   // frame index (after --reference / --frames) kept out of the merge
     else if (k == "--smax") prm.smax_x = float(std::atof(argv[++i]));
     else if (k == "--notch") prm.solve.notch = nx() != 0;
+    else if (k == "--hl-rec") prm.solve.highlight_recovery = nx() != 0;   // 0: neutral highlight rule only
     else if (k == "--workers") prm.workers = nx();
     else if (k == "--robust") prm.solve.robust = nx() != 0;
     else if (k == "--ibp") prm.solve.init_backproject = nx();
@@ -138,6 +152,24 @@ int main(int argc, char** argv) {
     else if (k == "--tilelk") prm.tile_lk = nx() != 0;
     else if (k == "--mhc") prm.solve.mhc_init = nx() != 0;
     else if (k == "--llam") { prm.solve.local_lambda = float(std::atof(argv[++i])); prm.auto_local_lambda = false; }
+  }
+  lkrl::PriorFactory make;
+  if (!prm.solve.no_prior && !learned_prior.empty()) {
+#ifdef LKRL_TORCH_PRIOR
+    if (dct_prior) {
+      std::fprintf(stderr, "--learned-prior requires --prior 0\n");
+      return 2;
+    }
+    try {
+      make = LoadTorchPrior(learned_prior);
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "cannot load learned prior: %s\n", error.what());
+      return 2;
+    }
+#else
+    std::fprintf(stderr, "rebuild with -DLKRL_TORCH_PRIOR=ON to enable --learned-prior\n");
+    return 2;
+#endif
   }
   std::vector<std::string> paths;
   if (DIR* d = opendir(in.c_str())) {
@@ -196,6 +228,7 @@ int main(int argc, char** argv) {
   for (int c = 0; c < 4; ++c) black[c] = float(m.black_level_precise[c]);
   std::array<float, 3> wb{1, 1, 1};
   if (m.has_as_shot_neutral) wb = {float(m.as_shot_neutral[1] / m.as_shot_neutral[0]), 1.0f, float(m.as_shot_neutral[1] / m.as_shot_neutral[2])};
+  if (const char* pc = std::getenv("LKRL_PCACHE")) lkrl::Gpu::SetPipelineCacheFile(pc);   // benchmark runs: skip pipeline compilation
   lkrl::Gpu gpu;
   if (!gpu.ok()) return 1;
   std::printf("device: %s\n", gpu.info().c_str());
@@ -217,7 +250,6 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "model-error dimensions/values do not match requested reference region\n");return 2;
     }
   }
-  const lkrl::PriorFactory make;
   std::vector<float> rgb;
   int ow = 0, oh = 0;
   lkrl::FullStats st;
@@ -229,7 +261,9 @@ int main(int argc, char** argv) {
   }
   // HDR: scale so the clip level is 1 and tell raw converters to brighten by the same factor.
   const float hw = st.hdr_white;
-  for (float& v : rgb) v = std::clamp(v / hw, 0.0f, 1.0f);
+  // Only the top is clipped (white). Negative shadow values stay below the 4096 DNG pedestal,
+  // as on the device path, which passes floats through to LinearRgbDngWriter unclamped.
+  for (float& v : rgb) v = std::isfinite(v) ? std::min(v / hw, 1.0f) : 0.0f;
   srp::DngColorMeta color;
   std::memcpy(color.color_matrix1, m.color_matrix1, sizeof(color.color_matrix1));
   color.has_color_matrix1 = m.color_matrix_present;
@@ -265,11 +299,12 @@ int main(int argc, char** argv) {
   std::fwrite(rgb.data(), 4, rgb.size(), f);
   std::fclose(f);
   std::printf("%zu frames %ux%u -> %dx%d s=%d tiles %d  sigma %.5f a %.3g b %.3g  prior %s%s\n", fr.size(), m.width,
-              m.height, ow, oh, prm.s, st.tiles, st.sigma, st.a, st.b, dct_prior ? "dct" : "none", "");
+              m.height, ow, oh, prm.s, st.tiles, st.sigma, st.a, st.b, prm.solve.no_prior ? "none" : make ? "learned" : dct_prior ? "dct" : "none", "");
   std::printf("reference frame %d (sharpest)\n", st.ref_index);
   std::printf("lfc %.0f ms, mean weight U %.2f V %.2f\n", st.lfc_ms, st.lfc_wu, st.lfc_wv);
   std::printf("DCT luma: %s; lost-frame colour cleanup: %s\n",
-              dct_prior ? "on" : "off", prm.solve.dct_fallback ? "on" : "off");
+              !prm.solve.no_prior && dct_prior ? "on" : "off",
+              !prm.solve.no_prior && prm.solve.dct_fallback ? "on" : "off");
   std::printf("look: prior %.2f grain %.2f%s  local lambda %.2f\n", st.prior_gain, st.grain,
               prm.auto_look ? " (auto from noise)" : "", st.local_lambda);
   std::printf("ms: load %.0f noise %.0f coarseLK %.0f tiles %.0f (gpu %.0f prior %.0f, %d calls) TOTAL(merge) %.0f\n",

@@ -3,7 +3,6 @@
 
 package com.matthew.rawlens
 
-import com.matthew.rawlens.MainActivity.Companion.SLIDER_STEPS
 
 import android.Manifest
 import android.app.Activity
@@ -31,6 +30,7 @@ import android.widget.TextView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Button
+import kotlin.math.abs
 import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.CheckBox
@@ -48,7 +48,6 @@ import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
-import com.particlesdevs.photoncamera.processing.ml.RawNindNcnnProcessor
 import java.io.File
 import java.util.Locale
 import android.os.Build
@@ -91,19 +90,18 @@ internal fun MainActivity.showProgramAxisSlider(isIso: Boolean) {
         (profile.lockedShutterNanos.takeIf { it > 0L } ?: range.current)
             .coerceIn(range.minimum, range.maximum)
     }
+    cancelPendingSliderUpdate()
     activeManualControl = null
     activeProgramAxis = axis
-    // No text label under the histogram: the ruler tick code (ISO/S) plus the
-    // exposure chips carry the values. LIMITS opens the full PROGRAM editor.
+    // LIMITS opens the full PROGRAM editor.
     manualLimits.visibility = View.VISIBLE
     manualLimits.contentDescription = if (isIso) {
         "ISO lock limits and metering editor."
     } else {
         "Shutter lock limits and metering editor."
     }
-    manualSlider.label = shortControlName(axis)
-    manualSlider.max = SLIDER_STEPS
-    manualSlider.setProgressFromUser(sliderProgress(axis, range.copy(current = current)), fromUser = false)
+    manualSlider.max = sliderSteps(axis, range)
+    manualSlider.progress = sliderProgress(axis, range.copy(current = current))
     manualAuto.text = "AUTO"
     manualAuto.isEnabled = true
     refreshRuleSliderAccessibility()
@@ -154,10 +152,15 @@ internal fun MainActivity.openManualModeThen(control: ManualControl) {
 internal fun MainActivity.showProgramPanelHintOnce() {
     if (programHintShown) return
     programHintShown = true
-    val profile = programProfile()
-    setStatus("P ${programLockText(profile.lockMode).substringAfter("Lock: ")} " +
-        "${String.format(Locale.US, "%.2f", profile.balance)} " +
-        "${programEvBiasText(profile.evBias)} • ISO/S edits")
+    setStatus("PROGRAM AE • TAP ISO OR SHUTTER TO SHIFT")
+}
+
+/**
+ * Tap ISO/SHUTTER in PROGRAM: open that axis's ruler slider directly (moving it
+ * locks the axis, AUTO releases). Priority presets live in the LIMITS editor.
+ */
+internal fun MainActivity.showProgramShift(isIso: Boolean) {
+    showProgramAxisSlider(isIso)
 }
 
 internal fun MainActivity.programBalanceText(balance: Float): String = when {
@@ -243,8 +246,7 @@ internal fun MainActivity.showProgramPanel() {
         })
     }
     container.addView(TextView(this).apply {
-        text = "Hold ISO / SHUTTER chips to lock • tap for slider • Auto releases both • " +
-            "lock both for manual"
+        text = "Tap ISO or shutter for its slider; moving it locks that value. Hold to release."
         setTextColor(getColor(R.color.text_secondary))
         textSize = 11f
         setPadding(0, dp(4), 0, 0)
@@ -280,10 +282,43 @@ internal fun MainActivity.showProgramPanel() {
         contentDescription = "PROGRAM ISO and shutter balance"
         setLabelFormatter { programBalanceText(it / 100f) }
     }
+    // Priority presets: one row of chips that snap the balance slider.
+    val presetRow = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        setPadding(0, dp(6), 0, dp(2))
+    }
+    val presets = listOf("Lower ISO" to 0f, "Balanced" to 0.5f, "Faster shutter" to 1f)
+    val presetButtons = presets.map { (label, _) ->
+        Button(this).apply {
+            text = label
+            isAllCaps = false
+            textSize = 12f
+            minWidth = 0
+            minimumWidth = 0
+        }
+    }
+    fun refreshPresets() = presetButtons.forEachIndexed { i, button ->
+        styleDialogButton(button, active = abs(profile.balance - presets[i].second) < 0.01f)
+    }
+    presetButtons.forEachIndexed { i, button ->
+        presetRow.addView(button, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+            if (i > 0) marginStart = dp(6)
+        })
+        button.setOnClickListener {
+            profile = profile.copy(balance = presets[i].second)
+            balanceSlider.progress = (profile.balance * 100).toInt()
+            balanceLabel.text = programBalanceText(profile.balance)
+            refreshPresets()
+            apply()
+        }
+    }
+    refreshPresets()
+    container.addView(presetRow)
     container.addView(balanceSlider)
     bindSlider(balanceSlider) { progress ->
         profile = profile.copy(balance = progress / 100f)
         balanceLabel.text = programBalanceText(profile.balance)
+        refreshPresets()
     }
     val lockButton = Button(this).also { styleDialogButton(it) }
     val lockedIsoButton = Button(this).also { styleDialogButton(it) }
@@ -480,7 +515,7 @@ internal fun MainActivity.showProgramPanel() {
         }
     })
     RawLensDialogBuilder(this)
-        .setTitle("PROGRAM AE • custom")
+        .setTitle("Advanced Program AE")
         .setView(ScrollView(this).apply { addView(container) })
         .setPositiveButton("Done", null)
         .show()

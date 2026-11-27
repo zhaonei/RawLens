@@ -12,6 +12,7 @@ import android.hardware.camera2.params.ColorSpaceTransform
 import android.media.Image
 import android.os.Build
 import android.util.Rational
+import android.util.Size
 
 /** A defensive immutable wrapper for metadata arrays supplied by the camera HAL. */
 class ImmutableFloatValues(values: FloatArray) {
@@ -147,17 +148,33 @@ data class RawFrameMetadata(
     }
 }
 
+private fun physicalCaptureResults(result: TotalCaptureResult): Map<String, CaptureResult> = runCatching {
+    if (Build.VERSION.SDK_INT >= 31) result.physicalCameraTotalResults
+    else {
+        @Suppress("DEPRECATION")
+        result.physicalCameraResults
+    }
+}.getOrDefault(emptyMap())
+
+internal fun physicalCaptureResult(result: TotalCaptureResult, physicalId: String?): CaptureResult? =
+    physicalId?.let { physicalCaptureResults(result)[it] }
+
 object RawFrameMetadataFactory {
     /**
      * Physical-result routing contract (the `captureValue` routing pattern).
-     * Returns the physical camera id to read sensor keys from, or null when the
-     * frame has no physical source or the id is stale/unknown. Pure strings in
-     * and out so it stays JVM-testable without the Android framework.
+     * An output binding takes precedence over the logical camera's active ID.
+     * If that sensor's result is missing, callers fall back to the logical result.
      */
     internal fun selectPhysicalResultId(
         activePhysicalId: String?,
-        availableIds: Set<String>
-    ): String? = activePhysicalId?.takeIf { it in availableIds }
+        availableIds: Set<String>,
+        boundPhysicalId: String? = null
+    ): String? = (boundPhysicalId ?: activePhysicalId)?.takeIf { it in availableIds }
+
+    /** The physical-result id [capture] would pick for [result], for preview-side caches. */
+    fun previewPhysicalId(result: TotalCaptureResult, boundPhysicalId: String?): String? =
+        selectPhysicalResultId(result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID),
+            physicalCaptureResults(result).keys, boundPhysicalId)
 
     fun capture(
         cameraId: String,
@@ -165,9 +182,10 @@ object RawFrameMetadataFactory {
         characteristics: CameraCharacteristics,
         result: TotalCaptureResult,
         exifOrientation: Int,
-        levelOverrides: DngMetadataOverrides = DngMetadataOverrides()
+        levelOverrides: DngMetadataOverrides = DngMetadataOverrides(),
+        boundPhysicalId: String? = null
     ): RawFrameMetadata = capture(cameraId, RawImageView.of(image), characteristics, result,
-        exifOrientation, levelOverrides)
+        exifOrientation, levelOverrides, boundPhysicalId = boundPhysicalId)
 
     /** [capture] over a live or staged RAW plane ([BufferedRawFrame.view]). */
     internal fun capture(
@@ -176,33 +194,33 @@ object RawFrameMetadataFactory {
         characteristics: CameraCharacteristics,
         result: TotalCaptureResult,
         exifOrientation: Int,
-        levelOverrides: DngMetadataOverrides = DngMetadataOverrides()
+        levelOverrides: DngMetadataOverrides = DngMetadataOverrides(),
+        vendorFullResolution: Boolean = false,
+        boundPhysicalId: String? = null,
+        cfaOverride: Int? = null
     ): RawFrameMetadata {
-        val cfaValue = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
+        val cfaValue = cfaOverride ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
         val cfaResult = runCatching { cfaValue?.let(BayerPattern::fromCamera2) }
         val cfa = cfaResult.getOrNull()
 
-        // Physical-first routing: when the HAL reports which physical camera
-        // produced this frame, sensor keys below read from that physical result
-        // and fall back to the logical result per key. Pipeline states
-        // (AF/AE/lens/flash) and frame identity stay logical. With no physical
-        // source this degrades to a plain logical read, identical to before.
-        // Physical results need Android 12 (the runCatching below also
-        // covers HALs that throw, but only an SDK guard satisfies the
-        // minSdk-30 NewApi gate for the call itself).
-        val physicalResults = if (Build.VERSION.SDK_INT >= 31) {
-            runCatching { result.physicalCameraTotalResults }.getOrNull()
-        } else {
-            null
-        }
-        val physicalId = selectPhysicalResultId(
-            result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID),
-            physicalResults?.keys ?: emptySet()
-        )
-        val physical: TotalCaptureResult? = physicalId?.let { physicalResults?.get(it) }
+        // An explicitly bound output can differ from the logical camera's active sensor.
+        val logicalActiveId = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+        val physicalResults = physicalCaptureResults(result)
+        val physicalId = selectPhysicalResultId(logicalActiveId, physicalResults.keys, boundPhysicalId)
+        val physical = physicalResults[physicalId]
         fun <T> sensorKey(key: CaptureResult.Key<T>): T? = physical?.get(key) ?: result.get(key)
 
-        val dynamicBlack = sensorKey(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
+        // Lapis DCG14 stores RAW14 with its own levels while the HAL still reports the 10-bit ones
+        // (see LapisRootSession.storageWhite). Only frames whose own samples pass 10 bits take the
+        // storage levels: the mode switch still delivers a few 10-bit frames, and 1024 / 16383 on
+        // those would read every pixel as below black.
+        val levelSample = image.buffer?.let { buffer ->
+            DngLevelRepair.sample(buffer, image.rowStride, image.pixelStride, image.width, image.height)
+        }
+        val lapisDcg = LapisRootSession.spec(characteristics)?.dcg == true &&
+            (levelSample == null || levelSample.max > 1023)
+        val dcgBlack = if (lapisDcg) FloatArray(4) { LapisRootSession.storageBlack(characteristics, it).toFloat() } else null
+        val dynamicBlack = dcgBlack ?: sensorKey(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
             ?.takeIf { it.size == 4 && it.all(Float::isFinite) }
         val staticBlack = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
             ?.let { pattern -> FloatArray(4) { index ->
@@ -215,8 +233,8 @@ object RawFrameMetadataFactory {
             else -> BlackLevelSource.MISSING
         }
 
-        val dynamicWhite = sensorKey(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)
-            ?.takeIf { it > 0 }?.toFloat()
+        val dynamicWhite = (if (lapisDcg) LapisRootSession.storageWhite(characteristics)?.toFloat() else null)
+            ?: sensorKey(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)?.takeIf { it > 0 }?.toFloat()
         val staticWhite = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)
             ?.takeIf { it > 0 }?.toFloat()
         val (reportedBlack, reportedWhite) = levelOverrides.captureSensorLevels(
@@ -233,17 +251,24 @@ object RawFrameMetadataFactory {
         // placeholders or white <= black) would fail the save or write a
         // black DNG. Sample the frame's own bytes instead; the tags stay
         // self-consistent with the payload. Sane HALs never sample.
-        val sampled = if (DngLevelRepair.needsRepair(reportedBlack, reportedWhite)) {
-            image.buffer?.let { buffer ->
-                DngLevelRepair.sample(buffer, image.rowStride, image.pixelStride,
-                    image.width, image.height)
-            }
-        } else null
+        val sampled = if (DngLevelRepair.needsRepair(reportedBlack, reportedWhite)) levelSample else null
         val repaired = sampled?.let(DngLevelRepair::repair)
-        val black = repaired?.first ?: reportedBlack
-        val white = repaired?.second ?: reportedWhite
-        val blackSource = if (repaired != null) BlackLevelSource.SAMPLED else reportedBlackSource
-        val whiteSource = if (repaired != null) WhiteLevelSource.SAMPLED else reportedWhiteSource
+        // DCG / deeper storage on any phone: 10- or 12-bit levels reported for a 12- or 14-bit payload
+        // (samples past the reported white) scale up by the matching power of two. User overrides and
+        // device profiles (levelOverrides) win; a repaired pair already came from the samples.
+        val deeper = if (repaired == null && levelOverrides.blackLevels == null &&
+            levelOverrides.whiteLevel == null && reportedBlack != null && reportedWhite != null) {
+            levelSample?.let { DngLevelRepair.deeperStorage(reportedBlack, reportedWhite, it) }
+        } else null
+        if (deeper != null) {
+            android.util.Log.i("RawLensLevels", "DEEPER_STORAGE route=$cameraId frame=${result.frameNumber} " +
+                "reported=${reportedBlack?.joinToString()}/$reportedWhite -> ${deeper.first.joinToString()}/${deeper.second} " +
+                "sampleMax=${levelSample?.max}")
+        }
+        val black = repaired?.first ?: deeper?.first ?: reportedBlack
+        val white = repaired?.second ?: deeper?.second ?: reportedWhite
+        val blackSource = if (repaired != null || deeper != null) BlackLevelSource.SAMPLED else reportedBlackSource
+        val whiteSource = if (repaired != null || deeper != null) WhiteLevelSource.SAMPLED else reportedWhiteSource
 
         if (levelOverrides.blackLevels != null || levelOverrides.whiteLevel != null) {
             android.util.Log.i("RawLensLevels", "CAPTURE_LEVELS route=$cameraId frame=${result.frameNumber} " +
@@ -251,11 +276,15 @@ object RawFrameMetadataFactory {
                 "halWhite=${dynamicWhite ?: staticWhite}")
         }
 
-        val pixelSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+        val fullSize = if (vendorFullResolution) Size(image.width, image.height) else null
+        val pixelSize = fullSize ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
         val imageCrop = image.cropRect.snapshot()!!
         val plane = image.buffer?.takeIf { image.planeCount == 1 }
-        val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE).snapshot()
-        val preCorrection = characteristics
+        // The vendor stream is configured at full resolution while standard
+        // Camera2 characteristics can still describe the binned photo mode.
+        val fullArray = fullSize?.let { IntRectSnapshot(0, 0, it.width, it.height) }
+        val activeArray = fullArray ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE).snapshot()
+        val preCorrection = fullArray ?: characteristics
             .get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE).snapshot()
         val rawCrop = if (Build.VERSION.SDK_INT >= 34) {
             sensorKey(CaptureResult.SCALER_RAW_CROP_REGION).snapshot()
@@ -278,15 +307,18 @@ object RawFrameMetadataFactory {
             }
         val hotPixels = sensorKey(CaptureResult.STATISTICS_HOT_PIXEL_MAP)
             ?.map { it.snapshot() }.orEmpty()
-        val halGains = sensorKey(CaptureResult.COLOR_CORRECTION_GAINS)?.let {
+        val reportedGains = sensorKey(CaptureResult.COLOR_CORRECTION_GAINS)?.let {
             ImmutableFloatValues(floatArrayOf(it.red, it.greenEven, it.greenOdd, it.blue))
         }
-        val halNeutral = sensorKey(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)
-            ?.toDoubleValues()
-        // Direct-opened Xiaomi aux lenses run no AWB (unity gains, NaN
-        // neutral): estimate from the frame so JPEG and DNG are not green.
-        val fallbackNeutral = if (RawWhiteBalanceFallback.halAwbMissing(
-                halNeutral?.toDoubleArray(), halGains?.toFloatArray()) &&
+        val reportedNeutral = sensorKey(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)?.toDoubleValues()
+        val awbMode = if (result.get(CaptureResult.CONTROL_MODE) == CaptureResult.CONTROL_MODE_OFF) 0
+            else sensorKey(CaptureResult.CONTROL_AWB_MODE)
+        // Xiaomi tele stills return AWB still SEARCHING with a stale neutral (StillAwbRepair):
+        // estimate from this frame's RAW like a missing AWB; the converged preview is the backup.
+        val stillAwbUnsettled = StillAwbRepair.unsettled(awbMode, sensorKey(CaptureResult.CONTROL_AWB_STATE))
+        val awbMissing = RawWhiteBalanceFallback.halAwbMissing(
+            reportedNeutral?.toDoubleArray(), reportedGains?.toFloatArray())
+        val fallbackNeutral = if ((awbMissing || stillAwbUnsettled) &&
             cfaValue != null && black != null && white != null && plane != null
         ) {
             runCatching {
@@ -297,8 +329,19 @@ object RawFrameMetadataFactory {
                         sensorKey(CaptureResult.SENSOR_SENSITIVITY), sensorKey(CaptureResult.LENS_APERTURE)))
             }.getOrNull()
         } else null
-        val gains = fallbackNeutral?.let { ImmutableFloatValues(RawWhiteBalanceFallback.gainsFor(it)) } ?: halGains
-        val neutral = fallbackNeutral?.let(::ImmutableDoubleValues) ?: halNeutral
+        val previewAwb = if (fallbackNeutral == null && stillAwbUnsettled) StillAwbRepair.replacementFor(
+            cameraId, physicalId, awbMode, sensorKey(CaptureResult.CONTROL_AWB_STATE),
+            sensorKey(CaptureResult.SENSOR_TIMESTAMP)) else null
+        if (stillAwbUnsettled && !awbMissing) {
+            android.util.Log.i("RawLensColor", "STILL_AWB_REPAIR route=$cameraId frame=${result.frameNumber} " +
+                "stillNeutral=${reportedNeutral?.toDoubleArray()?.joinToString { "%.4f".format(java.util.Locale.US, it) }} " +
+                "rawEstimate=${fallbackNeutral?.joinToString { "%.4f".format(java.util.Locale.US, it) }} " +
+                "previewNeutral=${previewAwb?.neutral?.joinToString { "%.4f".format(java.util.Locale.US, it) }}")
+        }
+        val gains = fallbackNeutral?.let { ImmutableFloatValues(RawWhiteBalanceFallback.gainsFor(it)) }
+            ?: previewAwb?.let { ImmutableFloatValues(it.gains) } ?: reportedGains
+        val neutral = fallbackNeutral?.let(::ImmutableDoubleValues)
+            ?: previewAwb?.let { ImmutableDoubleValues(it.neutral) } ?: reportedNeutral
         val noise = sensorKey(CaptureResult.SENSOR_NOISE_PROFILE)?.let { pairs ->
             ImmutableDoubleValues(DoubleArray(pairs.size * 2) { index ->
                 if (index and 1 == 0) pairs[index / 2].first else pairs[index / 2].second
@@ -402,11 +445,10 @@ object RawFrameMetadataFactory {
             noiseProfile = noise,
             sensorPixelMode = pixelMode,
             rawBinningFactorUsed = rawBinning,
-            activePhysicalCameraId = result
-                .get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID),
-            afState = result.get(CaptureResult.CONTROL_AF_STATE),
-            aeState = result.get(CaptureResult.CONTROL_AE_STATE),
-            lensState = result.get(CaptureResult.LENS_STATE),
+            activePhysicalCameraId = boundPhysicalId ?: logicalActiveId,
+            afState = sensorKey(CaptureResult.CONTROL_AF_STATE),
+            aeState = sensorKey(CaptureResult.CONTROL_AE_STATE),
+            lensState = sensorKey(CaptureResult.LENS_STATE),
             quadBayer = quadBayer,
             aperture = sensorKey(CaptureResult.LENS_APERTURE)
                 ?.takeIf { it.isFinite() && it > 0f },

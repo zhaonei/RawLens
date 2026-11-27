@@ -19,6 +19,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "lkrl_full.h"
@@ -27,7 +28,7 @@
 #include "lkrl_tuning.h"
 #include "lkrl_resample.h"
 #include "lkrl_sharpness.h"
-#include "noise_model.h"   // app/src/main/cpp/wavelet: learned per-device noise model
+#include "noise_model.h"   // app/src/main/cpp/noise: learned per-device noise model
 
 #include <cmath>
 
@@ -76,6 +77,10 @@ thread_local NoiseModelRef g_noise_model;
 // HDR bracket exposures for the NEXT merge on this thread (nativeSetExposures, consumed by Merge):
 // one value per frame in frame order (frame 0 = reference), empty = normal merge.
 thread_local std::vector<float> g_exposure;
+thread_local bool g_npu_denoise = false;
+thread_local bool g_no_prior = false;
+// Local-colour highlight recovery (Settings -> Merge -> LK-R). Default on; debug.lkr.hlrec=0 still forces it off.
+thread_local bool g_highlight_rec = true;
 
 // stats layout (float[16]): tiles, sigma, a, b, ms_noise, ms_coarse, ms_tiles,
 // ms_gpu, ms_prior, ms_total, prior_calls, out_w, out_h, backend (0 none,
@@ -85,6 +90,9 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
               jintArray crop_j, jboolean dct, jfloatArray stats_j, jfloatArray tuning_j, jint out_w_req,
               jint out_h_req, jint packed_bits = 0) {
   g_last_profile.clear();
+  const bool npu_denoise = std::exchange(g_npu_denoise, false);
+  const bool no_prior = std::exchange(g_no_prior, false);
+  const bool highlight_rec = std::exchange(g_highlight_rec, true);
   const jsize K = env->GetArrayLength(frames);
   std::vector<lkrl::RawFrame> fr;
   for (jsize k = 0; k < K; ++k) {
@@ -112,6 +120,9 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
     return nullptr;
   }
   lkrl::FullParams prm = lkrl::AppDefaults();
+  prm.solve.npu_denoise = npu_denoise;
+  prm.solve.no_prior = no_prior;
+  prm.solve.highlight_recovery = highlight_rec;
   // x2 buffers are large and a third worker gains about 3 % on Mali (measured); debug.lkr.workers still overrides.
   if (s >= 2) {
     prm.workers = std::min(prm.workers, 2);
@@ -125,6 +136,7 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
     if (__system_property_get("debug.lkr.tilelk", v) > 0 && v[0] == '0') prm.tile_lk = false;
     // A/B of the colour-difference fit: debug.lkr.cdfit = D radius, -1 = the old independent fit (read once per process).
     if (__system_property_get("debug.lkr.cdfit", v) > 0 && v[0]) setenv("LKRL_CDFIT", v, 0);
+    if (__system_property_get("debug.lkr.chromasupport", v) > 0 && v[0]) setenv("LKRL_CHROMA_SUPPORT", v, 0);
     // Learned post-fit network A/B: debug.lkr.network = 1 / 0 overrides the app setting (read once per process).
     // (debug.lkr.prior is the DCT shadow-luma switch below.)
     if (__system_property_get("debug.lkr.network", v) > 0 && v[0]) setenv("LKRL_PRIOR", v, 0);
@@ -146,7 +158,10 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
       setenv("LKRL_RCD", "0", 0); setenv("LKRL_TDGATE", "0", 0); setenv("LKRL_DLN", "0", 0); setenv("LKRL_GCF", "0", 0); setenv("LKRL_CANC", "0", 0);
     }
     if (__system_property_get("debug.lkr.rcd", v) > 0 && v[0]) setenv("LKRL_RCD", v, 0);
+    if (__system_property_get("debug.lkr.align2", v) > 0 && v[0] && v[0] != '-') setenv("LKRL_ALIGN2", v, 1);
+    else unsetenv("LKRL_ALIGN2");
     if (__system_property_get("debug.lkr.tdgate", v) > 0 && v[0]) setenv("LKRL_TDGATE", v, 0);
+    if (__system_property_get("debug.lkr.tdresid", v) > 0 && v[0]) setenv("LKRL_TDRESID", v, 0);
     if (__system_property_get("debug.lkr.dln", v) > 0 && v[0]) setenv("LKRL_DLN", v, 0);
     if (__system_property_get("debug.lkr.axn", v) > 0 && v[0]) setenv("LKRL_AXN", v, 0);
     if (__system_property_get("debug.lkr.gcf", v) > 0 && v[0]) setenv("LKRL_GCF", v, 0);
@@ -168,7 +183,7 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
   const NoiseModelRef noise_model = g_noise_model;
   g_noise_model = {};
   if (!noise_model.path.empty() && noise_model.iso > 0) {
-    // Same mix as HDR+ (WaveletVulkan.combineNoise): model prior, this burst's fit as evidence.
+    // Same mix as HDR+ (RawNoiseModel.combineNoise): model prior, this burst's fit as evidence.
     prm.noise_refine = [noise_model](float* a, float* b, int bins) {
       const auto model = rawlens_noise::fit(rawlens_noise::loadSamples(noise_model.path));
       if (!model.supports(noise_model.iso)) {
@@ -251,7 +266,7 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
   }
 #endif
 
-  const float backend = dct ? 4.f : 0.f;
+  const float backend = !no_prior && prm.solve.dct_prior ? 4.f : 0.f;
   float* direct = nullptr;
   prm.out_alloc = [&](int oww, int ohh) -> float* {
     if (out_w_req > 0 && out_h_req > 0 && (out_w_req != oww || out_h_req != ohh)) return nullptr;   // 1.5x resamples
@@ -295,7 +310,7 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
   if (st.hdr_white > 1.0f) LKR_LOG("hdr: white %.3f (output level of the clip)", st.hdr_white);
   if (!st.gpu_profile.empty())
     LKR_LOG("gpu profile (sum of %d workers, ms): %s", st.workers, st.gpu_profile.c_str());
-  LKR_LOG("mode: %s", dct ? "DCT x-step" : "no prior");
+  LKR_LOG("mode: %s", backend != 0.0f ? "DCT x-step" : "no prior");
   LKR_LOG("look: prior %.2f grain %.2f (sigma %.5f)", st.prior_gain, st.grain, st.sigma);
   LKR_LOG("merge %dx%d s=%d K=%d tiles %d: noise %.0f coarse %.0f tiles %.0f (gpu %.0f prior %.0f) total %.0f ms",
           ow, oh, s, int(K), st.tiles, st.ms_noise, st.ms_coarse, st.ms_tiles, st.ms_gpu, st.ms_prior, st.ms_total);
@@ -372,12 +387,24 @@ extern "C" JNIEXPORT void JNICALL Java_com_matthew_rawlens_LkrBridge_nativeSetPr
   const bool on = enabled == JNI_TRUE;
   const bool was = lkrl::PriorEnabled();
   lkrl::PriorSetEnabled(on);
-  if (on && !was)
+  if (on && !was && !lkrl::NpuDenoiseEnabled())
     std::thread([] {
       std::string err;
       for (int t : PrewarmTileEdges())
         if (!lkrl::PriorPrewarm(t, t, &err)) { __android_log_print(ANDROID_LOG_WARN, "LkrPrior", "prewarm %d: %s", t, err.c_str()); break; }
     }).detach();
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_matthew_rawlens_LkrBridge_nativeSetNpuDenoise(
+    JNIEnv*, jclass, jboolean enabled, jboolean no_prior) {
+  g_npu_denoise = enabled == JNI_TRUE;
+  g_no_prior = no_prior == JNI_TRUE;
+}
+
+// Highlight recovery for the NEXT merge on the calling thread (see g_highlight_rec).
+extern "C" JNIEXPORT void JNICALL Java_com_matthew_rawlens_LkrBridge_nativeSetHighlightRecovery(
+    JNIEnv*, jclass, jboolean enabled) {
+  g_highlight_rec = enabled == JNI_TRUE;
 }
 
 // HDR bracket exposures (ExposureTime x ISO, any common unit) for the next merge on the calling thread,
@@ -487,10 +514,11 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_matthew_rawlens_LkrBridge_nativePrew
   {   // learned prior: compile for the NPU now (app tile 512 -> 512 px at 1x, 1024 px at 2x)
     char v[PROP_VALUE_MAX] = {0};
     if (__system_property_get("debug.lkr.network", v) > 0 && v[0]) setenv("LKRL_PRIOR", v, 0);
-    if (lkrl::PriorEnabled()) {
+    const bool denoise = lkrl::NpuDenoiseEnabled();
+    if (denoise || lkrl::PriorEnabled()) {
       std::string err;
       for (int t : PrewarmTileEdges())
-        if (!lkrl::PriorPrewarm(t, t, &err)) { __android_log_print(ANDROID_LOG_WARN, "LkrLite", "prior prewarm %d: %s", t, err.c_str()); break; }
+        if (!lkrl::PriorPrewarm(t, t, &err, denoise)) { __android_log_print(ANDROID_LOG_WARN, "LkrLite", "prior prewarm %d: %s", t, err.c_str()); break; }
     }
   }
   return jlong(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());

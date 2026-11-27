@@ -14,11 +14,13 @@
 namespace lkrl {
 
 struct LiteParams {
+  bool direct_rgb = false;  // Enough distinct Bayer shifts to fit the three planes independently.
   int s = 2;
   // Empty = by scale: 1x GGGJJJ; 2x GGGJJJJJJJJ (8 merge steps: grain / detail of LK-R's 24 data
   // steps at 2x). 3 motion steps match LK-R better than 5 (car 1x 59.93 -> 60.20 dB, worst block
   // 36.7 -> 38.4; IMG_20210228_133623 2x 52.31 -> 52.46) and save 2 jac / jacblk passes + round trips.
   std::string debug_prefix; // optional per-tile stage audit, supplied by MergeFull
+  std::string dense_field_path;  // Optional per-tile research replay.
   std::string schedule;   // G = motion step + weight refresh, J = merge step; leading G align to the reference-only image
   float noise_a = 0, noise_b = 0;     // our own fit: var = a y + b (normalised raw units)
   float clip = 0.98f;
@@ -61,6 +63,13 @@ struct LiteParams {
   // Motion-step sample weights: 0 = robust weights (computed with the CURRENT, possibly wrong,
   // geometry: rejects exactly the samples that would fix it), 1 = validity only.
   int gn_weights = 1;
+  // Motion v2 (SolveParams::align2): informs nothing here but the fields below; the patch seed and the 8 px
+  // offsets come from the tile preparation (lkrl_patchseed.h).
+  bool align2 = false;
+  const float* local_fine = nullptr;   // K x nb8 vec2 (8 px blocks): own offset, >= 1e8 = the 16 px field after the motion steps
+  // 2x: below this share of the burst's expected coverage the green step is the local mean (no comb in
+  // moving water). 0 = off.
+  float support_step = 0.0f;
   // Jacobi damping delta = jacobi_damp * K / s^2 (a fully covered pixel has ~K / s^2 per channel
   // share): 0 = plain Jacobi.
   float jacobi_damp = -1.0f;   // < 0: by scale (0 at 1x and 2x: 0.1 at 2x lowered the HR checker but cost
@@ -103,20 +112,25 @@ class LiteSolver {
              const LiteParams& prm, std::vector<float>* z_out, LiteStats* st, std::string* err,
              std::vector<float>* noise_scale = nullptr, std::vector<float>* resid_out = nullptr,
              std::vector<float>* weights_out = nullptr, std::vector<float>* x_out = nullptr);
+  bool denoiseDct(const std::vector<float>& fit, int H, int W, const LiteParams& prm,
+                  const std::vector<float>* noise_scale, std::vector<float>* x_out,
+                  LiteStats* st, std::string* err);
   // FinishLook default path on the GPU (fin.comp): notch, luma notch where frames were lost, clip
   // halo, grain, highlight desaturation. x in/out (3 H W planar camera RGB).
-  struct FinishArgs { float wb[3]; float clip, grain, eq_strength; bool notch, desat; float hl_ratio[3]; bool hl_rec; int hl_radius; };
+  struct FinishArgs { float wb[3]; float clip, grain, eq_strength; bool notch, desat; float hl_ratio[3]; bool hl_rec; };
   bool finish(const float* z, std::vector<float>* x, int H, int W, const FinishArgs& fa,
               const std::vector<float>* noise_scale, std::string* err);   // final residual vs z (K x h x w, 0 = invalid), final weights
 
  private:
   struct Entry { Buffer buf; size_t bytes = 0; bool host_read = false; };
-  std::deque<Entry> cache_;
+  std::deque<Entry> cache_, dcache_;
   std::deque<Entry> fcache_;   // finish() buffers   // per-solver buffers, reused across tiles (deque: stable references)
   Gpu* gpu_;
   bool ok_ = false;
+  Pipeline nes_, ne_apply_, ne_zupd_;
+  Pipeline local_search_, upfine_, rescue_e_, rescue_apply_, adj_cubic_, jac_cubic_, jacblk_cubic_, kresid_cubic_;
   Pipeline resid_, werr_, wavg_, wminh_, wminv_, adj_, adj_s1_, adj_s2_, zupd_, jac_, jacblk_, solveblk_, gstats_, wguide_, wvalid_,
-      kresid_, ktdet_, kth_, kt_, ktv_, ktd_, kguide_, kminh_, kmin_, kdy_, kdu_, kdv_, kdyuv_, kdyo_, kduo_, kdvo_, hyb_, adjwg_, fin_, edgeshift_, cdupd_, le_tensor_, le_blur_, le_apply_, dln_apply_, axn_apply_, gcf_apply_, canc_apply_, rcd_start_, prior_conv_;
+      kresid_, ktdet_, kth_, kt_, ktv_, ktd_, kguide_, kminh_, kmin_, kdy_, kdu_, kdv_, kdyuv_, kdyo_, kduo_, kdvo_, hyb_, adjwg_, fin_, edgeshift_, cdupd_, cdrow_, le_tensor_, le_blur_, le_apply_, dln_apply_, axn_apply_, gcf_apply_, canc_apply_, rcd_start_, prior_conv_;
 };
 
 }  // namespace lkrl

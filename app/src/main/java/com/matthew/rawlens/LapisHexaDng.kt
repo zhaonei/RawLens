@@ -9,27 +9,37 @@ import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-/**
- * Root-worker side of the 200 MP -> 50 MP version-2 path: serialises the Vulkan
- * output (linear camera RGB, uint16 normalised to the gain-corrected white level)
- * as a LinearRaw DNG through the app's TinyDNG writer. Quantisation is exact:
- * code/65535 re-quantises to the same code.
- */
+/** Streaming CFA DNG export for rawr Hexadeca sums + Quad Detail remosaic. */
 object LapisHexaDng {
-    const val ALGORITHM = "RawLens-Hexadeca200/v2-residual-interpolation"
+    const val ALGORITHM = "rawr-49b013db/Hexadeca-sum-Quad-Detail"
 
     /** Built while the camera Image is still open (the factory reads its plane geometry). */
     @JvmStatic
     fun metadata(image: Image, characteristics: CameraCharacteristics, result: TotalCaptureResult,
                  exifOrientation: Int): Any =
-        RawFrameMetadataFactory.capture("0", image, characteristics, result, exifOrientation)
+        RawFrameMetadataFactory.capture("0", image, characteristics, result, exifOrientation).let { m ->
+            val map = RawShadingCalibration.readoutMap(m.lensShadingMap)
+            m.copy(sensorReadoutProfile = "200to50-rawr49b013db", lensShadingMap = map,
+                lensShadingAlreadyApplied = RawShadingCalibration.alreadyApplied(map, m.lensShadingAlreadyApplied))
+        }
+
+    @JvmStatic
+    fun recordShading(report: org.json.JSONObject, metadata: Any) {
+        val m = metadata as RawFrameMetadata
+        report.put("lensShadingMapAvailable", m.lensShadingMap != null)
+            .put("lensShadingAlreadyApplied", m.lensShadingAlreadyApplied)
+        m.lensShadingMap?.let {
+            report.put("lensShadingMapRows", it.rows).put("lensShadingMapColumns", it.columns)
+                .put("lensShadingMapMax", it.gains.toList().maxOrNull())
+        }
+    }
 
     /** Small cross-process sidecar; matrices use the existing offline-merge contract. */
     @JvmStatic
-    fun writeDevelopMetadata(file: File, metadata: Any, width: Int, height: Int) {
+    fun writeDevelopMetadata(file: File, metadata: Any, width: Int, height: Int, black: Float) {
         val m = metadata as RawFrameMetadata
         val container = org.json.JSONObject().put("sensorArrangment", "gbrg")
-            .put("blackLevel", org.json.JSONArray(listOf(0, 0, 0, 0))).put("whiteLevel", 65535)
+            .put("blackLevel", org.json.JSONArray(listOf(black * 4, black * 4, black * 4, black * 4))).put("whiteLevel", 4092)
         fun matrix(key: String, v: ImmutableDoubleValues?) {
             v?.let { container.put(key, org.json.JSONArray(List(9) { i -> it[(i % 3) * 3 + i / 3] })) }
         }
@@ -40,6 +50,14 @@ object LapisHexaDng {
         m.referenceIlluminant2?.let { container.put("referenceIlluminant2", it) }
         val frame = org.json.JSONObject().put("width", width).put("height", height)
             .put("timestamp", m.timestampNanos.toString()).put("exifOrientation", m.exifOrientation)
+        frame.put("sensorReadoutProfile", "200to50-rawr49b013db")
+        frame.put("lensShadingAlreadyApplied", m.lensShadingAlreadyApplied)
+        RawShadingCalibration.readoutMap(m.lensShadingMap)?.takeUnless { m.lensShadingAlreadyApplied }?.let { map ->
+            frame.put("lensShadingMapWidth", map.columns).put("lensShadingMapHeight", map.rows)
+                .put("lensShadingMap", org.json.JSONArray(List(4) { channel ->
+                    org.json.JSONArray(List(map.rows * map.columns) { point -> map.gains[point * 4 + channel] })
+                }))
+        }
         m.neutralColorPoint?.let { frame.put("asShotNeutral", org.json.JSONArray(it.toDoubleArray().toList())) }
         m.sensitivityIso?.let { frame.put("iso", it) }
         m.exposureTimeNanos?.let { frame.put("exposureTime", it) }
@@ -49,18 +67,56 @@ object LapisHexaDng {
         file.writeText(org.json.JSONObject().put("container", container).put("frame", frame).toString())
     }
 
+    internal fun fields(metadata: RawFrameMetadata, width: Int, height: Int, black: Float,
+                        description: String, captureTime: Long): TiffFields {
+        val base = HdrPlusDngWriter.buildFields(BayerPattern.GBRG, metadata, null, DngCompression.UNCOMPRESSED)
+        return TiffFields().apply {
+            base.payloads.forEachIndexed { index, bytes ->
+                val tag = base.descriptors[index * 3]
+                if (tag != 50714 && tag != 50717) this.tag(tag, base.descriptors[index * 3 + 1], bytes)
+            }
+            ascii(270, description)
+            ascii(306, DngExifDirectory.dateTime(captureTime))
+            rationals(50714, DoubleArray(4) { black.toDouble() * 4 })
+            longs(50717, 4092)
+            longs(50829, 0, 0, height, width)
+            rationals(50719, doubleArrayOf(0.0, 0.0))
+            rationals(50720, doubleArrayOf(width.toDouble(), height.toDouble()))
+            bytes(50710, byteArrayOf(0, 1, 2))
+            shorts(50711, 1)
+            RawShadingCalibration.readoutMap(metadata.lensShadingMap)
+                ?.takeUnless { metadata.lensShadingAlreadyApplied }?.let { map ->
+                    // Same full field of view after 2x reduction. Normalized map coordinates
+                    // survive; only the output Bayer bounds change. No second sensor crop.
+                    undefined(51009, TinyDngMetadata.gainMap(map, BayerPattern.GBRG,
+                        RawCrop(0, 0, width, height), 0))
+                }
+        }
+    }
+
     @JvmStatic
-    fun write(file: File, rgb16: ByteBuffer, width: Int, height: Int, metadata: Any, timestampNs: Long, details: String) {
-        val provenance = MergeProvenance(
-            algorithmVersion = ALGORITHM, selectedFrames = 1, acceptedFrames = 1, rejectedFrames = 0,
-            referenceTimestampNs = timestampNs, outputScale = 1, sourceCameraId = "0",
-            lensShadingApplied = false, engineLabel = "200 MP 4x4 block CFA, single frame", details = details)
-        val shorts = rgb16.duplicate().order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+    fun write(file: File, bayer16: ByteBuffer, width: Int, height: Int, metadata: Any,
+              timestampNs: Long, black: Float, phaseFit: Boolean) {
+        val m = metadata as RawFrameMetadata
+        require(width > 0 && height > 0 && bayer16.capacity().toLong() >= width.toLong() * height * 2)
+        val time = System.currentTimeMillis()
+        val description = "$ALGORITHM; source 16320x12240 RAW10, 4x4 GBRG; " +
+            "exact 2x2 same-colour sums to Quad; Detail remosaic to ${width}x${height} GBRG CFA; " +
+            "phase fit=$phaseFit; x4 source code scale, black=${black * 4}, white=4092; " +
+            "reference timestamp=$timestampNs ns; single frame, CPU reference; " +
+            "no RGB intermediate; shading=" +
+            (if (m.lensShadingMap != null && !m.lensShadingAlreadyApplied) "matched-frame GainMap opcode" else
+                if (m.lensShadingAlreadyApplied) "already applied" else "map unavailable") +
+            "; distortion calibration unavailable."
+        val rowsPerStrip = 64
         FileOutputStream(file).use { out ->
-            LinearRgbDngWriter.writeStriped(out, width, height, metadata as RawFrameMetadata, provenance,
-                captureTimeMillis = System.currentTimeMillis()) { startY, rows, rgb ->
-                val base = startY * width * 3
-                for (i in 0 until rows * width * 3) rgb[i] = (shorts.get(base + i).toInt() and 0xffff) / 65535f
+            TinyDngImageWriter.write(out, width, height, 1, 16, 1, 32803, rowsPerStrip,
+                fields(m, width, height, black, description, time), DngExifDirectory.fields(m, time),
+                null, (height + rowsPerStrip - 1) / rowsPerStrip) { strip ->
+                val y = strip * rowsPerStrip
+                val bytes = ByteArray(width * minOf(rowsPerStrip, height - y) * 2)
+                bayer16.duplicate().apply { position(y * width * 2); get(bytes) }
+                bytes
             }
             out.fd.sync()
         }

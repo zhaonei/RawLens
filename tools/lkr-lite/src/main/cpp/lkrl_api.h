@@ -21,14 +21,21 @@
 
 namespace lkrl {
 
-// Plug-and-play prior x = f(z, sigma). z and x are 3 planes of H*W floats
-// (camera-linear, RGGB order R,G,B); they point straight into the mapped
-// GPU buffers (no copies on unified memory). Returns false on failure.
+// Optional prior applied to the final fitted tile before finishing. z and x
+// each store three planar H*W float channels in camera-linear RGB order.
+// Callbacks can run concurrently across tiles and return false on failure.
 // noise_scale: per-HR-pixel factor (H*W, >= 1) on the noise level, from the
 // fraction of frames that contributed there (robust weights); null = 1.
 using PriorFn = std::function<bool(const float* z, float* x, int H, int W, float sigma, const float* noise_scale)>;
 
 struct SolveParams {
+  bool npu_denoise = false;
+  bool no_prior = false;
+  bool direct_rgb = false;  // Enough distinct Bayer shifts to fit the three planes independently.
+  // Motion v2 (default since 2026-11-25; LKRL_ALIGN2=0 / debug.lkr.align2=0 = off): noise-gated patch seed, 8 px warp
+  // field, 2x support step. See LiteParams::align2, support_step.
+  bool align2 = true;
+  float support_step = 0.0f;
   int s = 2;
   int T = 16;
   int z_steps = 3;
@@ -130,6 +137,7 @@ struct SolveParams {
   int local_block = 16;         // 0 = off (paper model); 16 = jacblk workgroup size
   float local_lambda = 0.1f;
   float local_floor = 0.02f;
+  const float* local_fine = nullptr;   // optional K x nb8 vec2, 8 px blocks: own offset, >= 1e8 = the 16 px field
   const float* local_init = nullptr;   // optional K x nb vec2 initial field (block search)
   float* local_out = nullptr;          // optional: final field (diagnostics)
   // Prior must not move the local mean: x += lowpass(z - x) after each
@@ -150,6 +158,8 @@ struct SolveParams {
   float shadow_chroma = 0.7f;
   // Blown highlights go white: neutralise once any channel nears clip (FinishLook).
   bool highlight_desat = true;
+  // Highlight recovery (local donor colour, see HighlightRecover). false = only the neutral rule above.
+  bool highlight_recovery = true;
   // Highlight reconstruction (inpaint opposed, darktable / OpposedHighlightsVulkan idea, 2026-11-20): a
   // clipped channel is rebuilt from the UNCLIPPED channels with the colour of the reference's unclipped
   // pixels bordering clipped areas (wb space, G = 1): c = col_c * mean_k(v_k / col_k) over unclipped k.
@@ -162,6 +172,7 @@ struct SolveParams {
   // finished image and compared with it; SolveStats::ho_r / ho_valid receive the result.
   bool holdout = false;
   std::string debug_prefix; // opt-in per-tile trace, unique path owned by MergeFull
+  std::string dense_field_path;  // Optional per-tile research replay.
   bool debug_maps = false;   // fill SolveStats::dbg (LKR_DEBUG_MAPS)
   bool notch = true;           // remove Bayer-period (zipper/maze) structure from colour + grain
   float clip = 0.98f;          // normalised level at/above which a raw sample is treated as clipped

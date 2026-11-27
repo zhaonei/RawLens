@@ -30,7 +30,7 @@ data class MfsrSettings(
     /**
      * Noise model for the merge (GAT, SNR -> tile/kernel params, robustness
      * LUT). On (default): the learned per-device model
-     * (WaveletDenoiser store, rawlens_noise::fit) sets the green level, the
+     * (RawNoiseModel store, rawlens_noise::fit) sets the green level, the
      * Camera2 profile only the R/B-to-G shape; until the model is trained
      * it falls back to the profile. Off: the Camera2 profile as reported
      * (this phone's overstates base-ISO noise 4-14x in variance,
@@ -43,13 +43,15 @@ data class MfsrSettings(
      * the plain Wronski Eq. 1 merge (previous output, bit for bit).
      */
     val zipperFix: Boolean = true,
+    val greenFit: Boolean = true,
+    val rtSharpen: Boolean = false,
     /**
      * Two-band reconstruction (sr-pipeline TwoBandReconstruction on Vulkan):
      * low band = wide Gaussian, high band = narrow Gaussian residual with an
      * overlapped DCT Wiener, no per-frame kernels. Needs the zipper fix
      * (colour differences); off = the Wronski kernel merge.
      */
-    val twoBand: Boolean = true,
+    val twoBand: Boolean = false,
     /**
      * Merge engine behind the same shutter / ZSL / save path: Wronski MFSR
      * (sr-pipeline) or LK-Reloaded (tools/lkr-lite = LK-R Lite, after Lecouat et al. 2021).
@@ -62,6 +64,10 @@ data class MfsrSettings(
     /** LK-R: learned post-fit network (colour dots / colour zipper; colour only). Stored default: on with
      *  an NPU (LkrBridge.nativeHasNpu); this constructor default only applies before settings load. */
     val lkrNetwork: Boolean = false,
+    val lkrNpuDenoise: Boolean = false,
+    val lkrNoPrior: Boolean = false,
+    /** LK-R: rebuild clipped highlights (lamps, bulbs, sky) from the neighbours' local colour; off keeps the old neutral rule. */
+    val lkrHighlightRecovery: Boolean = true,
     /**
      * LK-R: reference = sharpest of the middle three frames instead of the
      * newest three ([BurstSharpness.plan]); more frames survive motion
@@ -99,16 +105,24 @@ data class MfsrSettings(
     fun activeFrameCount(configuredCount: Int): Int =
         configuredCount.coerceIn(MIN_MERGE_FRAMES, maxFrames(engine, if (lkrFullRes && lkrZoom == LkrZoom.X1) LkrZoom.FULL_2X else lkrZoom))
 
+    internal val useGreenFit: Boolean
+        get() = greenFit && !mfsrFullRes && zipperFix && !twoBand
+
     fun toPreferences(): Map<String, Any> = mapOf(
-        "mfsr_enabled" to enabled,
+        KEY_ENABLED to enabled,
         "mfsr_keep_source_burst" to keepSourceBurst,
         "mfsr_s3" to s3,
         "mfsr_learned_noise" to learnedNoise,
         "mfsr_zipper_fix" to zipperFix,
-        "mfsr_two_band" to twoBand,
+        "mfsr_green_fit" to greenFit,
+        KEY_RT_SHARPEN to rtSharpen,
+        KEY_EXPERIMENTAL_TWO_BAND to twoBand,
         "mfsr_engine" to engine.name,
         "lkr_dct_prior" to lkrDctPrior,
         "lkr_network" to lkrNetwork,
+        "lkr_npu_denoise" to lkrNpuDenoise,
+        "lkr_no_prior" to lkrNoPrior,
+        "lkr_highlight_rec" to lkrHighlightRecovery,
         "lkr_middle_reference" to lkrMiddleReference,
         "lkr_zoom" to lkrZoom.name,
         "lkr_full_res" to lkrFullRes,
@@ -133,19 +147,28 @@ data class MfsrSettings(
     }
 
     companion object {
+        const val KEY_ENABLED = "mfsr_enabled"
+        // The old key could contain the former default from a bulk settings save.
+        const val KEY_RT_SHARPEN = "mfsr_rt_sharpen"
+        const val KEY_EXPERIMENTAL_TWO_BAND = "mfsr_experimental_two_band"
         fun fromPreferences(values: Map<String, *>): MfsrSettings = MfsrSettings(
-            enabled = values["mfsr_enabled"] as? Boolean ?: false,
+            enabled = values[KEY_ENABLED] as? Boolean ?: false,
             keepSourceBurst = values["mfsr_keep_source_burst"] as? Boolean ?: false,
             s3 = values["mfsr_s3"] as? Boolean ?: true,
             learnedNoise = values["mfsr_learned_noise"] as? Boolean ?: true,
             zipperFix = values["mfsr_zipper_fix"] as? Boolean ?: true,
-            twoBand = values["mfsr_two_band"] as? Boolean ?: true,
+            greenFit = values["mfsr_green_fit"] as? Boolean ?: true,
+            rtSharpen = values[KEY_RT_SHARPEN] as? Boolean ?: false,
+            twoBand = values[KEY_EXPERIMENTAL_TWO_BAND] as? Boolean ?: false,
             engine = MfsrEngine.entries.firstOrNull { it.name == values["mfsr_engine"] } ?: MfsrEngine.MFSR,
             lkrDctPrior = values["lkr_dct_prior"] as? Boolean ?: false,
             // Default: on for phones with an NPU (nearly free there; colour-only since d1affb09, no luma
             // sharpening), off otherwise (the Vulkan fallback costs GPU time). Caught here: LkrBridge's class
             // init loads the native library (absent in JVM tests).
             lkrNetwork = values["lkr_network"] as? Boolean ?: runCatching { LkrBridge.nativeHasNpu() }.getOrDefault(false),
+            lkrNpuDenoise = values["lkr_npu_denoise"] as? Boolean ?: false,
+            lkrNoPrior = values["lkr_no_prior"] as? Boolean ?: false,
+            lkrHighlightRecovery = values["lkr_highlight_rec"] as? Boolean ?: true,
             lkrMiddleReference = values["lkr_middle_reference"] as? Boolean ?: true,
             // Legacy FULL_2X (zoom and resolution in one value) splits into 1x + full res.
             lkrZoom = (LkrZoom.entries.firstOrNull { it.name == values["lkr_zoom"] } ?: LkrZoom.X1)
@@ -156,7 +179,7 @@ data class MfsrSettings(
         )
 
         const val MIN_MERGE_FRAMES = 2
-        const val MAX_MERGE_FRAMES = 16
+        const val MAX_MERGE_FRAMES = 30
         /** LK-R at x1 follows the largest burst the app captures. */
         const val MAX_LKR_FRAMES = 59
         /**
@@ -175,9 +198,9 @@ data class MfsrSettings(
 
 /**
  * LK-R zoom: [factor] of the centre crop. 1x solves the full frame at x1;
- * 1.2x, 1.5x and 2x solve the centre 1/factor crop at x2 (2x lands exactly on
- * the sensor size, 1.5x / 1.2x are area-downsampled to it), so the output is
- * always sensor resolution with real super-resolved detail.
+ * 1.5x and 2x solve the centre 1/factor crop at x2 (2x lands exactly on the
+ * sensor size, 1.5x is area-downsampled to it), so the output is always
+ * sensor resolution with real super-resolved detail.
  */
 enum class LkrZoom(val factor: Float, val label: String) {
     X1(1f, "1×"), X1_2(1.2f, "1.2×"), X1_5(1.5f, "1.5×"), X2(2f, "2×"),

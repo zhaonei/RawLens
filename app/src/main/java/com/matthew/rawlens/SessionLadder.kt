@@ -20,9 +20,10 @@ internal class SessionLadder {
     /** Index into the session's ordered stream combos (0 = full combo). */
     var comboIndex = 0
 
-    /** The direct-physical route of a vendor composite is in use. */
+    /** The direct route to the selected physical sensor is in use. */
     var altRouteActive = false
         private set
+    private var altRouteTried = false
 
     private var lensId: String? = null
 
@@ -60,19 +61,19 @@ internal class SessionLadder {
     fun reset() {
         comboIndex = 0
         altRouteActive = false
+        altRouteTried = false
         failedOpenIds.clear()
-        routeRetries = 0
-        rejectionRetries = 0
+        resetOpenRetries()
     }
 
-    /** Camera start: a fresh lifecycle gets a fresh route-retry budget. */
-    fun resetRouteRetries() {
+    /** A fresh camera lifecycle retries temporary provider failures. */
+    fun resetOpenRetries() {
         routeRetries = 0
+        rejectionRetries = 0
     }
 
     fun onOpened(openId: String) {
-        routeRetries = 0
-        rejectionRetries = 0
+        resetOpenRetries()
         openedOnce += openId
     }
 
@@ -94,11 +95,12 @@ internal class SessionLadder {
     }
 
     fun altRouteAvailable(altOpenId: String?): Boolean =
-        !altRouteActive && altOpenId != null && altOpenId !in failedOpenIds
+        !altRouteTried && altOpenId != null && altOpenId !in failedOpenIds
 
-    /** First rung for vendor composites: direct-physical route, full combo. */
+    /** Try the selected sensor directly with the full stream combination. */
     fun switchToAltRoute() {
         altRouteActive = true
+        altRouteTried = true
         comboIndex = 0
     }
 

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 
 #include "lkrl_image.h"
@@ -373,27 +374,37 @@ LkRef LkPrepare(const float* ref, int h, int w, int levels) {
   return R;
 }
 
-double LkResidual(const LkRef& ref, const float* mov, const std::array<double, 6>& p) {
+LkFitComparison LkCompareFits(const LkRef& ref, const float* mov,
+                             const std::array<double, 6>& seed,
+                             const std::array<double, 6>& candidate) {
   const int h = ref.hs[0], w = ref.ws[0];
   const double* r = ref.r[0].data();
-  double e = 0;
-  size_t n = 0;
+  LkFitComparison fit;
+  auto sample = [&](const std::array<double, 6>& p, double ux, double uy) {
+    const double x = p[0] * ux + p[1] * uy + p[2] - 0.5;
+    const double y = p[3] * ux + p[4] * uy + p[5] - 0.5;
+    if (!(x >= 0 && y >= 0 && x < w - 1 && y < h - 1))
+      return std::numeric_limits<double>::quiet_NaN();
+    const int ix = int(x), iy = int(y);
+    return tap(r, size_t(iy) * w + ix, w, x - ix, y - iy);
+  };
   for (int i = 0; i < h; ++i)
     for (int j = 0; j < w; ++j) {
-      const double ux = j + 0.5, uy = i + 0.5;
-      const double fx = p[0] * ux + p[1] * uy + p[2] - 0.5, fy = p[3] * ux + p[4] * uy + p[5] - 0.5;
-      const int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
-      if (!(x0 >= 0 && y0 >= 0 && x0 + 1 < w && y0 + 1 < h)) continue;
-      const double d = std::fabs(tap(r, size_t(y0) * w + x0, w, fx - x0, fy - y0) - mov[size_t(i) * w + j]);
-      if (!std::isfinite(d)) continue;   // masked (NaN)
-      e += d;
-      ++n;
+      const double observed = mov[size_t(i) * w + j];
+      const double seed_error = std::abs(sample(seed, j + 0.5, i + 0.5) - observed);
+      if (!std::isfinite(seed_error)) continue;
+      ++fit.seed_samples;
+      const double candidate_error = std::abs(sample(candidate, j + 0.5, i + 0.5) - observed);
+      if (!std::isfinite(candidate_error)) continue;
+      fit.seed_error += seed_error;
+      fit.candidate_error += candidate_error;
+      ++fit.common_samples;
     }
-  return n ? e / n : 1e30;
-}
-
-double LkResidual(const float* ref, const float* mov, int h, int w, const std::array<double, 6>& p) {
-  return LkResidual(LkPrepare(ref, h, w, 1), mov, p);
+  if (fit.common_samples) {
+    fit.seed_error /= fit.common_samples;
+    fit.candidate_error /= fit.common_samples;
+  }
+  return fit;
 }
 
 std::vector<std::vector<double>> LkMovPyramid(const LkRef& ref, const float* mov) {
@@ -423,6 +434,12 @@ std::array<double, 6> LkAffine(const LkRef& ref, const float* mov, int iters, co
   }
   p[2] /= std::pow(2.0, levels - 1);
   p[5] /= std::pow(2.0, levels - 1);
+  // Convergence: translation step below tol (px of the level) or the iteration cap (LKRL_LK_TOL / LKRL_LK_IT override;
+  // LKRL_LK_TOL=0.001 LKRL_LK_IT=0 = the old 1e-3 / 30). Default 0.05 / 5 since 2026-11-26: half the quadrant fits ran
+  // to the cap chasing 1e-3, the GPU refines motion anyway; real holdout 14 bursts within +-0.2 %, phone prep 41 -> 9 s.
+  static const double lk_tol = std::getenv("LKRL_LK_TOL") ? std::atof(std::getenv("LKRL_LK_TOL")) : 0.05;
+  static const int lk_cap = std::getenv("LKRL_LK_IT") ? std::atoi(std::getenv("LKRL_LK_IT")) : 5;
+  if (lk_cap > 0) iters = std::min(iters, lk_cap);
   for (int lv = levels - 1; lv >= 0; --lv) {
     const int H = ref.hs[size_t(lv)], W = ref.ws[size_t(lv)];
     const double* rg = ref.rgg[size_t(lv)].data();
@@ -471,7 +488,7 @@ std::array<double, 6> LkAffine(const LkRef& ref, const float* mov, int iters, co
       double dp[6];
       if (!solve6(A, b, dp)) break;
       for (int a = 0; a < 6; ++a) p[a] += dp[a];
-      if (std::max(std::fabs(dp[2]), std::fabs(dp[5])) < 1e-3) { if (std::getenv("LKRL_LK_STATS")) std::fprintf(stderr, "lkstat lv%d W%d it%d\n", lv, W, it + 1); break; }
+      if (std::max(std::fabs(dp[2]), std::fabs(dp[5])) < lk_tol) { if (std::getenv("LKRL_LK_STATS")) std::fprintf(stderr, "lkstat lv%d W%d it%d\n", lv, W, it + 1); break; }
       if (it + 1 == iters && std::getenv("LKRL_LK_STATS")) std::fprintf(stderr, "lkstat lv%d W%d it%d cap\n", lv, W, it + 1);
     }
     if (lv) {

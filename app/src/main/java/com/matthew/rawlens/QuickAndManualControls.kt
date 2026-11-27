@@ -64,7 +64,6 @@ import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
-import com.particlesdevs.photoncamera.processing.ml.RawNindNcnnProcessor
 import java.io.File
 import java.util.Locale
 import android.os.Build
@@ -106,6 +105,7 @@ internal fun MainActivity.showQuickControls() {
     updateQuickControls()
     quickPanel.alpha = 0f
     quickPanel.visibility = View.VISIBLE
+    findViewById<View>(R.id.quickButton).isSelected = true
     positionQuickPanel()
     quickPanel.animate().alpha(1f).setDuration(160L).start()
     quickPanel.post { positionQuickPanel(); updateOverlayStack() }
@@ -120,10 +120,7 @@ internal fun MainActivity.closeFloatingPanels() {
 
 
 internal fun MainActivity.setQuickTileState(tile: TextView, active: Boolean) {
-    if (quickTileStates.put(tile, active) == active) return
-    tile.background = getDrawable(if (active) R.drawable.quick_tile_active else R.drawable.quick_tile)
     tile.isSelected = active
-    tile.setTextColor(getColor(if (active) R.color.accent_dark else R.color.text_primary))
 }
 
 /** Top-bar gold tags: only photo features that are on right now. */
@@ -140,18 +137,10 @@ internal fun MainActivity.refreshFeatureTags(ettrEnabled: Boolean) {
     featureTags.visibility = if (tags.isEmpty()) View.GONE else View.VISIBLE
 }
 
-/** Exposure tiles: gold value when the user set it, primary when auto. */
-internal fun MainActivity.refreshManualTileAccents() {
-    fun tint(tile: TextView, manual: Boolean) =
-        tile.setTextColor(getColor(if (manual) R.color.accent else R.color.text_primary))
-    fun manual(control: ManualControl) =
-        runCatching { manualRangeFor(control)?.automatic == false }.getOrDefault(false)
-    tint(isoControl, manual(ManualControl.ISO))
-    tint(shutterControl, manual(ManualControl.SHUTTER))
-    tint(wbControl, manual(ManualControl.WHITE_BALANCE))
-    tint(focusControl, manual(ManualControl.FOCUS_DISTANCE))
-    val ev = evControl.text.lines().lastOrNull()?.trim()
-    tint(evControl, ev != null && ev != "+0.0" && ev != "0.0" && ev != "--")
+internal fun MainActivity.refreshExposureAutoIndicators() {
+    isoControl.exposureAutomatic = manualRangeFor(ManualControl.ISO)?.automatic == true
+    shutterControl.exposureAutomatic = manualRangeFor(ManualControl.SHUTTER)?.automatic == true
+    wbControl.exposureAutomatic = manualRangeFor(ManualControl.WHITE_BALANCE)?.automatic == true
 }
 
 /** Both scope views share one bottom slot; only the active mode is visible. */
@@ -231,8 +220,9 @@ internal fun MainActivity.refreshLensSwitcher() {
     // that the row scrolls (lensScroll). Idle discs sit slightly smaller
     // so the selected lens reads as the one in front.
     val gap = dp(6)
-    // Panel row minus the track's 4dp padding on each side.
-    val rowWidth = resources.displayMetrics.widthPixels - dp(32) - dp(8)
+    // Reserve the fixed AF-ON/AE-L buttons, their margins and track padding.
+    // The remaining viewport scrolls independently of those controls.
+    val rowWidth = resources.displayMetrics.widthPixels - dp(32 + 108 + 12 + 8)
     val discSize = ((rowWidth - gap * (options.size - 1)) / options.size)
         .coerceIn(dp(36), dp(44))
     var selectedButton: View? = null
@@ -395,19 +385,18 @@ internal fun MainActivity.refreshVideoChip(control: ManualControl) {
             }
         }
     }
+    refreshExposureAutoIndicators()
 }
 
-internal fun MainActivity.formatVideoEvStops(index: Long): String {
+private fun MainActivity.videoEvStops(index: Long): Float? {
     val step = runCatching {
-        val manager = getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
-        val cameraId = videoCameraInfo(manager)?.first ?: return@runCatching null
-        manager.getCameraCharacteristics(cameraId)
-            .get(android.hardware.camera2.CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
-            ?.toFloat()
-    }.getOrNull() ?: return "EV $index"
-    if (step <= 0f) return "EV $index"
-    return String.format(Locale.US, "EV %+.1f", index * step)
+        videoRecorder?.exposureCompensationStep() ?: encodedVideoRecorder?.exposureCompensationStep()
+    }.getOrNull()?.takeIf { it > 0f } ?: return null
+    return index * step
 }
+
+internal fun MainActivity.formatVideoEvStops(index: Long): String =
+    videoEvStops(index)?.let { String.format(Locale.US, "EV %+.1f", it) } ?: "EV $index"
 
 internal fun MainActivity.showManualControl(control: ManualControl, allowToggle: Boolean = true) {
     recordingTools.wakePreview()
@@ -421,16 +410,12 @@ internal fun MainActivity.showManualControl(control: ManualControl, allowToggle:
         setStatus("${shortControlName(control)} N/A")
         return
     }
+    cancelPendingSliderUpdate()
     activeManualControl = control
     activeProgramAxis = null
-    // Tick-only ruler with no text label: values live in the exposure chips, never
-    // in the slider strip, so landscape stays compact. Full values remain in
-    // accessibility descriptions.
     manualLimits.visibility = View.GONE
-    manualSlider.label = shortControlName(control)
-    manualSlider.max = if (control == ManualControl.WHITE_BALANCE && controller.wbPresetsEnabled)
-        range.maximum.toInt().coerceAtLeast(1) else SLIDER_STEPS
-    manualSlider.setProgressFromUser(sliderProgress(control, range), fromUser = false)
+    manualSlider.max = sliderSteps(control, range)
+    manualSlider.progress = sliderProgress(control, range)
     manualAuto.text = if (control == ManualControl.EXPOSURE_COMPENSATION) "RESET" else "AUTO"
     manualAuto.isEnabled = !range.automatic
     refreshRuleSliderAccessibility()
@@ -441,41 +426,20 @@ internal fun MainActivity.showManualControl(control: ManualControl, allowToggle:
     scheduleManualPanelHide()
 }
 
-/** Full value stays available to accessibility even though the ruler draws ticks only. */
+/** Use the same camera-value mapping for the scale and its accessibility readout. */
 internal fun MainActivity.refreshRuleSliderAccessibility() {
-    activeProgramAxis?.let { axis ->
-        val range = manualRangeFor(axis) ?: return
-        val value = sliderValue(axis, range, manualSlider.progress)
-        val valueText = formatManualValue(axis, value)
-        manualSlider.valueText = rulerValueText(axis, value)
-        manualSlider.minText = rulerValueText(axis, range.minimum)
-        manualSlider.maxText = rulerValueText(axis, range.maximum)
-        manualSlider.contentDescription =
-            "${controlName(axis)} lock slider, $valueText. Current value also shown in the ${shortControlName(axis)} chip."
-        return
-    }
-    val control = activeManualControl ?: return
+    val control = activeProgramAxis ?: activeManualControl ?: return
     val range = manualRangeFor(control) ?: return
-    val value = sliderValue(control, range, manualSlider.progress)
-    val valueText = formatManualValue(control, value)
-    manualSlider.valueText = rulerValueText(control, value)
-    manualSlider.minText = rulerValueText(control, range.minimum)
-    manualSlider.maxText = rulerValueText(control, range.maximum)
-    manualSlider.contentDescription =
-        "${controlName(control)} slider, $valueText. Current value also shown in the ${shortControlName(control)} chip."
-}
-
-/**
- * Compact value for the floating ruler: the axis code already sits above it,
- * so "ISO 7964" becomes "7964" and "+0.2 EV" becomes "+0.2".
- */
-internal fun MainActivity.rulerValueText(control: ManualControl, value: Long): String {
-    val full = formatManualValue(control, value)
-    return when (control) {
-        ManualControl.ISO -> full.removePrefix("ISO ").trim()
-        ManualControl.EXPOSURE_COMPENSATION -> full.removeSuffix(" EV").trim()
-        else -> full
-    }.ifEmpty { "--" }
+    fun labelAt(progress: Int) = formatManualValue(control, sliderValue(control, range, progress))
+    val valueText = labelAt(manualSlider.progress)
+    manualSlider.valueLabel = valueText
+    manualSlider.referenceLabels = if (control == ManualControl.WHITE_BALANCE && controller.wbPresetsEnabled) {
+        null
+    } else {
+        fun referenceAt(position: Int) = labelAt(position).removePrefix("ISO ").removeSuffix(" EV")
+        referenceAt(manualSlider.max / 4) to referenceAt(manualSlider.max * 3 / 4)
+    }
+    manualSlider.contentDescription = "${controlName(control)}, $valueText"
 }
 
 internal fun MainActivity.scheduleManualPanelHide() {
@@ -491,18 +455,26 @@ internal fun MainActivity.cancelManualPanelHide() {
 }
 
 
+internal fun MainActivity.sliderSteps(control: ManualControl, range: ManualControlRange): Int =
+    when {
+        control == ManualControl.EXPOSURE_COMPENSATION ||
+            (control == ManualControl.WHITE_BALANCE && controller.wbPresetsEnabled) ->
+            (range.maximum - range.minimum).toInt().coerceAtLeast(1)
+        else -> SLIDER_STEPS
+    }
+
+private fun usesLogScale(control: ManualControl, range: ManualControlRange): Boolean =
+    range.minimum > 0L && (control == ManualControl.SHUTTER || control == ManualControl.ISO)
+
 internal fun MainActivity.sliderProgress(control: ManualControl, range: ManualControlRange): Int {
     if (range.maximum <= range.minimum) return 0
-    val fraction = if (control == ManualControl.SHUTTER) {
-        val minLog = kotlin.math.ln(range.minimum.toDouble())
-        (kotlin.math.ln(range.current.toDouble()) - minLog) /
-            (kotlin.math.ln(range.maximum.toDouble()) - minLog)
+    val fraction = if (usesLogScale(control, range)) {
+        kotlin.math.ln(range.current.toDouble() / range.minimum) /
+            kotlin.math.ln(range.maximum.toDouble() / range.minimum)
     } else {
         (range.current - range.minimum).toDouble() / (range.maximum - range.minimum)
     }
-    val steps = if (control == ManualControl.WHITE_BALANCE && controller.wbPresetsEnabled)
-        range.maximum.toInt().coerceAtLeast(1) else SLIDER_STEPS
-    return kotlin.math.round(fraction.coerceIn(0.0, 1.0) * steps).toInt()
+    return kotlin.math.round(fraction.coerceIn(0.0, 1.0) * sliderSteps(control, range)).toInt()
 }
 
 internal fun MainActivity.sliderValue(
@@ -510,25 +482,22 @@ internal fun MainActivity.sliderValue(
     range: ManualControlRange,
     progress: Int
 ): Long {
-    val steps = if (control == ManualControl.WHITE_BALANCE && controller.wbPresetsEnabled)
-        range.maximum.toInt().coerceAtLeast(1) else SLIDER_STEPS
+    val steps = sliderSteps(control, range)
+    if (progress <= 0) return range.minimum
+    if (progress >= steps) return range.maximum
     val fraction = progress.toDouble() / steps
-    return if (control == ManualControl.SHUTTER) {
-        kotlin.math.exp(
-            kotlin.math.ln(range.minimum.toDouble()) + fraction *
-                (kotlin.math.ln(range.maximum.toDouble()) - kotlin.math.ln(range.minimum.toDouble()))
-        ).toLong().coerceIn(range.minimum, range.maximum)
+    val value = if (usesLogScale(control, range)) {
+        range.minimum * kotlin.math.exp(fraction * kotlin.math.ln(range.maximum.toDouble() / range.minimum))
     } else {
-        val raw = range.minimum + fraction * (range.maximum - range.minimum)
-        (if (control == ManualControl.WHITE_BALANCE && controller.wbPresetsEnabled)
-            kotlin.math.round(raw).toLong() else raw.toLong())
-            .coerceIn(range.minimum, range.maximum)
+        range.minimum + fraction * (range.maximum - range.minimum)
     }
+    return kotlin.math.round(value).toLong().coerceIn(range.minimum, range.maximum)
 }
 
 internal fun MainActivity.updateAutomaticPanelValue(iso: Int, shutter: Long, wb: Int) {
     val control = activeManualControl ?: return
-    if (manualPanel.visibility != View.VISIBLE) return
+    if (manualPanel.visibility != View.VISIBLE || manualSlider.isTracking || hasPendingSliderUpdate) return
+    if (control == ManualControl.WHITE_BALANCE && controller.wbPresetsEnabled) return
     val range = manualRangeFor(control) ?: return
     if (!range.automatic) return
     val value = when (control) {
@@ -538,10 +507,9 @@ internal fun MainActivity.updateAutomaticPanelValue(iso: Int, shutter: Long, wb:
         ManualControl.FOCUS_DISTANCE -> range.current
         ManualControl.EXPOSURE_COMPENSATION -> range.current
     }
-    if (value > 0 || control == ManualControl.EXPOSURE_COMPENSATION) {
-        manualSlider.setProgressFromUser(
-            sliderProgress(control, range.copy(current = value.coerceIn(range.minimum, range.maximum))),
-            fromUser = false
+    if (value > 0 || control == ManualControl.FOCUS_DISTANCE || control == ManualControl.EXPOSURE_COMPENSATION) {
+        manualSlider.progress = sliderProgress(
+            control, range.copy(current = value.coerceIn(range.minimum, range.maximum))
         )
         refreshRuleSliderAccessibility()
     }
@@ -571,16 +539,21 @@ internal fun MainActivity.formatManualValue(control: ManualControl, value: Long)
         controller.whiteBalancePresets().getOrNull(value.toInt())?.second ?: "Auto"
         else "${value} K"
     ManualControl.FOCUS_DISTANCE -> formatFocusDistance(value)
-    ManualControl.EXPOSURE_COMPENSATION -> String.format(
-        Locale.US, "%+.1f EV", controller.exposureCompensationStops(value)
-    )
+    ManualControl.EXPOSURE_COMPENSATION -> {
+        val stops = if (videoRecording) videoEvStops(value) else controller.exposureCompensationStops(value)
+        if (stops != null) String.format(Locale.US, "%+.1f EV", stops) else "Step $value"
+    }
 }
 
 internal fun MainActivity.formatFocusDistance(scaledDiopters: Long): String {
     if (scaledDiopters <= 1L) return "∞"
     val meters = 1_000.0 / scaledDiopters
-    return if (meters >= 10.0) String.format(Locale.US, "%.0f m", meters)
-    else String.format(Locale.US, "%.1f m", meters)
+    val format = when {
+        meters >= 10.0 -> "%.0f m"
+        meters >= 1.0 -> "%.1f m"
+        else -> "%.2f m"
+    }
+    return String.format(Locale.US, format, meters)
 }
 
 /** Share the photo settings level with PROGRAM metering and ETTR protection. */
@@ -604,11 +577,10 @@ internal fun MainActivity.cycleQuickMono() {
     if (isVideoMode) return
     val current = jpegOutputSettings()
     val next = current.mono.mode.next()
-    if (!controller.setJpegOutputSettings(current.copy(mono = current.mono.copy(mode = next)).resolvedForPlatform())) {
+    if (!applyPhotoOutputSettings(current.copy(mono = current.mono.copy(mode = next)))) {
         setStatus("SETTINGS AFTER SAVES")
         return
     }
-    lensPreferences().edit().putString(MonoMode.PREFERENCE_KEY, next.name).apply()
     updateQuickControls()
     setStatus(if (next.enabled) "B&W • ${next.label.uppercase(Locale.US)}" else "COLOR")
 }
@@ -629,4 +601,27 @@ internal fun MainActivity.syncRecordingWhiteBalance() {
     videoRecorder?.setVideoWhiteBalance(selection.wbKelvin, selection.wbPreset)
     encodedVideoRecorder?.setVideoWhiteBalance(selection.wbKelvin, selection.wbPreset)
     wbControl.text = controlText("WB", controller.whiteBalanceLabel())
+}
+
+private val PORTRAIT_QUICK_STOPS = floatArrayOf(1.4f, 1.8f, 2.8f, 4.0f)
+
+/** Off -> f/1.4 -> f/1.8 -> f/2.8 -> f/4 -> Off; frozen per shot like every output choice. */
+internal fun MainActivity.cycleQuickPortrait() {
+    if (isVideoMode || !PortraitNetsHolder.available(this)) return
+    val current = jpegOutputSettings()
+    val portrait = current.portrait
+    val next = when {
+        !portrait.enabled -> portrait.copy(enabled = true, fNumber = PORTRAIT_QUICK_STOPS[0])
+        else -> {
+            val i = PORTRAIT_QUICK_STOPS.indexOfFirst { it >= portrait.fNumber - 0.05f }
+            if (i < 0 || i == PORTRAIT_QUICK_STOPS.lastIndex) portrait.copy(enabled = false)
+            else portrait.copy(fNumber = PORTRAIT_QUICK_STOPS[i + 1])
+        }
+    }
+    if (!applyPhotoOutputSettings(current.copy(portrait = next))) {
+        setStatus("SETTINGS AFTER SAVES")
+        return
+    }
+    updateQuickControls()
+    setStatus(if (next.enabled) "PORTRAIT • ${PortraitSettings.label(next.fNumber).uppercase(Locale.US)}" else "PORTRAIT OFF")
 }

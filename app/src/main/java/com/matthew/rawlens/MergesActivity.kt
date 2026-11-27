@@ -390,7 +390,8 @@ class MergesActivity : Activity() {
             .putString(KEY_MERGE_LKR_ZOOM, lkrZoom.name)
             .putBoolean("mfsr_s3", tuningMfsr.s3)
             .putBoolean("mfsr_zipper_fix", tuningMfsr.zipperFix)
-            .putBoolean("mfsr_two_band", tuningMfsr.twoBand)
+            .putBoolean(MfsrSettings.KEY_RT_SHARPEN, tuningMfsr.rtSharpen)
+            .putBoolean(MfsrSettings.KEY_EXPERIMENTAL_TWO_BAND, tuningMfsr.twoBand)
             .putBoolean("mfsr_learned_noise", tuningMfsr.learnedNoise)
             .putBoolean("lkr_dct_prior", tuningMfsr.lkrDctPrior)
             .putBoolean("hdr_plus_scene_auto_migrated", true)
@@ -692,6 +693,7 @@ class MergesActivity : Activity() {
             BurstMergeRunner.Method.MFSR -> {
                 toggle("Artefact rejection", tuningMfsr.s3) { tuningMfsr = tuningMfsr.copy(s3 = it) }
                 toggle("Colour zipper correction", tuningMfsr.zipperFix) { tuningMfsr = tuningMfsr.copy(zipperFix = it) }
+                toggle("RT capture sharpening", tuningMfsr.rtSharpen) { tuningMfsr = tuningMfsr.copy(rtSharpen = it) }
                 toggle("Learned noise model", tuningMfsr.learnedNoise) { tuningMfsr = tuningMfsr.copy(learnedNoise = it) }
             }
             BurstMergeRunner.Method.LKR -> {
@@ -927,7 +929,7 @@ class MergesActivity : Activity() {
         val inputs = BurstMergeRunner.Inputs(
             mfsr = tuningMfsr.copy(lkrZoom = lkrZoom, lkrFullRes = false),
             hdrPlus = tuningHdr,
-            jpeg = MergeScreenSettings.jpeg(prefs),
+            jpeg = MergeScreenSettings.jpeg(prefs, PhotoLutSelection(applicationContext).current()),
             denoise = MergeScreenSettings.denoise(prefs),
             jxl = MergeScreenSettings.jxl(prefs),
             developedFormat = developedFormat,

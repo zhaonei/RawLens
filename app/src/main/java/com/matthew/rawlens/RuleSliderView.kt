@@ -9,18 +9,18 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.util.AttributeSet
-import android.util.TypedValue
+import android.os.Build
+import android.os.Bundle
+import android.os.SystemClock
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
+import android.view.accessibility.AccessibilityNodeInfo
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
-/**
- * Minimal floating ruler slider, after the reference camera apps:
- * a translucent dark strip with the axis code + live value stacked on top,
- * a slim tick band, edge min/max hints, and a sand needle. Values are fed in
- * via [valueText]/[minText]/[maxText] so the strip stays self-sufficient and
- * the exposure chips are free for status.
- */
+/** Engraved scale with reference marks in the active camera setting’s units. */
 class RuleSliderView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null,
@@ -43,47 +43,38 @@ class RuleSliderView @JvmOverloads constructor(
             }
         }
 
-    /** Short code (SS / ISO / WB / MF / EV). */
-    var label: String = ""
+    var referenceLabels: Pair<String, String>? = null
         set(value) {
+            if (field == value) return
             field = value
             invalidate()
         }
 
-    /** Live formatted value drawn bold under the code (e.g. "1/60", "+0.2"). */
-    var valueText: String = ""
+    var valueLabel: String = ""
         set(value) {
-            field = value
-            invalidate()
-        }
-
-    /** Edge hints for the tick band (range min / max). Empty hides them. */
-    var minText: String = ""
-        set(value) {
-            field = value
-            invalidate()
-        }
-
-    var maxText: String = ""
-        set(value) {
+            if (field == value) return
             field = value
             invalidate()
         }
 
     override var contentRotation: Float = 0f
         set(value) {
+            if (field == value) return
             field = value
             invalidate()
         }
 
-    var onProgressChanged: ((progress: Int, fromUser: Boolean) -> Unit)? = null
+    var onProgressChanged: (() -> Unit)? = null
     var onStartTracking: (() -> Unit)? = null
-    var onStopTracking: ((progress: Int) -> Unit)? = null
+    var onStopTracking: ((progress: Int, changed: Boolean) -> Unit)? = null
 
     private val density = resources.displayMetrics.density
+    private val accentColor = context.getColor(R.color.accent)
+    private val labelColor = context.getColor(R.color.text_primary)
     private val backgroundRect = RectF()
     private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(105, 10, 12, 14)
+        color = context.getColor(R.color.surface_container)
+        alpha = 168
         style = Paint.Style.FILL
     }
     private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -102,151 +93,206 @@ class RuleSliderView @JvmOverloads constructor(
         strokeCap = Paint.Cap.ROUND
     }
     private val needlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(221, 192, 141)
+        color = accentColor
         strokeWidth = 2.5f * density
         strokeCap = Paint.Cap.ROUND
     }
-    private val needleGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(64, 221, 192, 141)
-        strokeWidth = 6f * density
-        strokeCap = Paint.Cap.ROUND
-    }
-    private val codePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(150, 255, 255, 255)
-        textSize = TypedValue.applyDimension(
-            TypedValue.COMPLEX_UNIT_SP, 8.5f, resources.displayMetrics
-        )
-        typeface = android.graphics.Typeface.create(
-            android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD
-        )
+    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = labelColor
+        typeface = android.graphics.Typeface.create("sans-serif-condensed-medium", 0)
+        textSize = 10f * density
         textAlign = Paint.Align.CENTER
-        letterSpacing = 0.14f
+        fontFeatureSettings = "tnum"
     }
-    private val valuePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(245, 255, 255, 255)
-        textSize = TypedValue.applyDimension(
-            TypedValue.COMPLEX_UNIT_SP, 14f, resources.displayMetrics
-        )
-        typeface = android.graphics.Typeface.create(
-            android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD
-        )
-        textAlign = Paint.Align.CENTER
-    }
-    private val edgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(120, 255, 255, 255)
-        textSize = TypedValue.applyDimension(
-            TypedValue.COMPLEX_UNIT_SP, 8f, resources.displayMetrics
-        )
-        typeface = android.graphics.Typeface.create(
-            android.graphics.Typeface.DEFAULT, android.graphics.Typeface.NORMAL
-        )
+    var isTracking = false
+        private set
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+    private var pointerId = MotionEvent.INVALID_POINTER_ID
+    private var previousX = 0f
+    private var dragProgress = 0f
+    private var dragging = false
+    private var changed = false
+    private var lastTickTime = 0L
+
+    init {
+        isFocusable = true
     }
 
-    private var tracking = false
+    private val divisions get() = max.coerceAtMost(20)
+    private val scaleStart get() = paddingLeft + 12f * density
+    private val scaleSpan get() = width - paddingRight - 12f * density - scaleStart
 
-    fun setProgressFromUser(progress: Int, fromUser: Boolean) {
-        this.progress = progress
-        onProgressChanged?.invoke(this.progress, fromUser)
-    }
-
-    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val desiredHeight = (68f * density).roundToInt()
-        val height = resolveSize(desiredHeight, heightMeasureSpec)
-        setMeasuredDimension(MeasureSpec.getSize(widthMeasureSpec), height)
+    private fun changeProgress(candidate: Int, explicitTap: Boolean = false) {
+        val previous = progress
+        progress = candidate
+        if (previous == progress && !explicitTap) return
+        changed = true
+        fun tick(value: Int) = (value.toFloat() * divisions / max).roundToInt()
+        val now = SystemClock.uptimeMillis()
+        if (tick(previous) != tick(progress) && now - lastTickTime >= 30L) {
+            val feedback = when {
+                Build.VERSION.SDK_INT < 34 -> HapticFeedbackConstants.CLOCK_TICK
+                max <= 20 -> HapticFeedbackConstants.SEGMENT_TICK
+                else -> HapticFeedbackConstants.SEGMENT_FREQUENT_TICK
+            }
+            performHapticFeedback(feedback)
+            lastTickTime = now
+        }
+        onProgressChanged?.invoke()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val radius = 14f * density
         backgroundRect.set(paddingLeft.toFloat(), paddingTop.toFloat(),
             (width - paddingRight).toFloat(), (height - paddingBottom).toFloat())
+        val radius = backgroundRect.height() / 2f
         canvas.drawRoundRect(backgroundRect, radius, radius, backgroundPaint)
         canvas.drawRoundRect(backgroundRect, radius, radius, borderPaint)
 
-        val centerX = backgroundRect.centerX()
-        val quarterTurn = kotlin.math.abs(kotlin.math.sin(Math.toRadians(contentRotation.toDouble()))) > 0.5
-        val headerY = if (quarterTurn) backgroundRect.centerY() else backgroundRect.top + 20f * density
-        canvas.save()
-        canvas.rotate(contentRotation, centerX, headerY)
-        if (quarterTurn) {
-            drawFittedText(canvas, "$label\n$valueText", valuePaint, centerX, headerY,
-                backgroundRect.height() - 8f * density, 64f * density)
-        } else {
-            canvas.drawText(label, centerX, backgroundRect.top + 12f * density, codePaint)
-            drawFittedText(canvas, valueText, valuePaint, centerX, backgroundRect.top + 24f * density,
-                backgroundRect.width() - 24f * density, 20f * density)
-        }
-        canvas.restore()
-
-        val tickTop = backgroundRect.top + 36f * density
-        val tickBottom = backgroundRect.bottom - 12f * density
-        val tickCenterY = (tickTop + tickBottom) / 2f
+        val sideways = abs(contentRotation % 180f) > 45f
+        val tickCenterY = if (sideways) backgroundRect.top + 10f * density
+            else backgroundRect.centerY() - 7f * density
+        val needleHalf = (if (sideways) 7f else 9f) * density
+        // At a quarter turn, measured text width runs across the ruler's height.
+        // Reserve clearance for the gold index as well as the shorter white ticks.
+        val labelTop = tickCenterY + needleHalf + needlePaint.strokeWidth / 2f + 3f * density
+        val labelBottom = backgroundRect.bottom - 3f * density
         val minorHalf = 3f * density
         val majorHalf = 5.5f * density
-        val tickCount = if (max < 21) max + 1 else 21
-        val span = backgroundRect.width() - 24f * density
-        val startX = backgroundRect.left + 12f * density
-        for (index in 0 until tickCount) {
-            val x = startX + span * index / (tickCount - 1).toFloat()
-            if (quarterTurn && kotlin.math.abs(x - centerX) < 36f * density) continue
-            val isMajor = max < 21 || index % 5 == 0 || index == tickCount / 2
+        val span = scaleSpan
+        if (span <= 0f) return
+        val startX = scaleStart
+        for (index in 0..divisions) {
+            val x = startX + span * index / divisions
+            val isMajor = max <= 20 || index % 5 == 0
             val half = if (isMajor) majorHalf else minorHalf
             canvas.drawLine(x, tickCenterY - half, x, tickCenterY + half,
                 if (isMajor) majorTickPaint else minorTickPaint)
         }
 
-        // Center rotated edge hints inside the strip instead of rotating an edge baseline
-        // outside its bounds. Leave the ruler endpoints and needle unobstructed.
-        for ((text, x) in listOf(minText to startX, maxText to (startX + span))) {
-            if (text.isEmpty()) continue
-            val hintX = if (quarterTurn) x else if (x == startX) x + 28f * density else x - 28f * density
-            val hintY = if (quarterTurn) backgroundRect.centerY() else backgroundRect.bottom - 5f * density
-            canvas.save()
-            canvas.rotate(contentRotation, hintX, hintY)
-            drawFittedText(canvas, text, edgePaint, hintX, hintY,
-                if (quarterTurn) backgroundRect.height() - 8f * density else 56f * density,
-                if (quarterTurn) 20f * density else 10f * density)
-            canvas.restore()
+        val checkpoint = canvas.save()
+        canvas.clipRect(backgroundRect)
+        for (index in 1..3) {
+            val label = when (index) {
+                1 -> referenceLabels?.first
+                2 -> valueLabel
+                else -> referenceLabels?.second
+            } ?: continue
+            labelPaint.color = if (index == 2) accentColor else labelColor
+            val x = startX + span * index / 4f
+            val y = if (sideways) (labelTop + labelBottom) / 2f
+                else backgroundRect.centerY() + 9f * density
+            val saved = canvas.save()
+            canvas.rotate(contentRotation, x, y)
+            val labelWidth = if (sideways) (labelBottom - labelTop).coerceAtLeast(1f)
+                else span / 4f
+            val naturalWidth = labelPaint.measureText(label)
+            labelPaint.textScaleX = if (naturalWidth > labelWidth) labelWidth / naturalWidth else 1f
+            canvas.drawText(label, x, y - (labelPaint.ascent() + labelPaint.descent()) / 2f, labelPaint)
+            labelPaint.textScaleX = 1f
+            canvas.restoreToCount(saved)
         }
+        canvas.restoreToCount(checkpoint)
 
-        // Sand needle marks the current position; the fill track is intentionally omitted
-        // so the strip reads as a ruler rather than a progress bar.
-        val fraction = if (max > 0) progress.toFloat() / max.toFloat() else 0f
-        val needleX = startX + span * fraction.coerceIn(0f, 1f)
-        canvas.drawLine(needleX, tickTop - 2f * density, needleX, tickBottom + 2f * density, needleGlowPaint)
-        canvas.drawLine(needleX, tickTop - 2f * density, needleX, tickBottom + 2f * density, needlePaint)
+        val needleX = startX + span * progress / max
+        canvas.drawLine(needleX, tickCenterY - needleHalf, needleX, tickCenterY + needleHalf, needlePaint)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!isEnabled || scaleSpan <= 0f) return false
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 parent?.requestDisallowInterceptTouchEvent(true)
-                tracking = true
+                pointerId = event.getPointerId(0)
+                previousX = event.x
+                dragProgress = progress.toFloat()
+                dragging = false
+                changed = false
+                isTracking = true
+                lastTickTime = 0L
                 onStartTracking?.invoke()
-                updateProgressForX(event.x, fromUser = true)
-                return true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (!tracking) return false
-                updateProgressForX(event.x, fromUser = true)
-                return true
+                val index = event.findPointerIndex(pointerId)
+                if (isTracking && index >= 0) dragTo(event.getX(index))
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (!tracking) return false
-                tracking = false
-                updateProgressForX(event.x, fromUser = true)
-                parent?.requestDisallowInterceptTouchEvent(false)
-                onStopTracking?.invoke(progress)
-                return true
+            MotionEvent.ACTION_UP -> {
+                if (isTracking) {
+                    dragTo(event.x)
+                    if (!dragging) {
+                        val target = ((event.x - scaleStart) / scaleSpan * max).roundToInt()
+                        changeProgress(target, explicitTap = true)
+                        performClick()
+                    }
+                    finishTracking()
+                }
             }
+            MotionEvent.ACTION_POINTER_UP -> {
+                if (event.getPointerId(event.actionIndex) == pointerId) finishTracking()
+            }
+            MotionEvent.ACTION_CANCEL -> finishTracking()
         }
-        return super.onTouchEvent(event)
+        return true
     }
 
-    private fun updateProgressForX(x: Float, fromUser: Boolean) {
-        val startX = paddingLeft + 12f * density
-        val endX = width - paddingRight - 12f * density
-        val fraction = if (endX > startX) ((x - startX) / (endX - startX)).coerceIn(0f, 1f) else 0f
-        setProgressFromUser((fraction * max).roundToInt(), fromUser)
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
+    }
+
+    private fun dragTo(x: Float) {
+        var dx = x - previousX
+        if (!dragging) {
+            if (abs(dx) <= touchSlop) return
+            dragging = true
+            dx += if (dx > 0f) -touchSlop else touchSlop
+        }
+        previousX = x
+        dragProgress = (dragProgress + dx * max / scaleSpan).coerceIn(0f, max.toFloat())
+        changeProgress(dragProgress.roundToInt())
+    }
+
+    private fun finishTracking() {
+        if (!isTracking) return
+        isTracking = false
+        pointerId = MotionEvent.INVALID_POINTER_ID
+        parent?.requestDisallowInterceptTouchEvent(false)
+        onStopTracking?.invoke(progress, changed)
+    }
+
+    override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
+        super.onInitializeAccessibilityNodeInfo(info)
+        info.className = "android.widget.SeekBar"
+        info.rangeInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            AccessibilityNodeInfo.RangeInfo(
+                AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_INT, 0f, max.toFloat(), progress.toFloat())
+        } else {
+            // Android 10 has no public RangeInfo constructor.
+            @Suppress("DEPRECATION")
+            AccessibilityNodeInfo.RangeInfo.obtain(
+                AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_INT, 0f, max.toFloat(), progress.toFloat())
+        }
+        if (isEnabled) {
+            info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS)
+            if (progress < max) info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD)
+            if (progress > 0) info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_BACKWARD)
+        }
+    }
+
+    override fun performAccessibilityAction(action: Int, arguments: Bundle?): Boolean {
+        if (!isEnabled) return super.performAccessibilityAction(action, arguments)
+        val step = (max / divisions).coerceAtLeast(1)
+        val target = when (action) {
+            AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.id ->
+                arguments?.getFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE)?.roundToInt() ?: return false
+            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD -> progress + step
+            AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD -> progress - step
+            else -> return super.performAccessibilityAction(action, arguments)
+        }
+        if (target.coerceIn(0, max) == progress) return false
+        onStartTracking?.invoke()
+        changeProgress(target)
+        onStopTracking?.invoke(progress, true)
+        return true
     }
 }

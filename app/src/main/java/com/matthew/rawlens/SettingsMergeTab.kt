@@ -22,7 +22,7 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
     fun settingsCheck(label: String, checked: Boolean): SettingsSwitch = p.kit.settingsCheck(label, checked)
     val mergeTab = p.tabs[5]
         content.removeAllViews()
-        content.addView(sectionTitle("MFSR · Multi-Frame Super-Resolution"))
+        content.addView(sectionTitle("MFSR"))
         content.addView(sectionDesc(
             "Auto, Program and Manual capture a fresh burst; ZSL merges buffered frames. " +
                 "Wronski supplement S.3 high-frequency artefact rejection for the " +
@@ -40,7 +40,7 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
                 }
             }
         })
-        content.addView(settingsCheck("Zipper fix (colour-difference merge)", mfsrSettings.zipperFix).apply {
+        content.addView(settingsCheck("Zipper artefact correction", mfsrSettings.zipperFix).apply {
             setOnCheckedChangeListener { _, checked ->
                 if (checked != mfsrSettings.zipperFix) {
                     if (applyMfsrSettings(mfsrSettings.copy(zipperFix = checked))) {
@@ -51,7 +51,30 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
                 }
             }
         })
-        content.addView(settingsCheck("Two-band reconstruction", mfsrSettings.twoBand).apply {
+        content.addView(settingsCheck("Green fit at 1×", mfsrSettings.greenFit).apply {
+            setOnCheckedChangeListener { _, checked ->
+                if (checked != mfsrSettings.greenFit) {
+                    if (applyMfsrSettings(mfsrSettings.copy(greenFit = checked))) {
+                        setStatus(if (checked) "MFSR GREEN FIT • ON" else "MFSR GREEN FIT • OFF")
+                    } else {
+                        isChecked = mfsrSettings.greenFit
+                    }
+                }
+            }
+        })
+        content.addView(sectionDesc("Uses the colour-difference merge at 1× with two-band reconstruction off."))
+        content.addView(settingsCheck("RT capture sharpening", mfsrSettings.rtSharpen).apply {
+            setOnCheckedChangeListener { _, checked ->
+                if (checked != mfsrSettings.rtSharpen) {
+                    if (applyMfsrSettings(mfsrSettings.copy(rtSharpen = checked))) {
+                        setStatus(if (checked) "MFSR RT SHARPENING • ON" else "MFSR RT SHARPENING • OFF")
+                    } else {
+                        isChecked = mfsrSettings.rtSharpen
+                    }
+                }
+            }
+        })
+        content.addView(settingsCheck("Experimental two-band reconstruction", mfsrSettings.twoBand).apply {
             setOnCheckedChangeListener { _, checked ->
                 if (checked != mfsrSettings.twoBand) {
                     if (applyMfsrSettings(mfsrSettings.copy(twoBand = checked))) {
@@ -73,7 +96,7 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
                 }
             }
         })
-        content.addView(settingsCheck("2× super-resolution (MFSR)", mfsrSettings.mfsrFullRes).apply {
+        content.addView(settingsCheck("2× super-resolution", mfsrSettings.mfsrFullRes).apply {
             setOnCheckedChangeListener { _, checked ->
                 if (checked != mfsrSettings.mfsrFullRes) {
                     if (applyMfsrSettings(mfsrSettings.copy(mfsrFullRes = checked))) {
@@ -91,7 +114,7 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
         ))
         val mfsrLabPrefs = MfsrTuning.prefs(this)
         val mfsrLabBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        content.addView(settingsCheck("Show MFSR Lab (expert tuning)",
+        content.addView(settingsCheck("Show MFSR Lab",
             mfsrLabPrefs.getBoolean(MfsrTuning.KEY_SHOW_LAB, false)).apply {
             setOnCheckedChangeListener { _, checked ->
                 mfsrLabPrefs.edit().putBoolean(MfsrTuning.KEY_SHOW_LAB, checked).apply()
@@ -101,13 +124,31 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
         mfsrLabBox.visibility = if (mfsrLabPrefs.getBoolean(MfsrTuning.KEY_SHOW_LAB, false)) View.VISIBLE else View.GONE
         content.addView(mfsrLabBox)
         buildMfsrLab(p, mfsrLabBox)
-        content.addView(sectionTitle("LK-R · Lucas–Kanade Reloaded"))
+        content.addView(sectionTitle("LK-R"))
         content.addView(sectionDesc(
             "RawLens adaptation of Lucas–Kanade Reloaded (Lecouat et al., 2021). " +
                 "RawLens improvements: DSLR look, motion and water rejection, local motion, " +
                 "shadow cleanup. Own quick tile; same shutter, ZSL and save path as MFSR."
         ))
-        content.addView(settingsCheck("LK-R: Network", mfsrSettings.lkrNetwork).apply {
+        content.addView(settingsCheck("Bypass denoising", mfsrSettings.lkrNoPrior).apply {
+            setOnCheckedChangeListener { _, checked ->
+                if (checked != mfsrSettings.lkrNoPrior &&
+                    !applyMfsrSettings(mfsrSettings.copy(lkrNoPrior = checked))) {
+                    isChecked = mfsrSettings.lkrNoPrior
+                }
+            }
+        })
+        content.addView(sectionDesc("Bypasses the networks, DCT and additional denoising."))
+        content.addView(settingsCheck("Highlight recovery", mfsrSettings.lkrHighlightRecovery).apply {
+            setOnCheckedChangeListener { _, checked ->
+                if (checked != mfsrSettings.lkrHighlightRecovery &&
+                    !applyMfsrSettings(mfsrSettings.copy(lkrHighlightRecovery = checked))) {
+                    isChecked = mfsrSettings.lkrHighlightRecovery
+                }
+            }
+        })
+        content.addView(sectionDesc("Rebuilds blown lamps, bulbs and sky from the neighbouring unclipped colour. Off keeps the old neutral white."))
+        content.addView(settingsCheck("Network denoise", mfsrSettings.lkrNetwork).apply {
             setOnCheckedChangeListener { _, checked ->
                 if (checked != mfsrSettings.lkrNetwork &&
                     !applyMfsrSettings(mfsrSettings.copy(lkrNetwork = checked))) {
@@ -120,7 +161,19 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
                 "brightness, detail and grain stay as merged. Default on for phones with an NPU (MediaTek " +
                 "APU, Qualcomm Hexagon), where it is nearly free; elsewhere it runs on the GPU and adds time."
         ))
-        content.addView(settingsCheck("LK-R shadow luma denoise", mfsrSettings.lkrDctPrior).apply {
+        content.addView(settingsCheck("NPU denoise", mfsrSettings.lkrNpuDenoise).apply {
+            setOnCheckedChangeListener { _, checked ->
+                if (checked != mfsrSettings.lkrNpuDenoise &&
+                    !applyMfsrSettings(mfsrSettings.copy(lkrNpuDenoise = checked))) {
+                    isChecked = mfsrSettings.lkrNpuDenoise
+                }
+            }
+        })
+        content.addView(sectionDesc(
+            "Uses a shorter merge for regular bursts and denoises on the NPU while Vulkan fits the next tile. " +
+                "Takes precedence over Network and falls back to DCT if needed."
+        ))
+        content.addView(settingsCheck("Shadow luminance denoise", mfsrSettings.lkrDctPrior).apply {
             setOnCheckedChangeListener { _, checked ->
                 if (checked != mfsrSettings.lkrDctPrior &&
                     !applyMfsrSettings(mfsrSettings.copy(lkrDctPrior = checked))) {
@@ -149,7 +202,7 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
                 "the ZSL frames: highlights keep detail, the JPEG / Ultra HDR is tone-mapped. On: always. " +
                 "Off: a normal burst. Same frame count, same merge time."
         ))
-        content.addView(settingsCheck("LK-R reference: middle of the burst", mfsrSettings.lkrMiddleReference).apply {
+        content.addView(settingsCheck("Use middle frame as reference", mfsrSettings.lkrMiddleReference).apply {
             setOnCheckedChangeListener { _, checked ->
                 if (checked != mfsrSettings.lkrMiddleReference &&
                     !applyMfsrSettings(mfsrSettings.copy(lkrMiddleReference = checked))) {
@@ -165,7 +218,7 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
         ))
         val labPrefs = LkrTuning.prefs(this)
         val labBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        content.addView(settingsCheck("Show LK-R Lab (expert tuning)",
+        content.addView(settingsCheck("Show LK-R Lab",
             labPrefs.getBoolean(LkrTuning.KEY_SHOW_LAB, false)).apply {
             setOnCheckedChangeListener { _, checked ->
                 labPrefs.edit().putBoolean(LkrTuning.KEY_SHOW_LAB, checked).apply()
@@ -246,6 +299,9 @@ internal fun MainActivity.showMergeSettings(p: SettingsPage) {
         })
         p.markActive(mergeTab)
         p.kit.polish()
+        p.kit.collapseSection("MFSR", "MFSR", "Multi-frame super-resolution and Lab controls")
+        p.kit.collapseSection("LK-R", "LK-R", "Lucas–Kanade merge, denoising and Lab controls")
+        p.kit.collapseSection("HDR+ merge", "HDR+ merge", "Automatic or manual merge strength")
 }
 
 /**

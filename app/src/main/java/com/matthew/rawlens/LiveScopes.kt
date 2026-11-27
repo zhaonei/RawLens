@@ -85,7 +85,7 @@ internal class LiveScopes(
     }
 
     /** True while the user is focusing: manual distance set or a tap scan/lock in flight. */
-    private fun peakingActive(): Boolean =
+    fun peakingActive(): Boolean =
         FocusPeakingPolicy.shouldShow(
             peakingEnabled,
             host.manualFocusSet(),
@@ -276,11 +276,13 @@ internal class LiveScopes(
     fun publishDevelopedJxlScope(developed: DevelopedJxl) {
         if (!histogramEnabled) return
         guard.run("developed-jxl-scope") {
+            // Scopes need statistics only: bound the Java-heap copy for 50 MP frames.
+            val step = maxOf(1, (maxOf(developed.width, developed.height) + 4095) / 4096)
             val rgba8 = JxlPixelPack.halfRgbaToScopeRgba8(
-                developed.halfRgba, developed.width, developed.height
+                developed.halfRgba, developed.width, developed.height, step
             )
             val bitmap = Bitmap.createBitmap(
-                developed.width, developed.height, Bitmap.Config.ARGB_8888
+                developed.width / step, developed.height / step, Bitmap.Config.ARGB_8888
             )
             try {
                 bitmap.copyPixelsFromBuffer(rgba8)
@@ -299,6 +301,6 @@ internal class LiveScopes(
         /** Scope cost telemetry cadence: one LUT/scan average line per 5 s. */
         const val SCOPE_LOG_INTERVAL_MS = 5000L
         /** Live peaking verdicts ride the same ~4 Hz cadence as the scope. */
-        const val FOCUS_PEAKING_INTERVAL_MS = 250L
+        const val FOCUS_PEAKING_INTERVAL_MS = 80L
     }
 }

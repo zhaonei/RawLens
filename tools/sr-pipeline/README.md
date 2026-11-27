@@ -99,6 +99,7 @@ CLI flags (see `Main.kt` usage text):
 | `--spv-dir DIR` | with `--backend vulkan` | directory with the compiled stage `.spv` modules; supplied by launcher |
 | `--lib PATH` | no | JNI library to load (default: `System.loadLibrary`) |
 | `--lut PATH\|auto` | no | noise LUT `.npz`, or `auto` to simulate it in-process; enables noise correction |
+| `--rt-sharpen on\|off` | no | RT capture sharpening on the merged linear DNG, with up to four Richardson–Lucy iterations (default off) |
 | `--kernel wronski\|kernelnet` | no | reconstruction kernel (`--kn-scale F`, `--kn-cap F` tune KernelNet) |
 | `--kn-floor F` | no | override the base KernelNet width floor (including reference support); positive and no greater than `--kn-cap` |
 | `--continuous-motion on\|off` | no | Wronski: KernelNet's regularized flow, smooth flow/robustness sampling and soft motion rejection (default off = IPOL parity; the app uses on; always on with KernelNet) |
@@ -148,3 +149,31 @@ tools/sr-pipeline/run.sh \
 Repeated `--tune` flags compose; later duplicate keys win. `--tune app` resets
 the earlier overrides. For example, `--tune kStretch=2.5 --tune kShrink=2`
 is equivalent to `--tune kStretch=2.5,kShrink=2`.
+### Tiled green residual experiment
+
+Set `SRP_GREEN_RESIDUAL=1` when running the Vulkan Wronski CLI at 1× or 2×
+with colour differences enabled. The step reuses the merge flow and rejection
+weights, predicts the recorded green sensor samples from the merged image,
+and back-projects their residuals. The replay caches its inputs in a
+temporary directory. GPU working buffers are tile-sized.
+
+At 2×, it integrates each sensor pixel with separable box-overlap weights
+covering up to 3×3 output pixels. Two damped passes reuse those weights for
+back-projection. Low accepted sample mass reduces the update, and the replay
+limits shadow darkening and damps two- and four-pixel repeats in the correction.
+Combinations with the resident 1× fit are excluded.
+
+For the streaming 1× experiment, set `SRP_GREEN_ONLINE=1`. It uses
+every selected frame, accumulates the normal equations during the merge and runs
+six GPU updates over the finished image. The desktop version allocates
+full-frame fit buffers and uses no disk cache.
+
+Add `SRP_GREEN_RESIDENT=1` to test the packed gather. Each 2×2 Bayer cell
+shares one flow estimate, and each output pixel gathers the two green samples
+in its bilinear footprint without atomic writes. The fit reuses the merge's
+frame and output buffers and uses three momentum-accelerated updates. The least
+reliable frame at each guide cell limits the final correction in motion
+regions. The fit filters the correction layer and restores a bounded amount
+of fine detail where frame agreement is high and the correction shows little
+two-pixel alternation. The Android MFSR app uses the packed gather by default
+at 1× with colour differences enabled and two-band reconstruction off.

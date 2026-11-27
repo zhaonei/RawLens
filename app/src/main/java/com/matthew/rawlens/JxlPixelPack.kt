@@ -112,21 +112,23 @@ object JxlPixelPack {
      * RGBA order feeds `Bitmap.copyPixelsFromBuffer` directly). Scope-only:
      * the saved JXL keeps full precision. Alpha is forced opaque.
      */
-    fun halfRgbaToScopeRgba8(rgbaHalf: ByteBuffer, width: Int, height: Int): ByteBuffer {
+    fun halfRgbaToScopeRgba8(rgbaHalf: ByteBuffer, width: Int, height: Int, step: Int = 1): ByteBuffer {
+        require(step >= 1) { "Invalid scope step" }
         require(width > 0 && height > 0) { "Invalid JXL frame size ${width}x$height" }
         require(rgbaHalf.remaining() >= width * height * 8) {
             "RGBA half-float input too small: ${rgbaHalf.remaining()} bytes"
         }
         val output = ByteBuffer
-            .allocateDirect(width * height * 4)
+            .allocateDirect((width / step) * (height / step) * 4)
             .order(ByteOrder.nativeOrder())
         val source = rgbaHalf.duplicate().order(ByteOrder.nativeOrder())
-        repeat(width * height) {
-            repeat(3) {
-                val linear = halfBitsToFloat(source.short.toInt() and 0xffff)
+        val base = source.position()
+        for (y in 0 until height / step) for (x in 0 until width / step) {
+            val at = base + (y * step * width + x * step) * 8
+            repeat(3) { c ->
+                val linear = halfBitsToFloat(source.getShort(at + c * 2).toInt() and 0xffff)
                 output.put(quantizeUint16(linear, 255f).toByte())
             }
-            source.short // drop half alpha
             output.put(0xFF.toByte())
         }
         output.flip()
@@ -167,7 +169,7 @@ object JxlPixelPack {
         val c = code.coerceIn(0f, 1f).toDouble()
         if (c <= 0.0) return 0f
         val cp = c.pow(1.0 / 78.84375)
-        val y = ((cp - 0.8359375) / (18.8515625 - 18.6875 * cp)).pow(1.0 / 0.15930176)
+        val y = ((cp - 0.8359375).coerceAtLeast(0.0) / (18.8515625 - 18.6875 * cp)).pow(1.0 / 0.15930176)
         return (y * 10000.0).toFloat()
     }
 

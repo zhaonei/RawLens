@@ -13,6 +13,20 @@ class SessionLadderTest {
     private val ladder = SessionLadder()
 
     @Test
+    fun streamOverrideKeepsFallbacksWithinTheSelectedTopology() {
+        val raw = SessionStreamSize(4000, 3000)
+        val preview = SessionStreamSize(1920, 1440)
+        val combos = SessionStreamSelection.selectSessionStreamCombos(listOf(raw), listOf(preview), 12, 4)
+
+        assertEquals(combos, RawStreamMode.fromPreference(null).selectCombos(combos))
+        assertEquals(listOf(12, 4), RawStreamMode.RAW_ONLY.selectCombos(combos).map { it.readerMaxImages })
+        assertTrue(RawStreamMode.RAW_ONLY.selectCombos(combos).all { it.preview == null })
+        assertEquals(listOf(12, 4), RawStreamMode.PREVIEW_AND_RAW.selectCombos(combos).map { it.readerMaxImages })
+        assertTrue(RawStreamMode.PREVIEW_AND_RAW.selectCombos(combos).all { it.preview == preview })
+        assertTrue(RawStreamMode.PREVIEW_AND_RAW.selectCombos(RawStreamMode.RAW_ONLY.selectCombos(combos)).isEmpty())
+    }
+
+    @Test
     fun altRouteFirstThenPrimaryDegradesWithoutAlt() {
         ladder.selectLens("0")
         assertTrue(ladder.altRouteAvailable("5"))
@@ -22,6 +36,7 @@ class SessionLadderTest {
         assertTrue(ladder.canDegrade("0", comboCount = 3))
         assertEquals(1, ladder.degrade())
         assertFalse("degrading returns to the primary route", ladder.altRouteActive)
+        assertFalse("degrading does not restart the direct-route attempt", ladder.altRouteAvailable("5"))
         assertEquals(2, ladder.degrade())
         assertFalse(ladder.canDegrade("0", comboCount = 3))
     }
@@ -74,11 +89,11 @@ class SessionLadderTest {
     }
 
     @Test
-    fun startResetsOnlyTheRouteBudget() {
+    fun startResetsBothOpenRetryBudgets() {
         ladder.takeRouteRetry(max = 1)
         ladder.takeRejectionRetry(max = 1)
-        ladder.resetRouteRetries()
+        ladder.resetOpenRetries()
         assertEquals(1, ladder.takeRouteRetry(max = 1))
-        assertNull(ladder.takeRejectionRetry(max = 1))
+        assertEquals(1, ladder.takeRejectionRetry(max = 1))
     }
 }

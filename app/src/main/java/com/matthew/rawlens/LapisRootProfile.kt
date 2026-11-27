@@ -4,12 +4,17 @@ package com.matthew.rawlens
 import android.content.Context
 import android.os.Build
 
-/** Only the exact firmware whose vendor-library hash and sensor modes were verified. */
+/**
+ * Redmi Note 15 Pro 5G (lapis). The UI gate is device + model only: firmware OTAs often leave
+ * the camera stack untouched. Every root path re-checks the vendor-library SHA-256s below before
+ * patching, so a firmware that really changed the camera libraries still fails safely.
+ */
 internal object LapisRootProfile {
     const val PREFS = "rawlens_lapis_root"
     const val ENABLED = "enabled"
     const val FULL_RESOLUTION = "full_resolution"
     const val SENSOR_ZOOM = "sensor_zoom"
+    /** Firmware the modes were first verified on (305 has identical camera libraries). */
     const val FIRMWARE = "OS3.0.303.0.WPPEUXM"
     const val VENDOR_SHA256 = "95eded2eef1767fdb07f74d31a4ef1a9b40668e6d5984d30444e0165a489a7dc"
 
@@ -26,13 +31,13 @@ internal object LapisRootProfile {
         VIDEO60("video60", "9.4 MP · 60 fps"),
         CROP_2X_DSG("2xdsg14", "2× DSG · Auto AE"),
         NORMAL("normal", "12.5 MP"), FULL("50mp", "50 MP RAW"), CROP_2X("2x", "2× sensor RAW"), CROP_4X("4x", "4× sensor RAW"), DCG14("dcg14", "DCG14 · Auto AE"),
-        /** One-shot: 200 MP block-CFA readout, remosaiced to 50 MP Bayer by the root worker. */
+        /** One-shot: rawr same-colour sums + Quad Detail remosaic to 50 MP Bayer CFA. */
         HEXADECA_200("200mp", "200→50 MP RAW")
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun matches(device: String, model: String, fingerprint: String, display: String): Boolean =
-        device == "lapis" && model == "25080RABDG" &&
-            (fingerprint.contains(FIRMWARE) || display.contains(FIRMWARE))
+        device == "lapis" && model == "25080RABDG"
 
     fun supported(): Boolean = matches(Build.DEVICE, Build.MODEL, Build.FINGERPRINT, Build.DISPLAY)
     fun preferences(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -52,6 +57,20 @@ internal object LapisRootProfile {
     fun select(context:Context,mode:Mode) {
         preferences(context).edit().putBoolean(FULL_RESOLUTION,mode==Mode.FULL)
             .putBoolean(VIDEO_60,mode==Mode.VIDEO60).putBoolean(DSG_2X,mode==Mode.CROP_2X_DSG).putBoolean(SENSOR_ZOOM_4X,mode==Mode.CROP_4X).putBoolean(SENSOR_ZOOM,mode==Mode.CROP_2X).putBoolean(DCG_ENABLED,mode==Mode.DCG14).putBoolean(HEXADECA_200,mode==Mode.HEXADECA_200).apply()
+    }
+
+    /** A root HAL restart may temporarily hide another enabled camera route. */
+    fun keepSwitcherLens(rootEnabled: Boolean, explicitlyEnabled: Boolean, routeAvailable: Boolean): Boolean =
+        routeAvailable || (rootEnabled && explicitlyEnabled)
+
+    /** Never hide the active selection behind an older per-mode visibility preference. */
+    fun showSwitcherLens(lens: LensOption, savedVisible: Boolean): Boolean = lens.selected || savedVisible
+
+    private fun visibilityKey(lens: LensOption) = "show_lens:${lens.cameraId}:${lens.readout}"
+    fun lensVisible(context: Context, lens: LensOption): Boolean =
+        preferences(context).getBoolean(visibilityKey(lens), true)
+    fun setLensVisible(context: Context, lens: LensOption, visible: Boolean) {
+        preferences(context).edit().putBoolean(visibilityKey(lens), visible).apply()
     }
 
     fun videoFps(context: Context): Int = preferences(context).getInt("video_fps",60).takeIf { it in listOf(24,30,60) } ?: 60

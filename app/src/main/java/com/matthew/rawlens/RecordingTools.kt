@@ -229,8 +229,7 @@ internal class RecordingTools(private val activity: MainActivity) : AutoCloseabl
         val range = focusRange() ?: return
         cancelFocusPull()
         wakePreview()
-        activity.pendingSliderUpdate?.let(activity.manualSlider::removeCallbacks)
-        activity.pendingSliderUpdate = null
+        activity.cancelPendingSliderUpdate()
         activity.cancelManualPanelHide()
         val started = now()
         val duration = durations[durationIndex]
@@ -278,7 +277,7 @@ internal class RecordingTools(private val activity: MainActivity) : AutoCloseabl
             contentDescription = "Focus pull duration $text. Tap to change duration and stop pull. Hold to clear marks."
         }
         text(R.id.recordingPreviewSleep).apply {
-            text = if (sleeping) "Wake" else "Preview"
+            text = if (sleeping) "Wake preview" else "Preview sleep"
             contentDescription = if (sleeping) "Wake recording preview" else if (activity.videoRecording)
                 "Sleep recording preview now. Hold for sleep timer." else sleepSettingLabel()
         }
