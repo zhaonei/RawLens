@@ -294,6 +294,7 @@ class MainActivity : Activity() {
         // Viewfinder must never let the phone auto-lock mid-shoot.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_main)
+        ForkLocalization.install(window.decorView)
         val storedReleaseMode = lensPreferences().getInt(KEY_RELEASE_MODE,
             if (lensPreferences().getBoolean(KEY_BURST_RELEASE, false)) 1 else 0)
         hdrEnabled = lensPreferences().getBoolean(KEY_HDR_ENABLED, storedReleaseMode == 2)
